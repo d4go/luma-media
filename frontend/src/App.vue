@@ -7,8 +7,9 @@ import {
 } from 'naive-ui'
 import { RouterLink, useRoute } from 'vue-router'
 import {
-  IconActivityHeartbeat, IconCode, IconFolders, IconHome, IconListCheck, IconMenu2,
-  IconMoon, IconMovie, IconRefresh, IconSettings, IconSun, IconX,
+  IconActivityHeartbeat, IconAutomation, IconBinoculars, IconDownload,
+  IconGauge, IconListCheck, IconMenu2, IconMoon, IconMovie, IconRefresh, IconSettings,
+  IconSun, IconX,
 } from '@tabler/icons-vue'
 import { api } from './api'
 import { serviceStatusKey } from './service-status'
@@ -23,14 +24,15 @@ const storedTheme = localStorage.getItem('luma-theme')
 const isDark = ref(storedTheme ? storedTheme === 'dark' : prefersDark.matches)
 let statusTimer: number | undefined
 
-const renderIcon = (icon: typeof IconHome) => () => h(NIcon, null, { default: () => h(icon) })
+const renderIcon = (icon: typeof IconGauge) => () => h(NIcon, null, { default: () => h(icon) })
 const renderLink = (label: string, to: string) => () => h(RouterLink, { to }, { default: () => label })
 const menuOptions: MenuOption[] = [
-  { label: renderLink('开始', '/'), key: '/', icon: renderIcon(IconHome) },
-  { label: renderLink('媒体目录', '/folders'), key: '/folders', icon: renderIcon(IconFolders) },
+  { label: renderLink('Dashboard', '/'), key: '/', icon: renderIcon(IconGauge) },
+  { label: renderLink('资源发现', '/discovery'), key: '/discovery', icon: renderIcon(IconBinoculars) },
+  { label: renderLink('下载中心', '/downloads'), key: '/downloads', icon: renderIcon(IconDownload) },
   { label: renderLink('任务中心', '/tasks'), key: '/tasks', icon: renderIcon(IconListCheck) },
   { label: renderLink('媒体库', '/media'), key: '/media', icon: renderIcon(IconMovie) },
-  { label: renderLink('爬虫与下载', '/crawlers'), key: '/crawlers', icon: renderIcon(IconCode) },
+  { label: renderLink('自动化规则', '/automation'), key: '/automation', icon: renderIcon(IconAutomation) },
   { label: renderLink('系统设置', '/settings'), key: '/settings', icon: renderIcon(IconSettings) },
 ]
 const activeKey = computed(() => route.path)
@@ -113,7 +115,7 @@ onUnmounted(() => {
             <aside class="sidebar">
               <div class="brand">
                 <div class="brand-mark" aria-hidden="true"><span>L</span></div>
-                <div class="brand-copy"><strong>Luma</strong><span>MEDIA OPERATIONS</span></div>
+                <div class="brand-copy"><strong>Luma</strong><span>MEDIA AUTOMATION</span></div>
               </div>
               <nav class="primary-nav" aria-label="主要导航">
                 <n-menu :value="activeKey" :options="menuOptions" @update:value="mobileOpen = false" />

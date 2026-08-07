@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use reqwest::header::{COOKIE, SET_COOKIE};
 use serde::Deserialize;
 
-use crate::models::Settings;
+use crate::models::{DownloadItem, Settings};
 
 #[derive(Clone)]
 pub struct QBittorrentClient {
@@ -120,6 +120,66 @@ impl QBittorrentClient {
         Ok(hash)
     }
 
+    pub async fn torrents(&self) -> anyhow::Result<Vec<DownloadItem>> {
+        let cookie = self.login().await?;
+        let response = self
+            .http
+            .get(format!("{}/api/v2/torrents/info", self.base_url))
+            .header(COOKIE, cookie)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            bail!(
+                "qBittorrent torrent list returned HTTP {}",
+                response.status()
+            );
+        }
+        Ok(response
+            .json::<Vec<TorrentInfo>>()
+            .await?
+            .into_iter()
+            .map(DownloadItem::from)
+            .collect())
+    }
+
+    pub async fn pause(&self, hash: &str) -> anyhow::Result<()> {
+        self.post_hash_action("pause", hash).await
+    }
+
+    pub async fn resume(&self, hash: &str) -> anyhow::Result<()> {
+        self.post_hash_action("resume", hash).await
+    }
+
+    pub async fn remove(&self, hash: &str) -> anyhow::Result<()> {
+        let cookie = self.login().await?;
+        let response = self
+            .http
+            .post(format!("{}/api/v2/torrents/delete", self.base_url))
+            .header(COOKIE, cookie)
+            .form(&[("hashes", hash), ("deleteFiles", "false")])
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            bail!("qBittorrent delete returned HTTP {}", response.status());
+        }
+        Ok(())
+    }
+
+    async fn post_hash_action(&self, action: &str, hash: &str) -> anyhow::Result<()> {
+        let cookie = self.login().await?;
+        let response = self
+            .http
+            .post(format!("{}/api/v2/torrents/{action}", self.base_url))
+            .header(COOKIE, cookie)
+            .form(&[("hashes", hash)])
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            bail!("qBittorrent {action} returned HTTP {}", response.status());
+        }
+        Ok(())
+    }
+
     pub async fn update_all_trackers(&self, trackers: &[String]) -> anyhow::Result<usize> {
         if trackers.is_empty() {
             return Ok(0);
@@ -175,6 +235,44 @@ impl QBittorrentClient {
 #[derive(Deserialize)]
 struct TorrentInfo {
     hash: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    size: i64,
+    #[serde(default)]
+    progress: f64,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    dlspeed: i64,
+    #[serde(default)]
+    upspeed: i64,
+    #[serde(default)]
+    eta: i64,
+    #[serde(default)]
+    save_path: String,
+    #[serde(default)]
+    added_on: i64,
+    #[serde(default)]
+    completion_on: i64,
+}
+
+impl From<TorrentInfo> for DownloadItem {
+    fn from(torrent: TorrentInfo) -> Self {
+        Self {
+            hash: torrent.hash,
+            name: torrent.name,
+            size: torrent.size,
+            progress: torrent.progress,
+            state: torrent.state,
+            download_speed: torrent.dlspeed,
+            upload_speed: torrent.upspeed,
+            eta: torrent.eta,
+            save_path: torrent.save_path,
+            added_on: torrent.added_on,
+            completion_on: torrent.completion_on,
+        }
+    }
 }
 
 pub fn parse_tracker_list(text: &str) -> Vec<String> {
@@ -242,8 +340,12 @@ mod tests {
     async fn submits_download_and_updates_trackers_through_web_api() {
         let downloads = Arc::new(AtomicUsize::new(0));
         let tracker_updates = Arc::new(AtomicUsize::new(0));
+        let lifecycle_actions = Arc::new(AtomicUsize::new(0));
         let download_counter = downloads.clone();
         let tracker_counter = tracker_updates.clone();
+        let pause_counter = lifecycle_actions.clone();
+        let resume_counter = lifecycle_actions.clone();
+        let delete_counter = lifecycle_actions.clone();
         let app = Router::new()
             .route(
                 "/api/v2/auth/login",
@@ -275,7 +377,51 @@ mod tests {
             )
             .route(
                 "/api/v2/torrents/info",
-                get(|| async { Json(serde_json::json!([{"hash": "ABC123"}])) }),
+                get(|| async {
+                    Json(serde_json::json!([{
+                        "hash": "abcdef0123456789abcdef0123456789abcdef01",
+                        "name": "Example Movie",
+                        "size": 2147483648_i64,
+                        "progress": 0.42,
+                        "state": "downloading",
+                        "dlspeed": 1048576,
+                        "upspeed": 1024,
+                        "eta": 120,
+                        "save_path": "/downloads",
+                        "added_on": 1_700_000_000_i64,
+                        "completion_on": -1
+                    }]))
+                }),
+            )
+            .route(
+                "/api/v2/torrents/pause",
+                post(move || {
+                    let counter = pause_counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/api/v2/torrents/resume",
+                post(move || {
+                    let counter = resume_counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/api/v2/torrents/delete",
+                post(move || {
+                    let counter = delete_counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -302,6 +448,16 @@ mod tests {
             .unwrap();
         assert_eq!(updated, 1);
         assert_eq!(tracker_updates.load(Ordering::SeqCst), 4);
+
+        let torrents = client.torrents().await.unwrap();
+        assert_eq!(torrents.len(), 1);
+        assert_eq!(torrents[0].name, "Example Movie");
+        assert_eq!(torrents[0].download_speed, 1_048_576);
+        let torrent_hash = "abcdef0123456789abcdef0123456789abcdef01";
+        client.pause(torrent_hash).await.unwrap();
+        client.resume(torrent_hash).await.unwrap();
+        client.remove(torrent_hash).await.unwrap();
+        assert_eq!(lifecycle_actions.load(Ordering::SeqCst), 3);
         server.abort();
     }
 }

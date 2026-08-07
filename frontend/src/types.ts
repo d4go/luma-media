@@ -115,6 +115,9 @@ export interface DashboardStats {
   taskCount: number
   successCount: number
   failedCount: number
+  candidateCount: number
+  downloadCount: number
+  pendingScrapeCount: number
   recentActivity: Task[]
 }
 
@@ -193,14 +196,32 @@ export interface CrawlerResult {
   runId: number
   scriptId: number
   title: string
+  source: string
+  sourceUrl: string
+  size: string | null
+  publishedAt: string
   downloadUrl: string
   trackers: string[]
   raw: unknown
-  downloadStatus: 'pending' | 'downloading' | 'success' | 'failed'
+  downloadStatus: 'pending' | 'downloading' | 'success' | 'failed' | 'ignored'
   qbitHash: string | null
   errorMessage: string | null
   createdAt: string
   downloadedAt: string | null
+}
+
+export interface DownloadItem {
+  hash: string
+  name: string
+  size: number
+  progress: number
+  state: string
+  downloadSpeed: number
+  uploadSpeed: number
+  eta: number
+  savePath: string
+  addedOn: number
+  completionOn: number
 }
 
 export interface CrawlerForm {

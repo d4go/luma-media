@@ -1,6 +1,6 @@
 import type {
   BatchScrapeResponse, BatchTaskResponse, CrawlerForm, CrawlerResult, CrawlerRun, CrawlerScript,
-  DashboardStats, Folder, FolderInput, MediaItem, MetaTubeConnection, QBittorrentConnection,
+  DashboardStats, DownloadItem, Folder, FolderInput, MediaItem, MetaTubeConnection, QBittorrentConnection,
   ScrapeOptions, ServiceStatus, Settings, Task, TaskDetail,
 } from './types'
 
@@ -87,7 +87,12 @@ export const api = {
   crawlerRuns: (scriptId?: number) => request<CrawlerRun[]>(`/crawler-runs${scriptId ? `?scriptId=${scriptId}` : ''}`),
   crawlerResults: (scriptId?: number) => request<CrawlerResult[]>(`/crawler-results${scriptId ? `?scriptId=${scriptId}` : ''}`),
   downloadCrawlerResult: (id: number) => request<CrawlerResult>(`/crawler-results/${id}/download`, { method: 'POST' }),
+  ignoreCrawlerResult: (id: number) => request<CrawlerResult>(`/crawler-results/${id}/ignore`, { method: 'POST' }),
   downloadCrawlerResults: (resultIds: number[]) => request<CrawlerResult[]>('/crawler-results/download', {
     method: 'POST', body: JSON.stringify({ resultIds }),
   }),
+  downloads: () => request<DownloadItem[]>('/downloads'),
+  pauseDownload: (hash: string) => request<void>(`/downloads/${encodeURIComponent(hash)}/pause`, { method: 'POST' }),
+  resumeDownload: (hash: string) => request<void>(`/downloads/${encodeURIComponent(hash)}/resume`, { method: 'POST' }),
+  removeDownload: (hash: string) => request<void>(`/downloads/${encodeURIComponent(hash)}`, { method: 'DELETE' }),
 }

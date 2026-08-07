@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use serde_json::json;
 use sqlx::Row;
@@ -15,9 +15,9 @@ use crate::{
     metadata::{self, WriteOptions},
     models::{
         BatchCrawlerResultInput, BatchScrapeInput, BatchScrapeResponse, BatchTaskInput,
-        BatchTaskResponse, CrawlerResult, CrawlerRun, CrawlerScript, DashboardStats, Folder,
-        FolderInput, LogEntry, MediaItem, MetaTubeConnection, QBittorrentConnection, ScrapeOptions,
-        ServiceHealth, ServiceStatus, Settings, Task, TaskDetail,
+        BatchTaskResponse, CrawlerResult, CrawlerRun, CrawlerScript, DashboardStats, DownloadItem,
+        Folder, FolderInput, LogEntry, MediaItem, MetaTubeConnection, QBittorrentConnection,
+        ScrapeOptions, ServiceHealth, ServiceStatus, Settings, Task, TaskDetail,
     },
     provider::MetaTubeClient,
     qbittorrent::QBittorrentClient,
@@ -54,6 +54,11 @@ pub fn router() -> Router<AppState> {
             "/crawler-results/{id}/download",
             post(download_crawler_result),
         )
+        .route("/crawler-results/{id}/ignore", post(ignore_crawler_result))
+        .route("/downloads", get(list_downloads))
+        .route("/downloads/{hash}", delete(remove_download))
+        .route("/downloads/{hash}/pause", post(pause_download))
+        .route("/downloads/{hash}/resume", post(resume_download))
         .route("/logs", get(list_logs))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
 }
@@ -73,6 +78,20 @@ async fn dashboard(State(state): State<AppState>) -> AppResult<Json<DashboardSta
         sqlx::query_scalar("SELECT COUNT(*) FROM scrape_task WHERE status = 'failed'")
             .fetch_one(&state.pool)
             .await?;
+    let candidate_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM crawler_result WHERE download_status != 'ignored'",
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    let pending_scrape_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_item WHERE status = 'pending'")
+            .fetch_one(&state.pool)
+            .await?;
+    let settings = storage::load_settings(&state.pool).await?;
+    let download_count = match QBittorrentClient::new(&settings) {
+        Ok(client) => client.torrents().await.map_or(0, |items| items.len()),
+        Err(_) => 0,
+    };
     let rows = sqlx::query(&format!(
         "{} ORDER BY st.updated_at DESC, st.id DESC LIMIT 8",
         storage::TASK_SELECT
@@ -85,6 +104,9 @@ async fn dashboard(State(state): State<AppState>) -> AppResult<Json<DashboardSta
         task_count,
         success_count,
         failed_count,
+        candidate_count,
+        download_count,
+        pending_scrape_count,
         recent_activity,
     }))
 }
@@ -1056,6 +1078,73 @@ async fn download_crawler_results(
     Ok(Json(downloaded))
 }
 
+async fn ignore_crawler_result(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<CrawlerResult>> {
+    Ok(Json(crawler::ignore_result(&state.pool, id).await?))
+}
+
+async fn list_downloads(State(state): State<AppState>) -> AppResult<Json<Vec<DownloadItem>>> {
+    let client = qbittorrent_client(&state).await?;
+    let downloads = client
+        .torrents()
+        .await
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(Json(downloads))
+}
+
+async fn pause_download(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> AppResult<StatusCode> {
+    validate_download_hash(&hash)?;
+    qbittorrent_client(&state)
+        .await?
+        .pause(&hash)
+        .await
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn resume_download(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> AppResult<StatusCode> {
+    validate_download_hash(&hash)?;
+    qbittorrent_client(&state)
+        .await?
+        .resume(&hash)
+        .await
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_download(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> AppResult<StatusCode> {
+    validate_download_hash(&hash)?;
+    qbittorrent_client(&state)
+        .await?
+        .remove(&hash)
+        .await
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn qbittorrent_client(state: &AppState) -> AppResult<QBittorrentClient> {
+    let settings = storage::load_settings(&state.pool).await?;
+    QBittorrentClient::new(&settings).map_err(|error| AppError::BadRequest(error.to_string()))
+}
+
+fn validate_download_hash(hash: &str) -> AppResult<()> {
+    if !matches!(hash.len(), 40 | 64) || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::BadRequest("invalid torrent hash".into()));
+    }
+    Ok(())
+}
+
 async fn get_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1418,5 +1507,13 @@ mod tests {
             inferred_metatube_url(&headers).as_deref(),
             Some("http://[2001:db8::1]:8080")
         );
+    }
+
+    #[test]
+    fn accepts_only_complete_hex_torrent_hashes() {
+        assert!(validate_download_hash("0123456789abcdef0123456789abcdef01234567").is_ok());
+        assert!(validate_download_hash(&"a".repeat(64)).is_ok());
+        assert!(validate_download_hash("../../api/v2/app/shutdown").is_err());
+        assert!(validate_download_hash("0123456789abcdef").is_err());
     }
 }

@@ -65,24 +65,35 @@ pub async fn list_results(
     script_id: Option<i64>,
 ) -> AppResult<Vec<CrawlerResult>> {
     let rows = if let Some(script_id) = script_id {
-        sqlx::query("SELECT * FROM crawler_result WHERE script_id = ? ORDER BY id DESC LIMIT 500")
-            .bind(script_id)
-            .fetch_all(pool)
-            .await?
+        sqlx::query(
+            "SELECT cr.*, cs.name AS source, cs.website_url AS source_url \
+             FROM crawler_result cr JOIN crawler_script cs ON cs.id = cr.script_id \
+             WHERE cr.script_id = ? ORDER BY cr.id DESC LIMIT 500",
+        )
+        .bind(script_id)
+        .fetch_all(pool)
+        .await?
     } else {
-        sqlx::query("SELECT * FROM crawler_result ORDER BY id DESC LIMIT 500")
-            .fetch_all(pool)
-            .await?
+        sqlx::query(
+            "SELECT cr.*, cs.name AS source, cs.website_url AS source_url \
+             FROM crawler_result cr JOIN crawler_script cs ON cs.id = cr.script_id \
+             ORDER BY cr.id DESC LIMIT 500",
+        )
+        .fetch_all(pool)
+        .await?
     };
     Ok(rows.iter().map(result_from_row).collect())
 }
 
 pub async fn result_by_id(pool: &SqlitePool, id: i64) -> AppResult<CrawlerResult> {
-    let row = sqlx::query("SELECT * FROM crawler_result WHERE id = ?")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let row = sqlx::query(
+        "SELECT cr.*, cs.name AS source, cs.website_url AS source_url \
+         FROM crawler_result cr JOIN crawler_script cs ON cs.id = cr.script_id WHERE cr.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
     Ok(result_from_row(&row))
 }
 
@@ -402,6 +413,23 @@ pub async fn download_result(state: &AppState, result_id: i64) -> AppResult<Craw
     result_by_id(&state.pool, result_id).await
 }
 
+pub async fn ignore_result(pool: &SqlitePool, result_id: i64) -> AppResult<CrawlerResult> {
+    result_by_id(pool, result_id).await?;
+    let updated = sqlx::query(
+        "UPDATE crawler_result SET download_status = 'ignored', error_message = NULL \
+         WHERE id = ? AND download_status IN ('pending', 'failed')",
+    )
+    .bind(result_id)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(AppError::BadRequest(
+            "only pending or failed results can be ignored".into(),
+        ));
+    }
+    result_by_id(pool, result_id).await
+}
+
 async fn run_by_id(pool: &SqlitePool, id: i64) -> AppResult<CrawlerRun> {
     let row = sqlx::query("SELECT * FROM crawler_run WHERE id = ?")
         .bind(id)
@@ -530,18 +558,37 @@ fn run_from_row(row: &sqlx::sqlite::SqliteRow) -> CrawlerRun {
 fn result_from_row(row: &sqlx::sqlite::SqliteRow) -> CrawlerResult {
     let trackers_json: String = row.get("trackers_json");
     let raw_json: String = row.get("raw_json");
+    let raw = serde_json::from_str(&raw_json).unwrap_or(Value::Null);
+    let created_at: String = row.get("created_at");
+    let size = ["size", "fileSize"]
+        .into_iter()
+        .find_map(|key| raw.get(key))
+        .and_then(|value| match value {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        });
+    let published_at = ["publishedAt", "publishDate", "date", "createdAt"]
+        .into_iter()
+        .find_map(|key| raw.get(key).and_then(Value::as_str))
+        .unwrap_or(&created_at)
+        .to_owned();
     CrawlerResult {
         id: row.get("id"),
         run_id: row.get("run_id"),
         script_id: row.get("script_id"),
         title: row.get("title"),
+        source: row.try_get("source").unwrap_or_else(|_| "Crawler".into()),
+        source_url: row.try_get("source_url").unwrap_or_default(),
+        size,
+        published_at,
         download_url: row.get("download_url"),
         trackers: serde_json::from_str(&trackers_json).unwrap_or_default(),
-        raw: serde_json::from_str(&raw_json).unwrap_or(Value::Null),
+        raw,
         download_status: row.get("download_status"),
         qbit_hash: row.get("qbit_hash"),
         error_message: row.get("error_message"),
-        created_at: row.get("created_at"),
+        created_at,
         downloaded_at: row.get("downloaded_at"),
     }
 }

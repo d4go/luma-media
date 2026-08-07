@@ -253,6 +253,9 @@ pub struct DashboardStats {
     pub task_count: i64,
     pub success_count: i64,
     pub failed_count: i64,
+    pub candidate_count: i64,
+    pub download_count: usize,
+    pub pending_scrape_count: i64,
     pub recent_activity: Vec<Task>,
 }
 
@@ -332,6 +335,10 @@ pub struct CrawlerResult {
     pub run_id: i64,
     pub script_id: i64,
     pub title: String,
+    pub source: String,
+    pub source_url: String,
+    pub size: Option<String>,
+    pub published_at: String,
     pub download_url: String,
     pub trackers: Vec<String>,
     pub raw: serde_json::Value,
@@ -340,6 +347,22 @@ pub struct CrawlerResult {
     pub error_message: Option<String>,
     pub created_at: String,
     pub downloaded_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadItem {
+    pub hash: String,
+    pub name: String,
+    pub size: i64,
+    pub progress: f64,
+    pub state: String,
+    pub download_speed: i64,
+    pub upload_speed: i64,
+    pub eta: i64,
+    pub save_path: String,
+    pub added_on: i64,
+    pub completion_on: i64,
 }
 
 #[derive(Debug, Deserialize)]

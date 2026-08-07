@@ -143,6 +143,7 @@ onMounted(() => {
 
 <template>
   <PageHeader title="媒体库" description="浏览已索引文件，分别检查 NFO 与封面/海报状态并按需重新刮削。">
+    <n-button secondary tag="div"><RouterLink class="button-link" to="/folders">管理媒体目录</RouterLink></n-button>
     <n-button secondary :loading="loading" @click="load"><template #icon><IconRefresh /></template>刷新</n-button>
   </PageHeader>
   <div class="toolbar">

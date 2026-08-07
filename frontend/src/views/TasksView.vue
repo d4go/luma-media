@@ -138,6 +138,8 @@ function changeStatus() {
 
 onMounted(() => {
   drawerWidth.value = Math.min(620, window.innerWidth)
+  const requestedStatus = typeof route.query.status === 'string' ? route.query.status : ''
+  status.value = ['', 'pending', 'running', 'success', 'failed', 'cancelled'].includes(requestedStatus) ? requestedStatus : ''
   load()
   const taskId = Number(route.query.taskId)
   if (Number.isFinite(taskId) && taskId > 0) showDetail(taskId)
@@ -147,7 +149,7 @@ onUnmounted(() => window.clearInterval(timer))
 </script>
 
 <template>
-  <PageHeader title="任务中心" description="每个媒体对应一个刮削任务，重试与失败会保留为该任务的执行记录。">
+  <PageHeader title="任务中心" description="统一查看目录扫描与元数据刮削任务，重试、取消和失败都会保留执行记录。">
     <n-button secondary :loading="loading" @click="load()"><template #icon><IconRefresh /></template>刷新</n-button>
   </PageHeader>
   <div class="toolbar">
