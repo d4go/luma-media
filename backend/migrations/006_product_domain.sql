@@ -243,11 +243,15 @@ CREATE TABLE provider_config (
 INSERT INTO provider_config(provider_key, provider_type, display_name, enabled, base_url)
 VALUES ('javdb', 'source', 'JavDB', 1, 'https://javdb.com')
 ON CONFLICT(provider_key) DO NOTHING;
-INSERT INTO provider_config(provider_key, provider_type, display_name, enabled, base_url)
-SELECT 'metatube', 'metadata', 'MetaTube', 1, value FROM app_setting WHERE key = 'metatube_url'
+INSERT INTO provider_config(provider_key, provider_type, display_name, enabled, base_url, secret)
+SELECT 'metatube', 'metadata', 'MetaTube', 1, value,
+       COALESCE((SELECT value FROM app_setting WHERE key = 'metatube_token'), '')
+FROM app_setting WHERE key = 'metatube_url'
 ON CONFLICT(provider_key) DO NOTHING;
-INSERT INTO provider_config(provider_key, provider_type, display_name, enabled, base_url)
-SELECT 'qbittorrent', 'download', 'qBittorrent', 1, value FROM app_setting WHERE key = 'qbittorrent_url'
+INSERT INTO provider_config(provider_key, provider_type, display_name, enabled, base_url, secret)
+SELECT 'qbittorrent', 'download', 'qBittorrent', 1, value,
+       COALESCE((SELECT value FROM app_setting WHERE key = 'qbittorrent_password'), '')
+FROM app_setting WHERE key = 'qbittorrent_url'
 ON CONFLICT(provider_key) DO NOTHING;
 
 INSERT OR IGNORE INTO app_setting(key, value) VALUES
