@@ -2,6 +2,7 @@
 import { computed, h, onMounted, onUnmounted, ref } from 'vue'
 import { NAlert, NButton, NDataTable, NProgress, NSkeleton, NTag, type DataTableColumns, useMessage } from 'naive-ui'
 import { IconCircleCheck, IconCircleX, IconListCheck, IconMovie } from '@tabler/icons-vue'
+import { RouterLink } from 'vue-router'
 import PageHeader from '../components/PageHeader.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { api } from '../api'
@@ -16,16 +17,18 @@ let timer: number | undefined
 
 const metrics = computed(() => [
   { label: '媒体文件', value: stats.value.mediaCount, icon: IconMovie },
-  { label: '全部任务', value: stats.value.taskCount, icon: IconListCheck },
+  { label: '逻辑任务', value: stats.value.taskCount, icon: IconListCheck },
   { label: '成功任务', value: stats.value.successCount, icon: IconCircleCheck },
   { label: '失败任务', value: stats.value.failedCount, icon: IconCircleX },
 ])
 
 const columns: DataTableColumns<Task> = [
-  { title: '任务', key: 'taskType', render: (row) => taskTypeLabel[row.taskType] },
+  { title: '任务', key: 'id', width: 90, render: (row) => h(RouterLink, { class: 'resource-link', to: { path: '/tasks', query: { taskId: row.id } } }, { default: () => `#${row.id}` }) },
+  { title: '关联资源', key: 'resource', minWidth: 200, render: (row) => row.media?.title ?? row.folder?.name ?? '关联资源已删除' },
+  { title: '类型', key: 'taskType', render: (row) => taskTypeLabel[row.taskType] },
   { title: '状态', key: 'status', render: (row) => h(NTag, { type: statusType[row.status], bordered: false, size: 'small' }, { default: () => statusLabel[row.status] }) },
   { title: '进度', key: 'progress', render: (row) => h(NProgress, { type: 'line', percentage: row.progress, height: 5, showIndicator: false, processing: row.status === 'running' }) },
-  { title: '创建时间', key: 'createdAt', render: (row) => formatDate(row.createdAt) },
+  { title: '最近执行', key: 'updatedAt', render: (row) => formatDate(row.updatedAt) },
 ]
 
 async function load(silent = false) {

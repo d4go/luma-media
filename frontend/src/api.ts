@@ -1,9 +1,12 @@
 import type {
   BatchScrapeResponse, BatchTaskResponse, DashboardStats, Folder, FolderInput, MediaItem,
-  MetaTubeConnection, ScrapeOptions, Settings, Task,
+  MetaTubeConnection, ScrapeOptions, Settings, Task, TaskDetail,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
+const ASSET_BASE = API_BASE.replace(/\/api\/v1\/?$/, '')
+
+export const coverAssetUrl = (mediaId: number) => `${ASSET_BASE}/asset/cover/${mediaId}`
 
 export class ApiError extends Error {
   constructor(message: string, public readonly status: number) {
@@ -35,7 +38,7 @@ export const api = {
   deleteFolder: (id: number) => request<void>(`/folders/${id}`, { method: 'DELETE' }),
   scanFolder: (id: number) => request<Task>(`/folders/${id}/scan`, { method: 'POST' }),
   tasks: (status = '') => request<Task[]>(`/tasks${status ? `?status=${encodeURIComponent(status)}` : ''}`),
-  task: (id: number) => request<Task>(`/tasks/${id}`),
+  task: (id: number) => request<TaskDetail>(`/tasks/${id}`),
   retryTask: (id: number) => request<Task>(`/tasks/${id}/retry`, { method: 'POST' }),
   cancelTask: (id: number) => request<Task>(`/tasks/${id}/cancel`, { method: 'POST' }),
   retryTasks: (taskIds: number[]) => request<BatchTaskResponse>('/tasks/retry', {
@@ -44,8 +47,9 @@ export const api = {
   cancelTasks: (taskIds: number[]) => request<BatchTaskResponse>('/tasks/cancel', {
     method: 'POST', body: JSON.stringify({ taskIds }),
   }),
-  media: (search = '', status = '') => {
+  media: (search = '', status = '', mediaId?: number) => {
     const query = new URLSearchParams()
+    if (mediaId) query.set('mediaId', String(mediaId))
     if (search) query.set('search', search)
     if (status) query.set('status', status)
     return request<MediaItem[]>(`/media${query.size ? `?${query}` : ''}`)

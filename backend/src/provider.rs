@@ -1,8 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Context, anyhow};
-use reqwest::{Client, RequestBuilder, Url};
-use serde::Deserialize;
+use reqwest::{Client, RequestBuilder, StatusCode, Url, redirect::Policy};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::models::Settings;
@@ -18,7 +18,7 @@ struct ProviderData {
     movie_providers: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MovieSearchResult {
     pub id: String,
     pub provider: String,
@@ -29,10 +29,12 @@ pub struct MovieSearchResult {
 
 pub struct MetaTubeClient {
     client: Client,
+    image_client: Client,
     base_url: Url,
     token: String,
 }
 
+#[derive(Debug)]
 pub struct DownloadedImage {
     pub bytes: Vec<u8>,
     pub extension: &'static str,
@@ -49,8 +51,14 @@ impl MetaTubeClient {
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(45))
             .build()?;
+        let image_client = Client::builder()
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(45))
+            .redirect(Policy::none())
+            .build()?;
         Ok(Self {
             client,
+            image_client,
             base_url,
             token: settings.metatube_token.trim().to_owned(),
         })
@@ -64,12 +72,17 @@ impl MetaTubeClient {
     }
 
     pub async fn search_movie(&self, query: &str) -> anyhow::Result<MovieSearchResult> {
+        let results = self.search_movies(query).await?;
+        choose_best_match(query, results)
+            .ok_or_else(|| anyhow!("MetaTube found no metadata for {query}"))
+    }
+
+    pub async fn search_movies(&self, query: &str) -> anyhow::Result<Vec<MovieSearchResult>> {
         let url = self.endpoint(&["v1", "movies", "search"])?;
         let response: ApiResponse<Vec<MovieSearchResult>> = self
             .send(self.client.get(url).query(&[("q", query)]))
             .await?;
-        choose_best_match(query, response.data)
-            .ok_or_else(|| anyhow!("MetaTube found no metadata for {query}"))
+        Ok(response.data)
     }
 
     pub async fn movie_info(&self, provider: &str, id: &str) -> anyhow::Result<Value> {
@@ -89,12 +102,12 @@ impl MetaTubeClient {
         }
 
         let mut response = self
-            .authorize(self.client.get(url))
+            .authorize(self.image_client.get(url))
             .send()
             .await
             .context("could not download metadata image")?;
         let status = response.status();
-        if !status.is_success() {
+        if status != StatusCode::OK {
             return Err(anyhow!("image download returned HTTP {status}"));
         }
         if response
@@ -204,6 +217,11 @@ fn normalize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        Router,
+        http::{StatusCode, header},
+        routing::get,
+    };
 
     #[test]
     fn exact_number_is_preferred_over_first_result() {
@@ -223,5 +241,64 @@ mod tests {
         ];
         let selected = choose_best_match("abc_123", results).unwrap();
         assert_eq!(selected.provider, "exact");
+    }
+
+    #[tokio::test]
+    async fn image_download_rejects_redirects_and_html() {
+        let app = Router::new()
+            .route(
+                "/image",
+                get(|| async { ([(header::CONTENT_TYPE, "image/jpeg")], vec![1_u8, 2, 3]) }),
+            )
+            .route(
+                "/redirect",
+                get(|| async {
+                    (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, "/image")],
+                        "redirect",
+                    )
+                }),
+            )
+            .route(
+                "/html",
+                get(|| async { ([(header::CONTENT_TYPE, "text/html")], "error page") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let settings = Settings {
+            metatube_url: format!("http://{address}"),
+            metatube_token: String::new(),
+            output_format: "nfo".into(),
+            scan_interval: 60,
+            overwrite_policy: "missing".into(),
+            log_level: "info".into(),
+        };
+        let client = MetaTubeClient::new(&settings).unwrap();
+
+        let image = client
+            .download_image(&format!("http://{address}/image"))
+            .await
+            .unwrap();
+        assert_eq!(image.extension, "jpg");
+        assert_eq!(image.bytes, vec![1, 2, 3]);
+
+        let redirect = client
+            .download_image(&format!("http://{address}/redirect"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(redirect.contains("302"));
+
+        let html = client
+            .download_image(&format!("http://{address}/html"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(html.contains("text/html"));
+        server.abort();
     }
 }

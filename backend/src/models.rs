@@ -50,7 +50,65 @@ pub struct Task {
     pub progress: i64,
     pub error_message: Option<String>,
     pub created_at: String,
+    pub updated_at: String,
     pub finished_at: Option<String>,
+    pub record_count: i64,
+    pub media: Option<TaskMedia>,
+    pub folder: Option<TaskFolder>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskMedia {
+    pub id: i64,
+    pub title: String,
+    pub filename: String,
+    pub path: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskFolder {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRecord {
+    pub id: i64,
+    pub task_id: i64,
+    pub status: String,
+    pub progress: i64,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDetail {
+    #[serde(flatten)]
+    pub task: Task,
+    pub records: Vec<TaskRecord>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaResourceState {
+    pub status: String,
+    pub source: Option<String>,
+    pub path: Option<String>,
+    pub checked_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaResources {
+    pub nfo: MediaResourceState,
+    pub poster: MediaResourceState,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +123,10 @@ pub struct MediaItem {
     pub media_type: String,
     pub provider_id: Option<String>,
     pub status: String,
+    pub scrape_task_id: Option<i64>,
+    pub scrape_task_status: Option<String>,
+    pub scrape_record_count: i64,
+    pub resources: MediaResources,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -98,7 +160,7 @@ pub struct BatchScrapeInput {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchScrapeResponse {
-    pub created: usize,
+    pub queued: usize,
     pub skipped: usize,
     pub tasks: Vec<Task>,
 }

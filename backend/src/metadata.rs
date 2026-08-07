@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, anyhow};
 use serde_json::{Value, json};
 
-use crate::{models::MediaItem, provider::MetaTubeClient};
+use crate::{asset::CachedAsset, models::MediaItem, provider::MetaTubeClient};
 
 pub struct WriteReport {
     pub written: Vec<PathBuf>,
@@ -20,6 +20,7 @@ pub struct WriteOptions<'a> {
     pub overwrite_image: bool,
     pub provider: &'a str,
     pub remote_id: &'a str,
+    pub cached_poster: Option<&'a CachedAsset>,
 }
 
 pub async fn write_sidecars(
@@ -71,10 +72,9 @@ pub async fn write_sidecars(
         write_or_skip(&path, &bytes, overwrite_text, &mut report).await?;
     }
 
-    if let Some(url) = first_string(remote, &["big_cover_url", "cover_url"]) {
-        write_image(
-            client,
-            url,
+    if let Some(poster) = options.cached_poster {
+        write_cached_image(
+            poster,
             parent,
             stem,
             "poster",
@@ -83,8 +83,8 @@ pub async fn write_sidecars(
         )
         .await?;
     }
-    if let Some(url) = first_string(remote, &["big_thumb_url", "thumb_url"]) {
-        write_image(
+    if let Some(url) = first_string(remote, &["big_thumb_url", "thumb_url"])
+        && let Err(error) = write_image(
             client,
             url,
             parent,
@@ -93,10 +93,39 @@ pub async fn write_sidecars(
             overwrite_images,
             &mut report,
         )
-        .await?;
+        .await
+    {
+        tracing::warn!(%error, "fanart download failed; metadata will be kept");
     }
 
     Ok(report)
+}
+
+async fn write_cached_image(
+    cached: &CachedAsset,
+    parent: &Path,
+    stem: &str,
+    kind: &str,
+    overwrite: bool,
+    report: &mut WriteReport,
+) -> anyhow::Result<()> {
+    let existing = ["jpg", "png", "webp"]
+        .into_iter()
+        .map(|extension| parent.join(format!("{stem}-{kind}.{extension}")))
+        .find(|path| path.exists());
+    if !overwrite && let Some(path) = existing {
+        report.skipped.push(path);
+        return Ok(());
+    }
+    let path = parent.join(format!("{stem}-{kind}.{}", cached.extension));
+    let bytes = tokio::fs::read(&cached.path)
+        .await
+        .with_context(|| format!("failed to read cached {kind} image"))?;
+    atomic_write(&path, &bytes)
+        .await
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    report.written.push(path);
+    Ok(())
 }
 
 async fn write_image(

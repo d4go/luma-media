@@ -30,7 +30,39 @@ export interface Task {
   progress: number
   errorMessage: string | null
   createdAt: string
+  updatedAt: string
   finishedAt: string | null
+  recordCount: number
+  media: TaskMedia | null
+  folder: TaskFolder | null
+}
+
+export interface TaskMedia {
+  id: number
+  title: string
+  filename: string
+  path: string
+  status: MediaItem['status']
+}
+
+export interface TaskFolder {
+  id: number
+  name: string
+  path: string
+}
+
+export interface TaskRecord {
+  id: number
+  taskId: number
+  status: TaskStatus
+  progress: number
+  errorMessage: string | null
+  createdAt: string
+  finishedAt: string | null
+}
+
+export interface TaskDetail extends Task {
+  records: TaskRecord[]
 }
 
 export interface MediaItem {
@@ -43,8 +75,22 @@ export interface MediaItem {
   mediaType: string
   providerId: string | null
   status: 'pending' | 'ready' | 'failed'
+  scrapeTaskId: number | null
+  scrapeTaskStatus: TaskStatus | null
+  scrapeRecordCount: number
+  resources: {
+    nfo: MediaResourceState
+    poster: MediaResourceState
+  }
   createdAt: string
   updatedAt: string
+}
+
+export interface MediaResourceState {
+  status: 'ready' | 'missing' | 'failed'
+  source: string | null
+  path: string | null
+  checkedAt: string | null
 }
 
 export interface ScrapeOptions {
@@ -53,7 +99,7 @@ export interface ScrapeOptions {
 }
 
 export interface BatchScrapeResponse {
-  created: number
+  queued: number
   skipped: number
   tasks: Task[]
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, ref } from 'vue'
+import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   darkTheme,
   NButton,
@@ -38,12 +38,12 @@ const activeKey = computed(() => route.path)
 
 const themeOverrides: GlobalThemeOverrides = {
   common: {
-    primaryColor: '#2f7d64', primaryColorHover: '#3c9075', primaryColorPressed: '#286b56',
-    primaryColorSuppl: '#2f7d64', borderRadius: '10px', borderRadiusSmall: '8px',
-    fontFamily: '"Avenir Next", Avenir, "Segoe UI", "Noto Sans SC", sans-serif',
+    primaryColor: '#0071e3', primaryColorHover: '#0077ed', primaryColorPressed: '#0068d1',
+    primaryColorSuppl: '#0071e3', infoColor: '#0071e3', borderRadius: '10px', borderRadiusSmall: '8px',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "PingFang SC", sans-serif',
   },
   Button: { fontWeight: '600' },
-  Card: { borderRadius: '14px' },
+  Card: { borderRadius: '18px' },
 }
 
 function toggleTheme() {
@@ -55,8 +55,12 @@ function onSystemTheme(event: MediaQueryListEvent) {
   if (!localStorage.getItem('luma-theme')) isDark.value = event.matches
 }
 
+watch(isDark, (dark) => document.body.classList.toggle('luma-dark', dark), { immediate: true })
 onMounted(() => prefersDark.addEventListener('change', onSystemTheme))
-onUnmounted(() => prefersDark.removeEventListener('change', onSystemTheme))
+onUnmounted(() => {
+  prefersDark.removeEventListener('change', onSystemTheme)
+  document.body.classList.remove('luma-dark')
+})
 </script>
 
 <template>
@@ -73,7 +77,7 @@ onUnmounted(() => prefersDark.removeEventListener('change', onSystemTheme))
               <n-menu :value="activeKey" :options="menuOptions" @update:value="mobileOpen = false" />
               <div class="sidebar-footer">
                 <span>服务状态</span>
-                <n-tag type="success" size="small" :bordered="false">运行正常</n-tag>
+                <n-tag type="info" size="small" :bordered="false">运行正常</n-tag>
               </div>
             </aside>
 

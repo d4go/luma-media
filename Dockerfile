@@ -20,6 +20,7 @@ COPY --from=backend-builder /app/backend/target/release/luma-server /usr/local/b
 COPY --from=frontend-builder /app/frontend/dist /app/web
 ENV LUMA_BIND=0.0.0.0:3000
 ENV DATABASE_URL=sqlite:///data/luma-media.db?mode=rwc
+ENV LUMA_DATA_DIR=/data
 ENV LUMA_STATIC_DIR=/app/web
 ENV RUST_LOG=luma_server=info,tower_http=info
 VOLUME ["/data"]

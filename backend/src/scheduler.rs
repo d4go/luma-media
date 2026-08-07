@@ -23,7 +23,7 @@ async fn schedule_due_folders(state: &AppState) -> anyhow::Result<()> {
          WHERE mc.enabled = 1 AND mc.scan_mode IN ('interval', 'watch') \
          AND NOT EXISTS (SELECT 1 FROM scrape_task active WHERE active.folder_id = mc.id AND active.status IN ('pending', 'running')) \
          AND (NOT EXISTS (SELECT 1 FROM scrape_task previous WHERE previous.folder_id = mc.id AND previous.task_type = 'scan') \
-              OR COALESCE((SELECT (julianday('now') - julianday(MAX(previous.created_at))) * 1440 FROM scrape_task previous WHERE previous.folder_id = mc.id AND previous.task_type = 'scan'), ?) >= ?)",
+              OR COALESCE((SELECT (julianday('now') - julianday(MAX(previous.updated_at))) * 1440 FROM scrape_task previous WHERE previous.folder_id = mc.id AND previous.task_type = 'scan'), ?) >= ?)",
     )
     .bind(due_after)
     .bind(due_after)
@@ -33,11 +33,12 @@ async fn schedule_due_folders(state: &AppState) -> anyhow::Result<()> {
     for row in rows {
         let id: i64 = row.get("id");
         let folder = storage::folder_by_id(&state.pool, id).await?;
-        let task = storage::create_task(&state.pool, None, Some(id), "scan").await?;
+        let run = storage::create_task_run(&state.pool, None, Some(id), "scan").await?;
         tokio::spawn(api::run_scan_with_auto_scrape(
             state.clone(),
             folder,
-            task.id,
+            run.task.id,
+            run.record_id,
         ));
     }
     Ok(())

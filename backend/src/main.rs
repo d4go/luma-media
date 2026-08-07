@@ -1,4 +1,5 @@
 mod api;
+mod asset;
 mod error;
 mod metadata;
 mod models;
@@ -7,10 +8,11 @@ mod scanner;
 mod scheduler;
 mod storage;
 
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use sqlx::SqlitePool;
+use tokio::sync::Semaphore;
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
@@ -21,6 +23,8 @@ use tracing_subscriber::EnvFilter;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
+    pub scrape_limiter: Arc<Semaphore>,
+    pub asset_root: PathBuf,
 }
 
 #[tokio::main]
@@ -37,20 +41,29 @@ async fn main() -> anyhow::Result<()> {
     let address: SocketAddr = env::var("LUMA_BIND")
         .unwrap_or_else(|_| "0.0.0.0:3000".into())
         .parse()?;
+    let asset_root =
+        PathBuf::from(env::var("LUMA_DATA_DIR").unwrap_or_else(|_| "data".into())).join("assets");
+    tokio::fs::create_dir_all(asset_root.join("poster")).await?;
     let pool = storage::connect(&database_url).await?;
-    let state = AppState { pool };
+    let state = AppState {
+        pool,
+        scrape_limiter: Arc::new(Semaphore::new(8)),
+        asset_root,
+    };
     scheduler::start(state.clone());
+    asset::start_health_job(state.clone());
 
-    let api_router = api::router()
-        .route("/health", get(|| async { (StatusCode::OK, "ok") }))
-        .with_state(state);
+    let api_router = api::router().route("/health", get(|| async { (StatusCode::OK, "ok") }));
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
     let mut app = Router::new()
+        .route("/asset/poster/{media_id}", get(asset::poster))
+        .route("/asset/cover/{media_id}", get(asset::poster))
         .nest("/api/v1", api_router)
+        .with_state(state)
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 

@@ -6,13 +6,14 @@ Luma Media 是一个桌面优先的媒体元数据管理服务。项目按上级
 
 - 概览：媒体数、任务数、成功数、失败数和最近活动
 - 媒体目录：新增前验证 MetaTube，新增后自动扫描和刮削，并支持编辑、删除、启停和立即扫描
-- 扫描器：递归识别常见视频格式，生成文件指纹、更新媒体索引并自动排队待处理媒体
-- 任务中心：状态、进度、详情、单个或批量取消与失败重试
-- 媒体库：搜索、元数据状态筛选、单个刮削与批量刮削任务
+- 扫描器：递归识别常见视频格式，自动关联已有 NFO 与海报，仅排队仍缺元数据的媒体
+- 任务中心：一个媒体对应一个逻辑任务，每次执行与重试都保留独立记录，并显示媒体关联
+- 媒体库：搜索、元数据状态筛选、任务反向关联、单个刮削与批量刮削
 - 系统设置：MetaTube 地址、可选 Token、连接测试、输出格式、扫描间隔、覆盖策略和日志级别
-- MetaTube：调用官方搜索与详情接口，写入 NFO/JSON、海报和背景图，并记录真实任务错误
+- MetaTube：全局并发 8 个刮削执行，调用官方搜索与详情接口，写入 NFO/JSON、海报和背景图
+- 资源回退：严格检查海报/封面 URL，自动切换 Provider，并把成功图片缓存到 `/data/assets`
 - 调度器：按扫描间隔处理 `interval` 和 `watch` 模式目录
-- 明暗主题、移动端导航、加载、空数据和错误状态
+- Apple 风格明暗主题、移动端导航、加载、空数据和错误状态
 
 ## 目录结构
 
@@ -81,6 +82,7 @@ ABC-123-fanart.jpg
 - `GET /tasks`、`GET /tasks/{id}`
 - `POST /tasks/{id}/retry`、`POST /tasks/{id}/cancel`
 - `GET /media`、`POST /media/{id}/scrape`
+- `GET /asset/poster/{mediaId}`、`GET /asset/cover/{mediaId}`
 - `GET|PUT /settings`
 - `POST /settings/metatube/test`
 - `GET /logs`
