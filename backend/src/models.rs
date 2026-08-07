@@ -69,13 +69,52 @@ pub struct MediaItem {
     pub updated_at: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScrapeOptions {
-    #[serde(default)]
+    #[serde(default = "default_enabled")]
     pub overwrite_nfo: bool,
-    #[serde(default)]
+    #[serde(default = "default_enabled")]
     pub overwrite_image: bool,
+}
+
+impl Default for ScrapeOptions {
+    fn default() -> Self {
+        Self {
+            overwrite_nfo: true,
+            overwrite_image: true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchScrapeInput {
+    pub media_ids: Vec<i64>,
+    #[serde(flatten)]
+    pub options: ScrapeOptions,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchScrapeResponse {
+    pub created: usize,
+    pub skipped: usize,
+    pub tasks: Vec<Task>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTaskInput {
+    pub task_ids: Vec<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTaskResponse {
+    pub processed: usize,
+    pub skipped: usize,
+    pub tasks: Vec<Task>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,4 +155,27 @@ pub struct LogEntry {
     pub module: String,
     pub message: String,
     pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrape_options_default_to_overwrite() {
+        let options: ScrapeOptions = serde_json::from_str("{}").unwrap();
+        assert!(options.overwrite_nfo);
+        assert!(options.overwrite_image);
+    }
+
+    #[test]
+    fn batch_scrape_options_are_flattened() {
+        let input: BatchScrapeInput = serde_json::from_str(
+            r#"{"mediaIds":[1,2],"overwriteNfo":false,"overwriteImage":true}"#,
+        )
+        .unwrap();
+        assert_eq!(input.media_ids, vec![1, 2]);
+        assert!(!input.options.overwrite_nfo);
+        assert!(input.options.overwrite_image);
+    }
 }

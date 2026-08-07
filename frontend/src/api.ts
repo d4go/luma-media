@@ -1,4 +1,7 @@
-import type { DashboardStats, Folder, FolderInput, MediaItem, MetaTubeConnection, Settings, Task } from './types'
+import type {
+  BatchScrapeResponse, BatchTaskResponse, DashboardStats, Folder, FolderInput, MediaItem,
+  MetaTubeConnection, ScrapeOptions, Settings, Task,
+} from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
 
@@ -35,9 +38,25 @@ export const api = {
   task: (id: number) => request<Task>(`/tasks/${id}`),
   retryTask: (id: number) => request<Task>(`/tasks/${id}/retry`, { method: 'POST' }),
   cancelTask: (id: number) => request<Task>(`/tasks/${id}/cancel`, { method: 'POST' }),
-  media: (search = '') => request<MediaItem[]>(`/media${search ? `?search=${encodeURIComponent(search)}` : ''}`),
-  scrapeMedia: (id: number, options: { overwriteNfo: boolean; overwriteImage: boolean }) =>
+  retryTasks: (taskIds: number[]) => request<BatchTaskResponse>('/tasks/retry', {
+    method: 'POST', body: JSON.stringify({ taskIds }),
+  }),
+  cancelTasks: (taskIds: number[]) => request<BatchTaskResponse>('/tasks/cancel', {
+    method: 'POST', body: JSON.stringify({ taskIds }),
+  }),
+  media: (search = '', status = '') => {
+    const query = new URLSearchParams()
+    if (search) query.set('search', search)
+    if (status) query.set('status', status)
+    return request<MediaItem[]>(`/media${query.size ? `?${query}` : ''}`)
+  },
+  scrapeMedia: (id: number, options: ScrapeOptions) =>
     request<Task>(`/media/${id}/scrape`, { method: 'POST', body: JSON.stringify(options) }),
+  scrapeMediaBatch: (mediaIds: number[], options: ScrapeOptions) =>
+    request<BatchScrapeResponse>('/media/scrape', {
+      method: 'POST',
+      body: JSON.stringify({ mediaIds, ...options }),
+    }),
   settings: () => request<Settings>('/settings'),
   updateSettings: (settings: Settings) => request<Settings>('/settings', { method: 'PUT', body: JSON.stringify(settings) }),
   testMetaTube: (settings: Settings) => request<MetaTubeConnection>('/settings/metatube/test', { method: 'POST', body: JSON.stringify(settings) }),

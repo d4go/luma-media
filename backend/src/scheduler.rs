@@ -1,6 +1,6 @@
 use sqlx::Row;
 
-use crate::{AppState, scanner, storage};
+use crate::{AppState, api, storage};
 
 pub fn start(state: AppState) {
     tokio::spawn(async move {
@@ -34,7 +34,11 @@ async fn schedule_due_folders(state: &AppState) -> anyhow::Result<()> {
         let id: i64 = row.get("id");
         let folder = storage::folder_by_id(&state.pool, id).await?;
         let task = storage::create_task(&state.pool, None, Some(id), "scan").await?;
-        tokio::spawn(scanner::run_scan(state.clone(), folder, task.id));
+        tokio::spawn(api::run_scan_with_auto_scrape(
+            state.clone(),
+            folder,
+            task.id,
+        ));
     }
     Ok(())
 }

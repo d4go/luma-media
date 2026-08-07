@@ -68,7 +68,7 @@ async function save() {
   try {
     if (editingId.value) await api.updateFolder(editingId.value, { ...form })
     else await api.createFolder({ ...form })
-    message.success(editingId.value ? '目录已更新' : '目录已添加')
+    message.success(editingId.value ? '目录已更新' : form.enabled ? '目录已添加，正在自动扫描并刮削' : '目录已添加')
     modalOpen.value = false
     await load()
   } catch (reason) { message.error(reason instanceof Error ? reason.message : '保存失败') }
@@ -119,6 +119,6 @@ onMounted(load)
         <n-form-item label="启用目录"><NSwitch v-model:value="form.enabled" /></n-form-item>
       </div>
     </n-form>
-    <template #footer><div style="display:flex;justify-content:flex-end;gap:10px"><n-button @click="modalOpen=false">取消</n-button><n-button type="primary" :loading="saving" @click="save">保存目录</n-button></div></template>
+    <template #footer><div style="display:flex;justify-content:flex-end;gap:10px"><n-button @click="modalOpen=false">取消</n-button><n-button type="primary" :loading="saving" @click="save">{{ editingId ? '保存目录' : '检测并创建' }}</n-button></div></template>
   </n-modal>
 </template>

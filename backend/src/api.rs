@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json, Router,
@@ -14,8 +14,9 @@ use crate::{
     error::{AppError, AppResult},
     metadata::{self, WriteOptions},
     models::{
-        DashboardStats, Folder, FolderInput, LogEntry, MediaItem, MetaTubeConnection,
-        ScrapeOptions, Settings, Task,
+        BatchScrapeInput, BatchScrapeResponse, BatchTaskInput, BatchTaskResponse, DashboardStats,
+        Folder, FolderInput, LogEntry, MediaItem, MetaTubeConnection, ScrapeOptions, Settings,
+        Task,
     },
     provider::MetaTubeClient,
     scanner,
@@ -29,10 +30,13 @@ pub fn router() -> Router<AppState> {
         .route("/folders/{id}", put(update_folder).delete(delete_folder))
         .route("/folders/{id}/scan", post(scan_folder))
         .route("/tasks", get(list_tasks))
+        .route("/tasks/retry", post(retry_tasks))
+        .route("/tasks/cancel", post(cancel_tasks))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/retry", post(retry_task))
         .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/media", get(list_media))
+        .route("/media/scrape", post(scrape_media_batch))
         .route("/media/{id}/scrape", post(scrape_media))
         .route("/settings", get(get_settings).put(update_settings))
         .route("/settings/metatube/test", post(test_metatube))
@@ -79,6 +83,8 @@ async fn create_folder(
     Json(input): Json<FolderInput>,
 ) -> AppResult<(StatusCode, Json<Folder>)> {
     validate_folder(&input)?;
+    validate_folder_path(&input.path).await?;
+    ensure_metatube_connected(&state).await?;
     let result = sqlx::query(
         "INSERT INTO media_config (name, path, media_type, output_format, scan_mode, enabled) VALUES (?, ?, ?, ?, ?, ?)",
     )
@@ -97,7 +103,57 @@ async fn create_folder(
         &format!("Added folder {}", folder.name),
     )
     .await;
+    if folder.enabled {
+        let task = storage::create_task(&state.pool, None, Some(folder.id), "scan").await?;
+        tokio::spawn(run_scan_with_auto_scrape(state, folder.clone(), task.id));
+    }
     Ok((StatusCode::CREATED, Json(folder)))
+}
+
+pub(crate) async fn run_scan_with_auto_scrape(state: AppState, folder: Folder, scan_task_id: i64) {
+    scanner::run_scan(state.clone(), folder.clone(), scan_task_id).await;
+    let scan_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM scrape_task WHERE id = ?")
+            .bind(scan_task_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+    if scan_status.as_deref() != Some("success") {
+        return;
+    }
+
+    let media_ids = match sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM media_item WHERE folder_id = ? AND status = 'pending' ORDER BY id ASC",
+    )
+    .bind(folder.id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(%error, folder_id = folder.id, "failed to load media for automatic scrape");
+            storage::log(
+                &state.pool,
+                "error",
+                "folder",
+                &format!("Could not start automatic scraping for {}", folder.name),
+            )
+            .await;
+            return;
+        }
+    };
+
+    if let Err(error) = queue_scrapes(&state, media_ids, ScrapeOptions::default()).await {
+        tracing::error!(%error, folder_id = folder.id, "failed to queue automatic scrape tasks");
+        storage::log(
+            &state.pool,
+            "error",
+            "folder",
+            &format!("Could not queue automatic scraping for {}", folder.name),
+        )
+        .await;
+    }
 }
 
 async fn update_folder(
@@ -106,6 +162,7 @@ async fn update_folder(
     Json(input): Json<FolderInput>,
 ) -> AppResult<Json<Folder>> {
     validate_folder(&input)?;
+    validate_folder_path(&input.path).await?;
     let result = sqlx::query(
         "UPDATE media_config SET name = ?, path = ?, media_type = ?, output_format = ?, scan_mode = ?, enabled = ?, updated_at = datetime('now') WHERE id = ?",
     )
@@ -146,7 +203,7 @@ async fn scan_folder(
         return Err(AppError::BadRequest("folder is disabled".into()));
     }
     let task = storage::create_task(&state.pool, None, Some(id), "scan").await?;
-    tokio::spawn(scanner::run_scan(state, folder, task.id));
+    tokio::spawn(run_scan_with_auto_scrape(state, folder, task.id));
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
@@ -173,10 +230,86 @@ async fn retry_task(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<(StatusCode, Json<Task>)> {
-    let previous = storage::task_by_id(&state.pool, id).await?;
-    if matches!(previous.status.as_str(), "pending" | "running") {
-        return Err(AppError::BadRequest("active task cannot be retried".into()));
+    let task = retry_task_by_id(&state, id).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+async fn retry_tasks(
+    State(state): State<AppState>,
+    Json(input): Json<BatchTaskInput>,
+) -> AppResult<(StatusCode, Json<BatchTaskResponse>)> {
+    validate_batch_task_input(&input)?;
+    let requested = input.task_ids.len();
+    let mut seen = HashSet::new();
+    let task_ids = input
+        .task_ids
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .collect::<Vec<_>>();
+    let mut skipped = requested.saturating_sub(task_ids.len());
+    let mut tasks = Vec::new();
+    for task_id in task_ids {
+        match retry_task_by_id(&state, task_id).await {
+            Ok(task) => tasks.push(task),
+            Err(AppError::BadRequest(_) | AppError::NotFound) => skipped += 1,
+            Err(error) => return Err(error),
+        }
     }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(BatchTaskResponse {
+            processed: tasks.len(),
+            skipped,
+            tasks,
+        }),
+    ))
+}
+
+async fn retry_task_by_id(state: &AppState, id: i64) -> AppResult<Task> {
+    let previous = storage::task_by_id(&state.pool, id).await?;
+    if !matches!(previous.status.as_str(), "failed" | "cancelled") {
+        return Err(AppError::BadRequest(
+            "only failed or cancelled tasks can be retried".into(),
+        ));
+    }
+
+    enum RetryTarget {
+        Scan(Folder),
+        Scrape(i64),
+    }
+    let target = match previous.task_type.as_str() {
+        "scan" => RetryTarget::Scan(
+            storage::folder_by_id(&state.pool, previous.folder_id.ok_or(AppError::NotFound)?)
+                .await?,
+        ),
+        "scrape" => {
+            let media_id = previous.media_id.ok_or(AppError::NotFound)?;
+            storage::media_by_id(&state.pool, media_id).await?;
+            RetryTarget::Scrape(media_id)
+        }
+        _ => return Err(AppError::BadRequest("unknown task type".into())),
+    };
+
+    let active: i64 = match &target {
+        RetryTarget::Scan(folder) => sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM scrape_task WHERE folder_id = ? AND task_type = 'scan' AND status IN ('pending', 'running'))",
+        )
+        .bind(folder.id)
+        .fetch_one(&state.pool)
+        .await?,
+        RetryTarget::Scrape(media_id) => sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM scrape_task WHERE media_id = ? AND task_type = 'scrape' AND status IN ('pending', 'running'))",
+        )
+        .bind(media_id)
+        .fetch_one(&state.pool)
+        .await?,
+    };
+    if active != 0 {
+        return Err(AppError::BadRequest(
+            "a retry for this resource is already active".into(),
+        ));
+    }
+
     let task = storage::create_task(
         &state.pool,
         previous.media_id,
@@ -184,31 +317,55 @@ async fn retry_task(
         &previous.task_type,
     )
     .await?;
-    match previous.task_type.as_str() {
-        "scan" => {
-            let folder =
-                storage::folder_by_id(&state.pool, previous.folder_id.ok_or(AppError::NotFound)?)
-                    .await?;
-            tokio::spawn(scanner::run_scan(state, folder, task.id));
+    match target {
+        RetryTarget::Scan(folder) => {
+            tokio::spawn(run_scan_with_auto_scrape(state.clone(), folder, task.id));
         }
-        "scrape" => {
-            let media_id = previous.media_id.ok_or(AppError::NotFound)?;
+        RetryTarget::Scrape(media_id) => {
             tokio::spawn(run_scrape(
-                state,
+                state.clone(),
                 media_id,
                 task.id,
-                ScrapeOptions {
-                    overwrite_nfo: false,
-                    overwrite_image: false,
-                },
+                ScrapeOptions::default(),
             ));
         }
-        _ => return Err(AppError::BadRequest("unknown task type".into())),
     }
-    Ok((StatusCode::ACCEPTED, Json(task)))
+    Ok(task)
 }
 
 async fn cancel_task(State(state): State<AppState>, Path(id): Path<i64>) -> AppResult<Json<Task>> {
+    Ok(Json(cancel_task_by_id(&state, id).await?))
+}
+
+async fn cancel_tasks(
+    State(state): State<AppState>,
+    Json(input): Json<BatchTaskInput>,
+) -> AppResult<Json<BatchTaskResponse>> {
+    validate_batch_task_input(&input)?;
+    let requested = input.task_ids.len();
+    let mut seen = HashSet::new();
+    let task_ids = input
+        .task_ids
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .collect::<Vec<_>>();
+    let mut skipped = requested.saturating_sub(task_ids.len());
+    let mut tasks = Vec::new();
+    for task_id in task_ids {
+        match cancel_task_by_id(&state, task_id).await {
+            Ok(task) => tasks.push(task),
+            Err(AppError::BadRequest(_) | AppError::NotFound) => skipped += 1,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Json(BatchTaskResponse {
+        processed: tasks.len(),
+        skipped,
+        tasks,
+    }))
+}
+
+async fn cancel_task_by_id(state: &AppState, id: i64) -> AppResult<Task> {
     let result = sqlx::query(
         "UPDATE scrape_task SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status IN ('pending', 'running')",
     ).bind(id).execute(&state.pool).await?;
@@ -219,23 +376,70 @@ async fn cancel_task(State(state): State<AppState>, Path(id): Path<i64>) -> AppR
             task.status
         )));
     }
-    Ok(Json(storage::task_by_id(&state.pool, id).await?))
+    storage::task_by_id(&state.pool, id).await
 }
 
 async fn list_media(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> AppResult<Json<Vec<MediaItem>>> {
-    let rows = if let Some(search) = query.get("search").filter(|value| !value.is_empty()) {
-        let pattern = format!("%{search}%");
-        sqlx::query("SELECT * FROM media_item WHERE filename LIKE ? OR title LIKE ? ORDER BY updated_at DESC LIMIT 500")
-            .bind(&pattern).bind(&pattern).fetch_all(&state.pool).await?
-    } else {
-        sqlx::query("SELECT * FROM media_item ORDER BY updated_at DESC LIMIT 500")
+    let search = query
+        .get("search")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    let status = query
+        .get("status")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    if let Some(status) = status
+        && !matches!(status, "pending" | "ready" | "failed")
+    {
+        return Err(AppError::BadRequest("unknown media status".into()));
+    }
+    let rows = match (search, status) {
+        (Some(search), Some(status)) => {
+            let pattern = format!("%{search}%");
+            sqlx::query("SELECT * FROM media_item WHERE (filename LIKE ? OR title LIKE ?) AND status = ? ORDER BY updated_at DESC LIMIT 500")
+                .bind(&pattern).bind(&pattern).bind(status).fetch_all(&state.pool).await?
+        }
+        (Some(search), None) => {
+            let pattern = format!("%{search}%");
+            sqlx::query("SELECT * FROM media_item WHERE filename LIKE ? OR title LIKE ? ORDER BY updated_at DESC LIMIT 500")
+                .bind(&pattern).bind(&pattern).fetch_all(&state.pool).await?
+        }
+        (None, Some(status)) => {
+            sqlx::query(
+                "SELECT * FROM media_item WHERE status = ? ORDER BY updated_at DESC LIMIT 500",
+            )
+            .bind(status)
             .fetch_all(&state.pool)
             .await?
+        }
+        (None, None) => {
+            sqlx::query("SELECT * FROM media_item ORDER BY updated_at DESC LIMIT 500")
+                .fetch_all(&state.pool)
+                .await?
+        }
     };
     Ok(Json(rows.iter().map(media_from_row).collect()))
+}
+
+async fn scrape_media_batch(
+    State(state): State<AppState>,
+    Json(input): Json<BatchScrapeInput>,
+) -> AppResult<(StatusCode, Json<BatchScrapeResponse>)> {
+    if input.media_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "select at least one media item".into(),
+        ));
+    }
+    if input.media_ids.len() > 500 {
+        return Err(AppError::BadRequest(
+            "a batch can contain at most 500 media items".into(),
+        ));
+    }
+    let response = queue_scrapes(&state, input.media_ids, input.options).await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
 async fn scrape_media(
@@ -243,17 +447,84 @@ async fn scrape_media(
     Path(id): Path<i64>,
     Json(options): Json<ScrapeOptions>,
 ) -> AppResult<(StatusCode, Json<Task>)> {
-    storage::media_by_id(&state.pool, id).await?;
-    let task = storage::create_task(&state.pool, Some(id), None, "scrape").await?;
+    let media = storage::media_by_id(&state.pool, id).await?;
+    let task = storage::create_task(&state.pool, Some(id), media.folder_id, "scrape").await?;
     tokio::spawn(run_scrape(state, id, task.id, options));
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
+async fn queue_scrapes(
+    state: &AppState,
+    media_ids: Vec<i64>,
+    options: ScrapeOptions,
+) -> AppResult<BatchScrapeResponse> {
+    let requested = media_ids.len();
+    let mut seen = HashSet::new();
+    let media_ids = media_ids
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .collect::<Vec<_>>();
+
+    let mut folder_ids = HashMap::new();
+    for media_id in &media_ids {
+        let media = storage::media_by_id(&state.pool, *media_id).await?;
+        folder_ids.insert(*media_id, media.folder_id);
+    }
+
+    let mut skipped = requested.saturating_sub(media_ids.len());
+    let mut tasks = Vec::new();
+    for media_id in media_ids {
+        let active: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM scrape_task WHERE media_id = ? AND task_type = 'scrape' AND status IN ('pending', 'running'))",
+        )
+        .bind(media_id)
+        .fetch_one(&state.pool)
+        .await?;
+        if active != 0 {
+            skipped += 1;
+            continue;
+        }
+        tasks.push(
+            storage::create_task(
+                &state.pool,
+                Some(media_id),
+                folder_ids.get(&media_id).copied().flatten(),
+                "scrape",
+            )
+            .await?,
+        );
+    }
+
+    let queued = tasks
+        .iter()
+        .filter_map(|task| task.media_id.map(|media_id| (media_id, task.id)))
+        .collect::<Vec<_>>();
+    if !queued.is_empty() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            for (media_id, task_id) in queued {
+                run_scrape(state.clone(), media_id, task_id, options).await;
+            }
+        });
+    }
+
+    Ok(BatchScrapeResponse {
+        created: tasks.len(),
+        skipped,
+        tasks,
+    })
+}
+
 async fn run_scrape(state: AppState, media_id: i64, task_id: i64, options: ScrapeOptions) {
-    let _ = sqlx::query("UPDATE scrape_task SET status = 'running', progress = 10 WHERE id = ?")
-        .bind(task_id)
-        .execute(&state.pool)
-        .await;
+    let started = sqlx::query(
+        "UPDATE scrape_task SET status = 'running', progress = 10 WHERE id = ? AND status = 'pending'",
+    )
+    .bind(task_id)
+    .execute(&state.pool)
+    .await;
+    if !matches!(started, Ok(result) if result.rows_affected() == 1) {
+        return;
+    }
 
     let media = match storage::media_by_id(&state.pool, media_id).await {
         Ok(media) => media,
@@ -484,6 +755,18 @@ async fn test_metatube(Json(settings): Json<Settings>) -> AppResult<Json<MetaTub
     }))
 }
 
+async fn ensure_metatube_connected(state: &AppState) -> AppResult<()> {
+    let settings = storage::load_settings(&state.pool).await?;
+    validate_settings(&settings)?;
+    let client = MetaTubeClient::new(&settings)
+        .map_err(|error| AppError::BadRequest(format!("MetaTube connection failed: {error}")))?;
+    client
+        .test_connection()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("MetaTube connection failed: {error}")))?;
+    Ok(())
+}
+
 async fn list_logs(State(state): State<AppState>) -> AppResult<Json<Vec<LogEntry>>> {
     let rows = sqlx::query("SELECT * FROM system_log ORDER BY created_at DESC, id DESC LIMIT 100")
         .fetch_all(&state.pool)
@@ -516,6 +799,31 @@ fn validate_folder(input: &FolderInput) -> AppResult<()> {
     if !matches!(input.output_format.as_str(), "nfo" | "json" | "both") {
         return Err(AppError::BadRequest(
             "output format must be nfo, json, or both".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_folder_path(path: &str) -> AppResult<()> {
+    let path = path.trim();
+    let metadata = tokio::fs::metadata(path).await.map_err(|error| {
+        AppError::BadRequest(format!("folder path is not accessible: {path} ({error})"))
+    })?;
+    if !metadata.is_dir() {
+        return Err(AppError::BadRequest(format!(
+            "folder path is not a directory: {path}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_batch_task_input(input: &BatchTaskInput) -> AppResult<()> {
+    if input.task_ids.is_empty() {
+        return Err(AppError::BadRequest("select at least one task".into()));
+    }
+    if input.task_ids.len() > 250 {
+        return Err(AppError::BadRequest(
+            "a batch can contain at most 250 tasks".into(),
         ));
     }
     Ok(())

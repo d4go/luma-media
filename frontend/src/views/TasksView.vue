@@ -12,12 +12,15 @@ const message = useMessage()
 const tasks = ref<Task[]>([])
 const loading = ref(true)
 const status = ref('')
+const checkedRowKeys = ref<Array<string | number>>([])
+const batchAction = ref<'retry' | 'cancel' | ''>('')
 const detail = ref<Task | null>(null)
 const drawerOpen = ref(false)
 const drawerWidth = ref(440)
 let timer: number | undefined
 
 const columns: DataTableColumns<Task> = [
+  { type: 'selection' },
   { title: '任务编号', key: 'id', width: 100, render: (row) => `#${row.id}` },
   { title: '类型', key: 'taskType', width: 130, render: (row) => taskTypeLabel[row.taskType] },
   { title: '状态', key: 'status', width: 105, render: (row) => h(NTag, { type: statusType[row.status], bordered: false, size: 'small' }, { default: () => statusLabel[row.status] }) },
@@ -36,6 +39,7 @@ const columns: DataTableColumns<Task> = [
     ]),
   },
 ]
+const rowKey = (row: Task) => row.id
 
 async function load(silent = false) {
   if (!silent) loading.value = true
@@ -52,6 +56,39 @@ async function cancel(task: Task) {
   try { await api.cancelTask(task.id); message.success('任务已取消'); await load(true) }
   catch (reason) { message.error(reason instanceof Error ? reason.message : '取消失败') }
 }
+function selectedTaskIds() {
+  return checkedRowKeys.value.map(Number).filter(Number.isFinite)
+}
+async function retrySelected() {
+  const ids = selectedTaskIds()
+  if (!ids.length) return
+  batchAction.value = 'retry'
+  try {
+    const result = await api.retryTasks(ids)
+    if (result.processed) message.success(`已创建 ${result.processed} 个重试任务${result.skipped ? `，跳过 ${result.skipped} 个不可重试任务` : ''}`)
+    else message.warning('所选任务当前不可重试')
+    checkedRowKeys.value = []
+    await load(true)
+  } catch (reason) { message.error(reason instanceof Error ? reason.message : '批量重试失败') }
+  finally { batchAction.value = '' }
+}
+async function cancelSelected() {
+  const ids = selectedTaskIds()
+  if (!ids.length) return
+  batchAction.value = 'cancel'
+  try {
+    const result = await api.cancelTasks(ids)
+    if (result.processed) message.success(`已取消 ${result.processed} 个任务${result.skipped ? `，跳过 ${result.skipped} 个已结束任务` : ''}`)
+    else message.warning('所选任务均已结束')
+    checkedRowKeys.value = []
+    await load(true)
+  } catch (reason) { message.error(reason instanceof Error ? reason.message : '批量取消失败') }
+  finally { batchAction.value = '' }
+}
+function changeStatus() {
+  checkedRowKeys.value = []
+  load()
+}
 
 onMounted(() => { drawerWidth.value = Math.min(440, window.innerWidth); load(); timer = window.setInterval(() => load(true), 5000) })
 onUnmounted(() => window.clearInterval(timer))
@@ -62,12 +99,14 @@ onUnmounted(() => window.clearInterval(timer))
     <n-button secondary :loading="loading" @click="load()"><template #icon><IconRefresh /></template>刷新</n-button>
   </PageHeader>
   <div class="toolbar">
-    <n-select v-model:value="status" style="width: 180px" :options="[{label:'全部状态',value:''},{label:'等待中',value:'pending'},{label:'执行中',value:'running'},{label:'成功',value:'success'},{label:'失败',value:'failed'},{label:'已取消',value:'cancelled'}]" @update:value="load()" />
+    <n-select v-model:value="status" style="width: 180px" :options="[{label:'全部状态',value:''},{label:'等待中',value:'pending'},{label:'执行中',value:'running'},{label:'成功',value:'success'},{label:'失败',value:'failed'},{label:'已取消',value:'cancelled'}]" @update:value="changeStatus" />
+    <n-button secondary :loading="batchAction === 'retry'" :disabled="!checkedRowKeys.length || !!batchAction" @click="retrySelected"><template #icon><IconRotateClockwise /></template>批量重试</n-button>
+    <n-button secondary type="warning" :loading="batchAction === 'cancel'" :disabled="!checkedRowKeys.length || !!batchAction" @click="cancelSelected"><template #icon><IconX /></template>批量取消</n-button>
   </div>
   <section class="panel">
     <div v-if="loading" style="padding: 20px"><n-skeleton text :repeat="8" /></div>
     <EmptyState v-else-if="!tasks.length" title="没有符合条件的任务" description="扫描媒体目录或刮削媒体后，任务会显示在这里。" />
-    <div v-else class="table-wrap"><n-data-table :columns="columns" :data="tasks" :bordered="false" :single-line="false" /></div>
+    <div v-else class="table-wrap"><n-data-table v-model:checked-row-keys="checkedRowKeys" :row-key="rowKey" :columns="columns" :data="tasks" :bordered="false" :single-line="false" /></div>
   </section>
 
   <n-drawer v-model:show="drawerOpen" :width="drawerWidth" placement="right">

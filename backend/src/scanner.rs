@@ -15,10 +15,15 @@ const MEDIA_EXTENSIONS: &[&str] = &[
 
 pub async fn run_scan(state: AppState, folder: Folder, task_id: i64) {
     let pool = &state.pool;
-    let _ = sqlx::query("UPDATE scrape_task SET status = 'running', progress = 5 WHERE id = ?")
-        .bind(task_id)
-        .execute(pool)
-        .await;
+    let started = sqlx::query(
+        "UPDATE scrape_task SET status = 'running', progress = 5 WHERE id = ? AND status = 'pending'",
+    )
+    .bind(task_id)
+    .execute(pool)
+    .await;
+    if !matches!(started, Ok(result) if result.rows_affected() == 1) {
+        return;
+    }
 
     let scan_path = folder.path.clone();
     let files = task::spawn_blocking(move || collect_media_files(&scan_path)).await;

@@ -42,9 +42,26 @@ export interface MediaItem {
   title: string
   mediaType: string
   providerId: string | null
-  status: string
+  status: 'pending' | 'ready' | 'failed'
   createdAt: string
   updatedAt: string
+}
+
+export interface ScrapeOptions {
+  overwriteNfo: boolean
+  overwriteImage: boolean
+}
+
+export interface BatchScrapeResponse {
+  created: number
+  skipped: number
+  tasks: Task[]
+}
+
+export interface BatchTaskResponse {
+  processed: number
+  skipped: number
+  tasks: Task[]
 }
 
 export interface DashboardStats {
