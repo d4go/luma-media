@@ -190,6 +190,7 @@ mod tests {
             crawler_limiter: Arc::new(Semaphore::new(1)),
             asset_root: root.join("assets"),
             script_root: root.join("crawlers"),
+            events: tokio::sync::broadcast::channel(32).0,
         };
         let watcher = start(state);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

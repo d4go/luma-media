@@ -9,7 +9,7 @@ use crate::{
     AppState,
     error::{AppError, AppResult},
     models::{CrawlerResult, CrawlerRun, CrawlerScript},
-    qbittorrent::QBittorrentClient,
+    product::{self, AcquireInput},
     storage,
 };
 
@@ -381,20 +381,26 @@ pub async fn download_result(state: &AppState, result_id: i64) -> AppResult<Craw
         ));
     }
 
-    let outcome: anyhow::Result<Option<String>> = async {
-        let settings = storage::load_settings(&state.pool).await?;
-        let client = QBittorrentClient::new(&settings)?;
-        client
-            .add_download(&result.download_url, &result.trackers)
-            .await
+    let outcome: AppResult<i64> = async {
+        let (media_id, resource_id) = product::ingest_crawler_result(state, result_id).await?;
+        let acquisition = product::request_acquisition(
+            state,
+            AcquireInput {
+                media_id: Some(media_id),
+                resource_id: Some(resource_id),
+                requested_by: format!("crawler:{}", result.script_id),
+            },
+        )
+        .await?;
+        Ok(acquisition.id)
     }
     .await;
     match outcome {
-        Ok(hash) => {
+        Ok(acquisition_id) => {
             sqlx::query(
-                "UPDATE crawler_result SET download_status = 'success', qbit_hash = ?, downloaded_at = datetime('now') WHERE id = ?",
+                "UPDATE crawler_result SET download_status = 'success', error_message = ?, downloaded_at = datetime('now') WHERE id = ?",
             )
-            .bind(hash)
+            .bind(format!("Acquisition #{acquisition_id}"))
             .bind(result_id)
             .execute(&state.pool)
             .await?;

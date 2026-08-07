@@ -74,17 +74,30 @@ impl QBittorrentClient {
         Ok(response.text().await?.trim().to_owned())
     }
 
-    pub async fn add_download(
+    pub async fn add_download_with_options(
         &self,
         download_url: &str,
         trackers: &[String],
+        save_path: Option<&str>,
+        category: Option<&str>,
+        tags: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
         let cookie = self.login().await?;
+        let mut form = vec![("urls", download_url)];
+        if let Some(value) = save_path.filter(|value| !value.trim().is_empty()) {
+            form.push(("savepath", value));
+        }
+        if let Some(value) = category.filter(|value| !value.trim().is_empty()) {
+            form.push(("category", value));
+        }
+        if let Some(value) = tags.filter(|value| !value.trim().is_empty()) {
+            form.push(("tags", value));
+        }
         let response = self
             .http
             .post(format!("{}/api/v2/torrents/add", self.base_url))
             .header(COOKIE, &cookie)
-            .form(&[("urls", download_url)])
+            .form(&form)
             .send()
             .await?;
         let status = response.status();
@@ -432,9 +445,12 @@ mod tests {
         };
         let client = QBittorrentClient::new(&settings).unwrap();
         let hash = client
-            .add_download(
+            .add_download_with_options(
                 "magnet:?xt=urn:btih:ABC123&dn=Example",
                 &["udp://tracker.example:80/announce".into()],
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();

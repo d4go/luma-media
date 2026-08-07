@@ -17,6 +17,9 @@ services:
         # 需要读写权限，刮削结果会写在视频文件旁边
         - ${MEDIA_ROOT:-/vol1/1000/a1}:/media:rw
 
+        # qBittorrent 与 Luma 必须共享同一下载目录，便于完成后整理入库
+        - ${DOWNLOAD_ROOT:-/vol3/1000/docker/downloads}:/downloads:rw
+
       environment:
         DATABASE_URL: sqlite:///data/luma.db?mode=rwc
         LUMA_DATA_DIR: /data

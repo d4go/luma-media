@@ -527,6 +527,7 @@ mod tests {
             crawler_limiter: Arc::new(Semaphore::new(2)),
             asset_root: asset_root.clone(),
             script_root: std::env::temp_dir().join(format!("luma-crawler-test-{nonce}")),
+            events: tokio::sync::broadcast::channel(32).0,
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

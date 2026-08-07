@@ -7,6 +7,20 @@ use crate::{
 };
 
 pub fn start(state: AppState) {
+    let acquisition_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = crate::product::recover(&acquisition_state).await {
+            tracing::warn!(%error, "acquisition startup recovery failed");
+        }
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(error) = crate::product::reconcile_active(&acquisition_state).await {
+                tracing::warn!(%error, "acquisition reconciliation tick failed");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -22,6 +36,9 @@ pub fn start(state: AppState) {
             }
             if let Err(error) = schedule_tracker_update(&state).await {
                 tracing::warn!(%error, "tracker scheduler tick failed");
+            }
+            if let Err(error) = crate::product::run_automations(&state).await {
+                tracing::warn!(%error, "automation scheduler tick failed");
             }
         }
     });

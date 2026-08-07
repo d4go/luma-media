@@ -4,6 +4,7 @@ mod crawler;
 mod error;
 mod metadata;
 mod models;
+mod product;
 mod provider;
 mod qbittorrent;
 mod scanner;
@@ -15,9 +16,8 @@ use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
 use sqlx::SqlitePool;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, broadcast};
 use tower_http::{
-    cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
@@ -30,6 +30,7 @@ pub struct AppState {
     pub crawler_limiter: Arc<Semaphore>,
     pub asset_root: PathBuf,
     pub script_root: PathBuf,
+    pub events: broadcast::Sender<String>,
 }
 
 #[tokio::main]
@@ -53,12 +54,14 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(script_root.join("runs")).await?;
     tokio::fs::create_dir_all(script_root.join("scripts")).await?;
     let pool = storage::connect(&database_url).await?;
+    let (events, _) = broadcast::channel(512);
     let state = AppState {
         pool,
         scrape_limiter: Arc::new(Semaphore::new(8)),
         crawler_limiter: Arc::new(Semaphore::new(2)),
         asset_root,
         script_root,
+        events,
     };
     scheduler::start(state.clone());
     let _watcher = watcher::start(state.clone());
@@ -66,16 +69,11 @@ async fn main() -> anyhow::Result<()> {
 
     let api_router = api::router().route("/health", get(|| async { (StatusCode::OK, "ok") }));
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
     let mut app = Router::new()
         .route("/asset/poster/{media_id}", get(asset::poster))
         .route("/asset/cover/{media_id}", get(asset::poster))
         .nest("/api/v1", api_router)
         .with_state(state)
-        .layer(cors)
         .layer(TraceLayer::new_for_http());
 
     if let Ok(static_dir) = env::var("LUMA_STATIC_DIR") {

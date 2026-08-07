@@ -27,6 +27,7 @@ use crate::{
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .merge(crate::product::router())
         .route("/dashboard", get(dashboard))
         .route("/folders", get(list_folders).post(create_folder))
         .route("/folders/{id}", put(update_folder).delete(delete_folder))
@@ -1168,13 +1169,24 @@ async fn get_settings(
         .execute(&state.pool)
         .await?;
     }
-    Ok(Json(storage::load_settings(&state.pool).await?))
+    let mut settings = storage::load_settings(&state.pool).await?;
+    settings.metatube_token.clear();
+    settings.qbittorrent_password.clear();
+    Ok(Json(settings))
 }
 
 async fn update_settings(
     State(state): State<AppState>,
     Json(settings): Json<Settings>,
 ) -> AppResult<Json<Settings>> {
+    let existing = storage::load_settings(&state.pool).await?;
+    let mut settings = settings;
+    if settings.metatube_token.trim().is_empty() {
+        settings.metatube_token = existing.metatube_token;
+    }
+    if settings.qbittorrent_password.trim().is_empty() {
+        settings.qbittorrent_password = existing.qbittorrent_password;
+    }
     validate_settings(&settings)?;
     let values = [
         ("metatube_url", settings.metatube_url.clone()),
@@ -1211,6 +1223,10 @@ async fn update_settings(
             .bind(key).bind(value).execute(&mut *transaction).await?;
     }
     transaction.commit().await?;
+    sqlx::query("UPDATE provider_config SET base_url = ?, secret = ?, updated_at = datetime('now') WHERE provider_key = 'metatube'")
+        .bind(&settings.metatube_url).bind(&settings.metatube_token).execute(&state.pool).await?;
+    sqlx::query("UPDATE provider_config SET base_url = ?, secret = ?, updated_at = datetime('now') WHERE provider_key = 'qbittorrent'")
+        .bind(&settings.qbittorrent_url).bind(&settings.qbittorrent_password).execute(&state.pool).await?;
     storage::log(
         &state.pool,
         "info",
@@ -1218,6 +1234,8 @@ async fn update_settings(
         "Updated application settings",
     )
     .await;
+    settings.metatube_token.clear();
+    settings.qbittorrent_password.clear();
     Ok(Json(settings))
 }
 
@@ -1288,7 +1306,13 @@ fn health_from_probe(
     }
 }
 
-async fn test_metatube(Json(settings): Json<Settings>) -> AppResult<Json<MetaTubeConnection>> {
+async fn test_metatube(
+    State(state): State<AppState>,
+    Json(mut settings): Json<Settings>,
+) -> AppResult<Json<MetaTubeConnection>> {
+    if settings.metatube_token.trim().is_empty() {
+        settings.metatube_token = storage::load_settings(&state.pool).await?.metatube_token;
+    }
     validate_metatube_settings(&settings)?;
     let client =
         MetaTubeClient::new(&settings).map_err(|error| AppError::BadRequest(error.to_string()))?;
@@ -1304,8 +1328,14 @@ async fn test_metatube(Json(settings): Json<Settings>) -> AppResult<Json<MetaTub
 }
 
 async fn test_qbittorrent(
-    Json(settings): Json<Settings>,
+    State(state): State<AppState>,
+    Json(mut settings): Json<Settings>,
 ) -> AppResult<Json<QBittorrentConnection>> {
+    if settings.qbittorrent_password.trim().is_empty() {
+        settings.qbittorrent_password = storage::load_settings(&state.pool)
+            .await?
+            .qbittorrent_password;
+    }
     validate_qbittorrent_settings(&settings)?;
     let version = QBittorrentClient::new(&settings)
         .map_err(|error| AppError::BadRequest(error.to_string()))?

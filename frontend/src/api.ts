@@ -2,6 +2,7 @@ import type {
   BatchScrapeResponse, BatchTaskResponse, CrawlerForm, CrawlerResult, CrawlerRun, CrawlerScript,
   DashboardStats, DownloadItem, Folder, FolderInput, MediaItem, MetaTubeConnection, QBittorrentConnection,
   ScrapeOptions, ServiceStatus, Settings, Task, TaskDetail,
+  Acquisition, AcquisitionDetail, Actor, AttentionItem, AutomationRule, HomeData, LibraryItem, MediaDetail, ProductMedia, ProductSettings, ProviderConfig, SearchResponse,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
@@ -44,6 +45,32 @@ function crawlerForm(input: CrawlerForm) {
 }
 
 export const api = {
+  home: () => request<HomeData>('/home'),
+  search: (q: string) => request<SearchResponse>(`/search?q=${encodeURIComponent(q)}`),
+  catalogMedia: (q = '') => request<ProductMedia[]>(`/catalog/media${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+  mediaDetail: (id: number) => request<MediaDetail>(`/catalog/media/${id}`),
+  acquireMedia: (mediaId: number, resourceId?: number) => request<Acquisition>(`/catalog/media/${mediaId}/acquire`, { method: 'POST', body: JSON.stringify({ resourceId, requestedBy: 'manual' }) }),
+  actorDetail: (id: number) => request<{ actor: Actor; media: ProductMedia[] }>(`/actors/${id}`),
+  followActor: (id: number, followed: boolean) => request<Actor>(`/actors/${id}/follow`, { method: followed ? 'POST' : 'DELETE' }),
+  acquisitions: (status = '') => request<Acquisition[]>(`/acquisitions${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+  acquisition: (id: number) => request<AcquisitionDetail>(`/acquisitions/${id}`),
+  acquisitionAction: (id: number, action: 'pause' | 'resume' | 'retry' | 'cancel') => request<Acquisition>(`/acquisitions/${id}/${action}`, { method: 'POST' }),
+  attention: () => request<AttentionItem[]>('/attention'),
+  attentionAction: (id: number, action: string) => request<{ resolved: boolean }>(`/attention/${id}/action`, { method: 'POST', body: JSON.stringify({ action }) }),
+  library: (q = '') => request<{ items: LibraryItem[]; total: number }>(`/library${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+  libraryItem: (id: number) => request<LibraryItem>(`/library/${id}`),
+  reorganizeLibrary: (id: number) => request<{ item: LibraryItem; message: string }>(`/library/${id}/reorganize`, { method: 'POST' }),
+  automations: () => request<AutomationRule[]>('/automations'),
+  createAutomation: (input: Omit<AutomationRule, 'id' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastExplanation' | 'createdAt'>) => request<AutomationRule>('/automations', { method: 'POST', body: JSON.stringify(input) }),
+  updateAutomation: (id: number, input: Partial<AutomationRule>) => request<AutomationRule>(`/automations/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
+  deleteAutomation: (id: number) => request<void>(`/automations/${id}`, { method: 'DELETE' }),
+  setAutomationEnabled: (id: number, enabled: boolean) => request<AutomationRule>(`/automations/${id}/enabled`, { method: 'POST', body: JSON.stringify({ enabled }) }),
+  providers: () => request<ProviderConfig[]>('/providers'),
+  updateProvider: (key: string, input: { baseUrl: string; secret?: string; config?: Record<string, unknown> }) => request<ProviderConfig>(`/providers/${key}`, { method: 'PUT', body: JSON.stringify(input) }),
+  setProviderEnabled: (key: string, enabled: boolean) => request<ProviderConfig>(`/providers/${key}/enabled`, { method: 'POST', body: JSON.stringify({ enabled }) }),
+  testProvider: (key: string) => request<{ connected: boolean; message: string; latencyMs: number }>(`/providers/${key}/test`, { method: 'POST' }),
+  productSettings: () => request<ProductSettings>('/product-settings'),
+  updateProductSettings: (input: ProductSettings) => request<ProductSettings>('/product-settings', { method: 'PUT', body: JSON.stringify(input) }),
   serviceStatus: () => request<ServiceStatus>('/status'),
   dashboard: () => request<DashboardStats>('/dashboard'),
   folders: () => request<Folder[]>('/folders'),

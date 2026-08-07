@@ -1,119 +1,67 @@
 # Luma
 
-Luma 是一个桌面优先的媒体元数据管理服务。项目包含 Vue 3 管理端、Rust Axum API、SQLite 存储与 Docker 部署。
+Luma 是面向家庭 NAS 的媒体获取与入库编排器。它把作品发现、资源选择、qBittorrent 下载、MetaTube 元数据、文件整理和媒体库提交连接为一条可追踪、可恢复的流程。
 
-## 已实现功能
+## 产品能力
 
-- 开始：服务链路状态、首次配置步骤与常用入口
-- 媒体目录：新增前验证 MetaTube，新增后自动扫描和刮削，并支持编辑、删除、启停和立即扫描
-- 扫描器：递归识别常见视频格式，自动关联已有 NFO 与海报，仅排队仍缺元数据的媒体
-- 任务中心：一个媒体对应一个逻辑任务，每次执行与重试都保留独立记录，并显示媒体关联
-- 媒体库：搜索、元数据状态筛选、任务反向关联、单个刮削与批量刮削
-- 系统设置：MetaTube 与 qBittorrent 连接、自动 Tracker 更新、输出格式、扫描间隔、覆盖策略和日志级别
-- MetaTube：全局并发 8 个刮削执行，调用官方搜索与详情接口，写入 NFO/JSON、海报和背景图
-- 资源回退：严格检查海报/封面 URL，自动切换 Provider，并把成功图片缓存到 `/data/assets`
-- Python 爬虫：上传脚本、绑定目标网站、定时循环执行，并持久化 stdout、stderr 和结构化结果
-- qBittorrent：手动或自动执行爬虫结果，附加结果内 Tracker，并定时向现有种子追加 Tracker 订阅列表
-- 目录监听：`watch` 模式使用操作系统文件事件递归监听，周期扫描作为漏事件兜底
-- Apple 风格明暗主题、移动端导航、加载、空数据和错误状态
+- 全局搜索：同时查找作品和演员，首个内置 Source Provider 为 JavDB。
+- 资源排序：服务端按字幕、清晰度、大小、时间和来源统一评分，并返回排序理由。
+- 获取状态机：从请求、排队、下载、整理、元数据到入库，每次转换都有持久化事件。
+- qBittorrent：下载提交、进度对账、暂停、继续、取消和定时 Tracker 更新。
+- MetaTube：默认地址为当前部署机器 IP 加 `8080`，负责元数据、演员、NFO 和海报。
+- 自动化：使用 WHEN / IF / THEN 描述规则，支持 AUTO、CONFIRM 和 NOTIFY 三种模式。
+- 待处理问题：外部服务离线、路径映射失败和文件冲突都会给出明确恢复动作。
+- 媒体库：只展示已经完成整理和提交的文件，并保留来源 Acquisition。
+- 兼容工具：媒体目录监听、周期扫描和可信 Python 来源脚本位于设置的高级诊断区域。
+- 服务状态：Luma、MetaTube 和 qBittorrent 每 10 秒刷新。
 
-## 目录结构
+## 信息架构
 
-```text
-luma/
-├── backend/       Rust、Axum、SQLx、SQLite migrations
-├── frontend/      Vue 3、TypeScript、Naive UI
-├── Dockerfile
-└── docker-compose.yml
-```
+一级导航固定为：首页、资源、下载、媒体库、自动化、设置。产品操作统一称为“获取”。旧任务、爬虫和 qBittorrent 原始列表不再作为一级页面。
 
 ## 本地开发
 
-需要 Node.js 22+、npm、Rust 1.85+ 和 Python 3。可用 `LUMA_PYTHON_BIN` 指定 Python 可执行文件。
-
-终端一：
+需要 Rust 1.85+、Node.js 22+、npm 和 Python 3。
 
 ```bash
 cd backend
 DATABASE_URL='sqlite://luma.db?mode=rwc' cargo run
 ```
 
-终端二：
-
 ```bash
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
-访问 `http://localhost:5173`。Vite 会把 `/api` 请求代理到 `http://localhost:3000`。
+访问 `http://localhost:5173`。Vite 会把 `/api` 代理到 `http://localhost:3000`。
 
 ## Docker
 
-在项目目录运行 Compose。默认使用飞牛 NAS 路径 `/vol1/1000/a1` 作为媒体目录、`/vol3/1000/docker/luma-data` 保存数据库；也可以用环境变量改掉。媒体目录必须以读写方式挂载，因为刮削结果会落在视频旁边：
+Luma 需要三个持久化或共享挂载：
+
+- `/data`：SQLite、海报缓存和脚本运行数据。
+- `/downloads`：必须与 qBittorrent 共享同一宿主机下载目录。
+- `/media`：最终媒体库目录，需要读写权限。
 
 ```bash
-MEDIA_ROOT=/path/to/your/media \
+MEDIA_ROOT=/path/to/media \
+DOWNLOAD_ROOT=/path/to/downloads \
 LUMA_DATA_ROOT=/path/to/luma-data \
 docker compose up -d --build
 ```
 
-访问 `http://localhost:3000`。容器内的媒体路径以 `/media` 开头，例如 `/media/movies`。
+访问 `http://localhost:3000`。qBittorrent 的保存路径和 Luma 的映射路径默认均为 `/downloads`。
 
-旧版数据库若仅因迁移文件换行符等非结构性变化出现校验不一致，启动时会先验证核心表结构，再自动修复 1/2 号历史迁移的校验记录；表或字段缺失时仍会停止启动并保留原始数据库。
+## Python 来源脚本
 
-以 `/media/movies/ABC-123.mp4` 为例，输出文件为：
-
-```text
-ABC-123.nfo
-ABC-123.metadata.json    # 输出格式为 json 或 both 时
-ABC-123-poster.jpg       # 扩展名取决于远程图片格式
-ABC-123-fanart.jpg
-```
-
-覆盖策略为 `missing` 或 `never` 时保留已存在文件，只补缺失文件；选择 `always`，或在单次刮削时勾选覆盖选项，才会重写对应文件。
-
-## API
-
-所有接口以 `/api/v1` 开头：
-
-- `GET /dashboard`
-- `GET|POST /folders`
-- `PUT|DELETE /folders/{id}`
-- `POST /folders/{id}/scan`
-- `GET /tasks`、`GET /tasks/{id}`
-- `POST /tasks/{id}/retry`、`POST /tasks/{id}/cancel`
-- `GET /media`、`POST /media/{id}/scrape`
-- `GET /asset/poster/{mediaId}`、`GET /asset/cover/{mediaId}`
-- `GET|PUT /settings`
-- `POST /settings/metatube/test`
-- `POST /settings/qbittorrent/test`
-- `GET|POST /crawlers`、`PUT|DELETE /crawlers/{id}`
-- `POST /crawlers/{id}/run`
-- `GET /crawler-runs`、`GET /crawler-results`
-- `POST /crawler-results/{id}/download`
-- `GET /logs`
-- `GET /health`
-
-## MetaTube 连接
-
-系统使用 MetaTube 官方 `/v1/providers`、`/v1/movies/search` 和 `/v1/movies/{provider}/{id}` 接口。首次打开设置页时，默认地址会根据当前部署主机地址生成 `http://<部署主机 IP>:8080`；也可通过 `LUMA_METATUBE_URL` 或设置页覆盖。若 MetaTube 使用 `-token` 启动，请在系统设置中填写 Token；请求会使用 Bearer 鉴权。
-
-Luma 与 MetaTube 位于不同容器时，不要填写 `127.0.0.1`。可填写 NAS 局域网地址，例如 `http://192.168.1.20:8080`，或把两个容器加入同一个 Docker 网络后填写 `http://metatube:8080`。
-
-你当前的 MetaTube 容器没有设置 `TOKEN`，因此 Luma 的 Token 留空即可。若以后为 MetaTube 设置 Token，两边填写相同值。
-
-MetaTube 的 `DSN` 为空时使用内存数据库，容器重启后缓存会丢失。建议把宿主机目录挂载到 `/config`，并让 MetaTube 使用 `-dsn /config/metatube.db`；这不影响 Luma 连接，但能保留 MetaTube 数据。
-
-## Python 爬虫与 qBittorrent
-
-“爬虫与下载”页支持上传最大 1 MiB 的 `.py` 文件。服务将目标网站同时作为第一个命令行参数和 `LUMA_TARGET_WEBSITE` 环境变量传入；脚本应向 stdout 输出 JSON，或写入 `LUMA_RESULT_PATH` 指定的文件：
+设置中的“Python 来源脚本”支持上传不超过 1 MiB 的 `.py` 文件、绑定网站、定时循环执行并持久化 stdout、stderr 和结构化结果。脚本应向 stdout 或 `LUMA_RESULT_PATH` 输出：
 
 ```json
 {
   "results": [
     {
-      "title": "Example",
+      "title": "ABC-123 1080p",
       "downloadUrl": "magnet:?xt=urn:btih:...",
       "trackers": ["udp://tracker.example:80/announce"]
     }
@@ -121,6 +69,16 @@ MetaTube 的 `DSN` 为空时使用内存数据库，容器重启后缓存会丢�
 }
 ```
 
-根节点也可直接使用数组；下载字段还接受 `magnet`、`torrentUrl` 或 `url`。每次执行最长 15 分钟，最多同时运行 2 个脚本。脚本属于任意代码执行能力，只应上传你信任的脚本；可从 [示例脚本](examples/sample_crawler.py) 开始修改。
+脚本结果会先归一化为 Media 和 Resource，再调用统一的 AcquisitionService，不会直接绕过状态机操作 qBittorrent。只上传你信任的脚本。
 
-qBittorrent 需要启用 Web UI，并确保填写的地址可从 Luma 容器访问。自动 Tracker 更新从设置的文本订阅地址读取 HTTP、HTTPS 或 UDP Tracker，按设置周期追加到现有种子，不会删除已有 Tracker。
+## 文档
+
+- [当前状态审计](docs/current-state.md)
+- [架构](docs/architecture.md)
+- [API](docs/api.md)
+- [数据库](docs/database.md)
+- [Provider](docs/providers.md)
+- [获取状态机](docs/acquisition-state-machine.md)
+- [自动化](docs/automation.md)
+- [恢复与幂等](docs/recovery.md)
+- [实现与验收报告](docs/luma-implementation-report.md)
