@@ -74,7 +74,7 @@ async fn recover_interrupted_crawler_work(pool: &SqlitePool) -> anyhow::Result<(
 async fn run_migrations_with_legacy_repair(pool: &SqlitePool) -> anyhow::Result<()> {
     match MIGRATOR.run(pool).await {
         Ok(()) => Ok(()),
-        Err(MigrateError::VersionMismatch(version)) if matches!(version, 1 | 2) => {
+        Err(MigrateError::VersionMismatch(version)) if matches!(version, 1..=3) => {
             validate_legacy_schema(pool, version).await?;
             let migration = MIGRATOR
                 .iter()
@@ -158,8 +158,38 @@ async fn validate_legacy_schema(pool: &SqlitePool, version: i64) -> anyhow::Resu
             ),
             ("app_setting", &["key", "value", "updated_at"]),
         ]
-    } else {
+    } else if version == 2 {
         vec![("app_setting", &["key", "value", "updated_at"] as &[&str])]
+    } else {
+        vec![
+            (
+                "scrape_task",
+                &[
+                    "id",
+                    "media_id",
+                    "folder_id",
+                    "task_type",
+                    "status",
+                    "progress",
+                    "error_message",
+                    "created_at",
+                    "updated_at",
+                    "finished_at",
+                ] as &[&str],
+            ),
+            (
+                "task_record",
+                &[
+                    "id",
+                    "task_id",
+                    "status",
+                    "progress",
+                    "error_message",
+                    "created_at",
+                    "finished_at",
+                ],
+            ),
+        ]
     };
 
     for (table, expected_columns) in required_tables {
@@ -698,10 +728,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "luma-resource-test-{}-{nonce}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("luma-resource-test-{}-{nonce}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let media = directory.join("Example.MKV");
         let nfo = directory.join("EXAMPLE.NFO");
@@ -718,30 +746,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repairs_valid_legacy_migration_checksum() {
+    async fn repairs_valid_legacy_migration_checksums() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = 1")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        run_migrations_with_legacy_repair(&pool).await.unwrap();
-
-        let actual: Vec<u8> =
-            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
-                .fetch_one(&pool)
+        for version in [1_i64, 3_i64] {
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = ?")
+                .bind(version)
+                .execute(&pool)
                 .await
                 .unwrap();
-        let expected = MIGRATOR
-            .iter()
-            .find(|migration| migration.version == 1)
-            .unwrap();
-        assert_eq!(actual, expected.checksum.as_ref());
+
+            run_migrations_with_legacy_repair(&pool).await.unwrap();
+
+            let actual: Vec<u8> =
+                sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?")
+                    .bind(version)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let expected = MIGRATOR
+                .iter()
+                .find(|migration| migration.version == version)
+                .unwrap();
+            assert_eq!(actual, expected.checksum.as_ref());
+        }
     }
 
     #[tokio::test]
