@@ -74,7 +74,7 @@ async fn recover_interrupted_crawler_work(pool: &SqlitePool) -> anyhow::Result<(
 async fn run_migrations_with_legacy_repair(pool: &SqlitePool) -> anyhow::Result<()> {
     match MIGRATOR.run(pool).await {
         Ok(()) => Ok(()),
-        Err(MigrateError::VersionMismatch(version)) if matches!(version, 1..=4) => {
+        Err(MigrateError::VersionMismatch(version)) if matches!(version, 1..=5) => {
             validate_legacy_schema(pool, version).await?;
             let migration = MIGRATOR
                 .iter()
@@ -190,7 +190,7 @@ async fn validate_legacy_schema(pool: &SqlitePool, version: i64) -> anyhow::Resu
                 ],
             ),
         ]
-    } else {
+    } else if version == 4 {
         vec![(
             "media_asset",
             &[
@@ -206,6 +206,60 @@ async fn validate_legacy_schema(pool: &SqlitePool, version: i64) -> anyhow::Resu
                 "updated_at",
             ] as &[&str],
         )]
+    } else {
+        vec![
+            (
+                "crawler_script",
+                &[
+                    "id",
+                    "name",
+                    "website_url",
+                    "file_name",
+                    "file_path",
+                    "interval_minutes",
+                    "enabled",
+                    "auto_download",
+                    "last_started_at",
+                    "last_finished_at",
+                    "next_run_at",
+                    "created_at",
+                    "updated_at",
+                ] as &[&str],
+            ),
+            (
+                "crawler_run",
+                &[
+                    "id",
+                    "script_id",
+                    "status",
+                    "stdout",
+                    "stderr",
+                    "result_count",
+                    "error_message",
+                    "created_at",
+                    "started_at",
+                    "finished_at",
+                ],
+            ),
+            (
+                "crawler_result",
+                &[
+                    "id",
+                    "run_id",
+                    "script_id",
+                    "title",
+                    "download_url",
+                    "trackers_json",
+                    "raw_json",
+                    "download_status",
+                    "qbit_hash",
+                    "error_message",
+                    "created_at",
+                    "downloaded_at",
+                ],
+            ),
+            ("app_setting", &["key", "value", "updated_at"]),
+        ]
     };
 
     for (table, expected_columns) in required_tables {
@@ -769,7 +823,7 @@ mod tests {
             .await
             .unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        for version in [1_i64, 3_i64, 4_i64] {
+        for version in [1_i64, 3_i64, 4_i64, 5_i64] {
             sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = ?")
                 .bind(version)
                 .execute(&pool)
