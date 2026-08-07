@@ -74,7 +74,7 @@ async fn recover_interrupted_crawler_work(pool: &SqlitePool) -> anyhow::Result<(
 async fn run_migrations_with_legacy_repair(pool: &SqlitePool) -> anyhow::Result<()> {
     match MIGRATOR.run(pool).await {
         Ok(()) => Ok(()),
-        Err(MigrateError::VersionMismatch(version)) if matches!(version, 1..=3) => {
+        Err(MigrateError::VersionMismatch(version)) if matches!(version, 1..=4) => {
             validate_legacy_schema(pool, version).await?;
             let migration = MIGRATOR
                 .iter()
@@ -160,7 +160,7 @@ async fn validate_legacy_schema(pool: &SqlitePool, version: i64) -> anyhow::Resu
         ]
     } else if version == 2 {
         vec![("app_setting", &["key", "value", "updated_at"] as &[&str])]
-    } else {
+    } else if version == 3 {
         vec![
             (
                 "scrape_task",
@@ -190,6 +190,22 @@ async fn validate_legacy_schema(pool: &SqlitePool, version: i64) -> anyhow::Resu
                 ],
             ),
         ]
+    } else {
+        vec![(
+            "media_asset",
+            &[
+                "id",
+                "media_id",
+                "asset_type",
+                "source",
+                "url",
+                "local_path",
+                "status",
+                "checked_at",
+                "created_at",
+                "updated_at",
+            ] as &[&str],
+        )]
     };
 
     for (table, expected_columns) in required_tables {
@@ -753,7 +769,7 @@ mod tests {
             .await
             .unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        for version in [1_i64, 3_i64] {
+        for version in [1_i64, 3_i64, 4_i64] {
             sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = ?")
                 .bind(version)
                 .execute(&pool)
