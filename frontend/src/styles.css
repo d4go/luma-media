@@ -189,11 +189,17 @@ body.luma-dark {
 .setting-section-actions { min-height: 34px; display: flex; align-items: center; gap: 12px; }
 .setting-section-actions .n-alert { flex: 1; padding: 7px 11px; }
 .tracker-control { margin: 4px 0 19px; padding: 14px 15px; display: flex; align-items: center; gap: 20px; background: var(--surface-muted); border: 1px solid var(--hairline); border-radius: 11px; }
-.tracker-control div { flex: 1; }
+.tracker-control > div { min-width: 0; flex: 1; }
+.tracker-control > .tracker-switch { flex: 0 0 auto; }
 .tracker-control strong, .tracker-control span { display: block; }
 .tracker-control strong { font-size: 12.5px; }
 .tracker-control span { margin-top: 3px; color: var(--text-secondary); font-size: 10.5px; line-height: 1.5; }
 .tracker-fields { padding: 16px 16px 0; display: grid; grid-template-columns: minmax(0, 1fr) 190px; gap: 15px; background: var(--surface-muted); border: 1px solid var(--hairline); border-radius: 11px; }
+.setting-subsection { margin-top: 3px; padding-top: 20px; border-top: 1px solid var(--hairline); }
+.setting-subsection-head { margin-bottom: 16px; }
+.setting-subsection-head strong, .setting-subsection-head span { display: block; }
+.setting-subsection-head strong { font-size: 12.5px; }
+.setting-subsection-head span { max-width: 560px; margin-top: 4px; color: var(--text-secondary); font-size: 10.5px; line-height: 1.5; }
 .settings-rail { position: sticky; top: 78px; display: grid; gap: 14px; }
 .settings-note { padding: 22px; }
 .settings-note h2 { margin: 8px 0 10px; font-size: 17px; }

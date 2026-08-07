@@ -6,7 +6,7 @@ import {
 } from 'naive-ui'
 import {
   IconArrowBackUp, IconCheck, IconDatabase, IconDeviceFloppy, IconPlugConnected,
-  IconRefresh, IconServer, IconSettingsAutomation,
+  IconRefresh, IconServer,
 } from '@tabler/icons-vue'
 import PageHeader from '../components/PageHeader.vue'
 import { api } from '../api'
@@ -26,7 +26,6 @@ const qbitResult = ref<TestResult>(null)
 const initialSnapshot = ref('')
 const metaTubeFormRef = ref<FormInst | null>(null)
 const qbitFormRef = ref<FormInst | null>(null)
-const mediaFormRef = ref<FormInst | null>(null)
 const form = reactive<Settings>({
   metatubeUrl: '', metatubeToken: '', outputFormat: 'nfo', scanInterval: 60,
   overwritePolicy: 'missing', logLevel: 'info', qbittorrentUrl: 'http://127.0.0.1:8080',
@@ -39,7 +38,10 @@ const urlRule = (label: string) => [
   { required: true, message: `请输入${label}`, trigger: ['blur', 'input'] },
   { pattern: /^https?:\/\//, message: '地址需要以 http:// 或 https:// 开头', trigger: ['blur', 'input'] },
 ]
-const metaTubeRules: FormRules = { metatubeUrl: urlRule(' MetaTube 地址') }
+const metaTubeRules: FormRules = {
+  metatubeUrl: urlRule(' MetaTube 地址'),
+  scanInterval: { type: 'number', min: 1, required: true, message: '扫描间隔必须大于 0', trigger: ['blur', 'change'] },
+}
 const qbitRules: FormRules = {
   qbittorrentUrl: urlRule(' qBittorrent 地址'),
   qbittorrentTrackerUpdateInterval: { type: 'number', min: 1, required: true, message: '更新间隔必须大于 0', trigger: ['blur', 'change'] },
@@ -47,9 +49,6 @@ const qbitRules: FormRules = {
     validator: (_rule, value: string) => !form.qbittorrentAutoUpdateTrackers || /^https?:\/\//.test(value),
     message: '请输入有效的 Tracker 列表地址', trigger: ['blur', 'input'],
   },
-}
-const mediaRules: FormRules = {
-  scanInterval: { type: 'number', min: 1, required: true, message: '扫描间隔必须大于 0', trigger: ['blur', 'change'] },
 }
 const dirty = computed(() => !loading.value && JSON.stringify(form) !== initialSnapshot.value)
 
@@ -70,7 +69,7 @@ async function load() {
 async function validateAll() {
   try {
     await Promise.all([
-      metaTubeFormRef.value?.validate(), qbitFormRef.value?.validate(), mediaFormRef.value?.validate(),
+      metaTubeFormRef.value?.validate(), qbitFormRef.value?.validate(),
     ])
     return true
   } catch {
@@ -161,6 +160,18 @@ onMounted(load)
                 <n-input v-model:value="form.metatubeToken" type="password" show-password-on="click" placeholder="未启用 Token 时留空" />
               </n-form-item>
             </div>
+            <div class="setting-subsection">
+              <div class="setting-subsection-head">
+                <strong>元数据处理规则</strong>
+                <span>控制 MetaTube 元数据的输出、刷新周期和已有文件处理方式。</span>
+              </div>
+              <div class="form-grid">
+                <n-form-item label="默认输出格式" path="outputFormat"><n-select v-model:value="form.outputFormat" :options="[{label:'NFO',value:'nfo'},{label:'JSON',value:'json'},{label:'NFO + JSON',value:'both'}]" /></n-form-item>
+                <n-form-item label="扫描间隔（分钟）" path="scanInterval"><n-input-number v-model:value="form.scanInterval" :min="1" :max="10080" style="width:100%" /></n-form-item>
+                <n-form-item label="覆盖策略" path="overwritePolicy"><n-select v-model:value="form.overwritePolicy" :options="[{label:'仅补充缺失项',value:'missing'},{label:'始终覆盖',value:'always'},{label:'从不覆盖',value:'never'}]" /></n-form-item>
+                <n-form-item label="日志级别" path="logLevel"><n-select v-model:value="form.logLevel" :options="[{label:'Debug',value:'debug'},{label:'Info',value:'info'},{label:'Warning',value:'warn'},{label:'Error',value:'error'}]" /></n-form-item>
+              </div>
+            </div>
           </n-form>
           <div class="setting-section-actions">
             <n-button secondary :loading="testingMetaTube" @click="testMetaTube"><template #icon><IconPlugConnected /></template>测试 MetaTube</n-button>
@@ -186,7 +197,7 @@ onMounted(load)
             </div>
             <div class="tracker-control">
               <div><strong>自动更新 Tracker</strong><span>按固定周期获取列表，并追加到 qBittorrent 中的现有任务。</span></div>
-              <n-switch v-model:value="form.qbittorrentAutoUpdateTrackers" />
+              <n-switch v-model:value="form.qbittorrentAutoUpdateTrackers" class="tracker-switch" />
             </div>
             <div v-if="form.qbittorrentAutoUpdateTrackers" class="tracker-fields">
               <n-form-item label="Tracker 列表地址" path="qbittorrentTrackerSourceUrl">
@@ -203,20 +214,6 @@ onMounted(load)
           </div>
         </section>
 
-        <section class="panel setting-section">
-          <header class="setting-section-head">
-            <span class="setting-icon"><IconSettingsAutomation /></span>
-            <div><h2>媒体处理</h2><p>设定后台扫描、输出格式和已有文件处理策略。</p></div>
-          </header>
-          <n-form ref="mediaFormRef" :model="form" :rules="mediaRules" label-placement="top">
-            <div class="form-grid">
-              <n-form-item label="默认输出格式" path="outputFormat"><n-select v-model:value="form.outputFormat" :options="[{label:'NFO',value:'nfo'},{label:'JSON',value:'json'},{label:'NFO + JSON',value:'both'}]" /></n-form-item>
-              <n-form-item label="扫描间隔（分钟）" path="scanInterval"><n-input-number v-model:value="form.scanInterval" :min="1" :max="10080" style="width:100%" /></n-form-item>
-              <n-form-item label="覆盖策略" path="overwritePolicy"><n-select v-model:value="form.overwritePolicy" :options="[{label:'仅补充缺失项',value:'missing'},{label:'始终覆盖',value:'always'},{label:'从不覆盖',value:'never'}]" /></n-form-item>
-              <n-form-item label="日志级别" path="logLevel"><n-select v-model:value="form.logLevel" :options="[{label:'Debug',value:'debug'},{label:'Info',value:'info'},{label:'Warning',value:'warn'},{label:'Error',value:'error'}]" /></n-form-item>
-            </div>
-          </n-form>
-        </section>
       </div>
 
       <aside class="settings-rail">
