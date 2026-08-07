@@ -54,7 +54,7 @@
 ### Provider 边界
 
 - MetaTube 和 qBittorrent 是具体客户端，没有实现统一 Provider 契约。
-- 没有内置 JavDB SourceProvider。
+- 原实现没有内置可扩展的多 SourceProvider 注册表。
 - Python 脚本是独立功能，不会先归一化为 Media 和 Resource。
 - 搜索、详情、演员、资源和来源部分失败没有统一聚合协议。
 

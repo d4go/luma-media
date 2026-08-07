@@ -2,15 +2,15 @@
 
 ## 类型
 
-- Source Provider：搜索作品、详情、演员和资源。首个内置实现为 JavDB；Python 脚本通过适配器提供资源。
+- Source Provider：搜索作品、详情、演员和资源。内置 JavBus 适配器支持配置多个主站、反代或镜像；Python 脚本也可提供资源。
 - Download Provider：提交、暂停、继续、取消和查询下载。首个实现为 qBittorrent。
 - Metadata Provider：搜索和获取结构化元数据、海报。首个实现为 MetaTube。
 
 `provider_config` 保存启停、地址、配置、加密边界内的凭据字段和最后一次健康状态。API 只返回 `hasSecret`，不会返回凭据正文。
 
-## JavDB
+## JavBus 与多来源
 
-默认地址 `https://javdb.com`。搜索会归一化到 `media` 和 `provider_entity_mapping`；详情按需加载演员和磁力资源。受限环境可在设置中填写 Cookie。来源超时或失败时，统一搜索仍返回本地和其他来源结果，并附带 ProviderReport。
+默认地址 `https://www.javbus.com`。设置页可以添加任意数量的 JavBus 主站、反代或镜像，每个来源拥有独立名称、地址、Cookie、启停和健康状态。搜索并发请求全部启用来源，将结果归一化到 `media` 和 `provider_entity_mapping` 后按番号去重；详情按需加载演员和磁力资源。来源超时、年龄验证或单站失败时，统一搜索仍返回本地和其他来源结果，并附带独立的 ProviderReport。
 
 ## MetaTube
 

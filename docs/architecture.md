@@ -8,7 +8,7 @@
 全局搜索 / 自动化 / Python 来源
               │
               ▼
- SourceProvider Registry ── JavDB / Script adapters
+ SourceProvider Registry ── multiple JavBus / Script adapters
               │
               ▼
         Media + Resource

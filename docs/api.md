@@ -51,7 +51,9 @@
 ## Provider 与设置
 
 - `GET /providers`
+- `POST /providers`（添加 JavBus 来源）
 - `PUT /providers/{key}`
+- `DELETE /providers/{key}`（仅 Source Provider）
 - `POST /providers/{key}/enabled`
 - `POST /providers/{key}/test`
 - `GET|PUT /product-settings`

@@ -65,8 +65,11 @@ pub fn router() -> Router<AppState> {
             put(update_automation).delete(delete_automation),
         )
         .route("/automations/{id}/enabled", post(set_automation_enabled))
-        .route("/providers", get(list_providers))
-        .route("/providers/{key}", put(update_provider))
+        .route("/providers", get(list_providers).post(create_provider))
+        .route(
+            "/providers/{key}",
+            put(update_provider).delete(delete_provider),
+        )
         .route("/providers/{key}/enabled", post(set_provider_enabled))
         .route("/providers/{key}/test", post(test_provider))
         .route(
@@ -256,29 +259,40 @@ async fn search(
         }));
     }
     let mut reports = Vec::new();
-    if provider_enabled(&state, "javdb").await? {
-        match javdb_search(&state, term).await {
-            Ok(count) => reports.push(ProviderReport {
-                provider_key: "javdb".into(),
+    let providers = enabled_source_providers(&state).await?;
+    let mut searches = tokio::task::JoinSet::new();
+    for provider in providers {
+        let source_state = state.clone();
+        let source_term = term.to_owned();
+        searches.spawn(async move {
+            let key = provider.key.clone();
+            let result = source_search(&source_state, &provider, &source_term).await;
+            (key, result)
+        });
+    }
+    while let Some(result) = searches.join_next().await {
+        match result {
+            Ok((provider_key, Ok(count))) => reports.push(ProviderReport {
+                provider_key,
                 ok: true,
                 message: "搜索完成".into(),
                 result_count: count,
             }),
+            Ok((provider_key, Err(error))) => reports.push(ProviderReport {
+                provider_key,
+                ok: false,
+                message: error.to_string(),
+                result_count: 0,
+            }),
             Err(error) => reports.push(ProviderReport {
-                provider_key: "javdb".into(),
+                provider_key: "source-runtime".into(),
                 ok: false,
                 message: error.to_string(),
                 result_count: 0,
             }),
         }
-    } else {
-        reports.push(ProviderReport {
-            provider_key: "javdb".into(),
-            ok: false,
-            message: "Provider 已停用".into(),
-            result_count: 0,
-        });
     }
+    reports.sort_by(|left, right| left.provider_key.cmp(&right.provider_key));
     let pattern = format!("%{}%", term.to_lowercase());
     let media_rows = sqlx::query("SELECT * FROM media WHERE lower(title) LIKE ? OR lower(normalized_code) LIKE ? OR lower(COALESCE(original_title,'')) LIKE ? ORDER BY updated_at DESC LIMIT 60")
         .bind(&pattern).bind(&pattern).bind(&pattern).fetch_all(&state.pool).await?;
@@ -1427,28 +1441,99 @@ async fn list_providers(State(state): State<AppState>) -> AppResult<Json<Vec<Val
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderInput {
+    #[serde(default)]
+    display_name: String,
     base_url: String,
     #[serde(default)]
     secret: String,
     #[serde(default)]
     config: Value,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateProviderInput {
+    display_name: String,
+    base_url: String,
+    #[serde(default)]
+    secret: String,
+    #[serde(default = "default_source_adapter")]
+    adapter: String,
+}
+
+fn default_source_adapter() -> String {
+    "javbus".into()
+}
+
+async fn create_provider(
+    State(state): State<AppState>,
+    Json(input): Json<CreateProviderInput>,
+) -> AppResult<Json<Value>> {
+    if input.display_name.trim().is_empty() {
+        return Err(AppError::BadRequest("来源名称不能为空".into()));
+    }
+    if input.adapter != "javbus" {
+        return Err(AppError::BadRequest("当前仅支持 JavBus 来源适配器".into()));
+    }
+    validate_http_url(&input.base_url)?;
+    let mut suffix = 2_i64;
+    let key = loop {
+        let candidate = format!("javbus-{suffix}");
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM provider_config WHERE provider_key = ?)",
+        )
+        .bind(&candidate)
+        .fetch_one(&state.pool)
+        .await?;
+        if exists == 0 {
+            break candidate;
+        }
+        suffix += 1;
+    };
+    sqlx::query("INSERT INTO provider_config(provider_key, provider_type, display_name, enabled, base_url, secret, config_json) VALUES (?, 'source', ?, 1, ?, ?, ?)")
+        .bind(&key)
+        .bind(input.display_name.trim())
+        .bind(input.base_url.trim())
+        .bind(input.secret.trim())
+        .bind(json!({"adapter": input.adapter}).to_string())
+        .execute(&state.pool)
+        .await?;
+    provider_by_key(&state, &key).await
+}
+
 async fn update_provider(
     State(state): State<AppState>,
     AxumPath(key): AxumPath<String>,
     Json(input): Json<ProviderInput>,
 ) -> AppResult<Json<Value>> {
     validate_http_url(&input.base_url)?;
+    let display_name = input.display_name.trim();
     let result = if input.secret.trim().is_empty() {
-        sqlx::query("UPDATE provider_config SET base_url = ?, config_json = ?, updated_at = datetime('now') WHERE provider_key = ?").bind(input.base_url.trim()).bind(input.config.to_string()).bind(&key).execute(&state.pool).await?
+        sqlx::query("UPDATE provider_config SET display_name = CASE WHEN ? = '' THEN display_name ELSE ? END, base_url = ?, config_json = ?, updated_at = datetime('now') WHERE provider_key = ?").bind(display_name).bind(display_name).bind(input.base_url.trim()).bind(input.config.to_string()).bind(&key).execute(&state.pool).await?
     } else {
-        sqlx::query("UPDATE provider_config SET base_url = ?, secret = ?, config_json = ?, updated_at = datetime('now') WHERE provider_key = ?").bind(input.base_url.trim()).bind(&input.secret).bind(input.config.to_string()).bind(&key).execute(&state.pool).await?
+        sqlx::query("UPDATE provider_config SET display_name = CASE WHEN ? = '' THEN display_name ELSE ? END, base_url = ?, secret = ?, config_json = ?, updated_at = datetime('now') WHERE provider_key = ?").bind(display_name).bind(display_name).bind(input.base_url.trim()).bind(&input.secret).bind(input.config.to_string()).bind(&key).execute(&state.pool).await?
     };
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
     sync_provider_legacy_setting(&state, &key, input.base_url.trim(), input.secret.trim()).await?;
     provider_by_key(&state, &key).await
+}
+
+async fn delete_provider(
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+) -> AppResult<Json<Value>> {
+    let result = sqlx::query(
+        "DELETE FROM provider_config WHERE provider_key = ? AND provider_type = 'source'",
+    )
+    .bind(&key)
+    .execute(&state.pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(json!({"deleted": true})))
 }
 
 async fn set_provider_enabled(
@@ -1468,23 +1553,29 @@ async fn test_provider(
     AxumPath(key): AxumPath<String>,
 ) -> AppResult<Json<Value>> {
     let started = std::time::Instant::now();
-    let outcome: anyhow::Result<String> = match key.as_str() {
-        "javdb" => javdb_probe(&state).await.map(|_| "JavDB 可访问".into()),
-        "metatube" => {
-            let settings = storage::load_settings(&state.pool).await?;
-            crate::provider::MetaTubeClient::new(&settings)?
-                .test_connection()
-                .await
-                .map(|count| format!("MetaTube 已连接，{count} 个元数据来源"))
+    let source = source_provider_by_key(&state, &key).await?;
+    let outcome: anyhow::Result<String> = if let Some(provider) = source {
+        source_probe(&provider)
+            .await
+            .map(|_| format!("{} 可访问", provider.display_name))
+    } else {
+        match key.as_str() {
+            "metatube" => {
+                let settings = storage::load_settings(&state.pool).await?;
+                crate::provider::MetaTubeClient::new(&settings)?
+                    .test_connection()
+                    .await
+                    .map(|count| format!("MetaTube 已连接，{count} 个元数据来源"))
+            }
+            "qbittorrent" => {
+                let settings = storage::load_settings(&state.pool).await?;
+                QBittorrentClient::new(&settings)?
+                    .version()
+                    .await
+                    .map(|version| format!("qBittorrent {version}"))
+            }
+            _ => return Err(AppError::NotFound),
         }
-        "qbittorrent" => {
-            let settings = storage::load_settings(&state.pool).await?;
-            QBittorrentClient::new(&settings)?
-                .version()
-                .await
-                .map(|version| format!("qBittorrent {version}"))
-        }
-        _ => return Err(AppError::NotFound),
     };
     let (status, message) = match outcome {
         Ok(message) => ("online", message),
@@ -1567,48 +1658,167 @@ async fn load_product_settings(state: &AppState) -> AppResult<ProductSettings> {
     })
 }
 
-async fn javdb_search(state: &AppState, query: &str) -> anyhow::Result<usize> {
-    let row =
-        sqlx::query("SELECT base_url, secret FROM provider_config WHERE provider_key = 'javdb'")
-            .fetch_one(&state.pool)
-            .await?;
-    let base: String = row.get("base_url");
-    let cookie: String = row.get("secret");
-    let mut url = reqwest::Url::parse(base.trim_end_matches('/'))?;
-    url.set_path("/search");
-    url.query_pairs_mut()
-        .append_pair("q", query)
-        .append_pair("f", "all");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .user_agent("Mozilla/5.0 Luma/1.0")
-        .build()?;
-    let mut request = client.get(url);
-    if !cookie.trim().is_empty() {
-        request = request.header(reqwest::header::COOKIE, cookie);
+#[derive(Debug, Clone)]
+struct SourceProviderConfig {
+    key: String,
+    display_name: String,
+    base_url: String,
+    secret: String,
+    adapter: String,
+}
+
+async fn enabled_source_providers(state: &AppState) -> AppResult<Vec<SourceProviderConfig>> {
+    let rows = sqlx::query(
+        "SELECT * FROM provider_config WHERE provider_type = 'source' AND enabled = 1 ORDER BY provider_key",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(rows.iter().map(source_provider_from_row).collect())
+}
+
+async fn source_provider_by_key(
+    state: &AppState,
+    key: &str,
+) -> AppResult<Option<SourceProviderConfig>> {
+    let row = sqlx::query(
+        "SELECT * FROM provider_config WHERE provider_key = ? AND provider_type = 'source'",
+    )
+    .bind(key)
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(row.as_ref().map(source_provider_from_row))
+}
+
+fn source_provider_from_row(row: &sqlx::sqlite::SqliteRow) -> SourceProviderConfig {
+    let config = parse_json(&row.get::<String, _>("config_json"), json!({}));
+    SourceProviderConfig {
+        key: row.get("provider_key"),
+        display_name: row.get("display_name"),
+        base_url: row.get("base_url"),
+        secret: row.get("secret"),
+        adapter: config
+            .get("adapter")
+            .and_then(Value::as_str)
+            .unwrap_or("javbus")
+            .to_owned(),
     }
-    let response = request.send().await?.error_for_status()?;
-    let html = response.text().await?;
-    let items = parse_javdb_search_html(&html, query);
+}
+
+async fn source_search(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    query: &str,
+) -> anyhow::Result<usize> {
+    match provider.adapter.as_str() {
+        "javbus" => javbus_search(state, provider, query).await,
+        adapter => anyhow::bail!("不支持的来源适配器：{adapter}"),
+    }
+}
+
+async fn source_probe(provider: &SourceProviderConfig) -> anyhow::Result<()> {
+    match provider.adapter.as_str() {
+        "javbus" => {
+            let base = reqwest::Url::parse(&provider.base_url)?;
+            let html = javbus_request_html(provider, base).await?;
+            if !html.to_ascii_lowercase().contains("javbus") {
+                anyhow::bail!("响应内容不是 JavBus 页面");
+            }
+            Ok(())
+        }
+        adapter => anyhow::bail!("不支持的来源适配器：{adapter}"),
+    }
+}
+
+async fn javbus_search(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    query: &str,
+) -> anyhow::Result<usize> {
+    let mut url = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("JavBus 地址不能作为基础地址"))?
+        .clear()
+        .push("search")
+        .push(query);
+    let html = javbus_request_html(provider, url).await?;
+    let items = parse_javbus_search_html(&html, query, &provider.base_url);
     for item in &items {
-        persist_source_media(state, item).await?;
+        persist_source_media(state, &provider.key, item).await?;
     }
     Ok(items.len())
 }
 
-async fn javdb_probe(state: &AppState) -> anyhow::Result<()> {
-    let base: String =
-        sqlx::query_scalar("SELECT base_url FROM provider_config WHERE provider_key = 'javdb'")
-            .fetch_one(&state.pool)
-            .await?;
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?
-        .get(base)
+fn javbus_cookie(provider: &SourceProviderConfig, session: &[String]) -> String {
+    let mut parts = vec!["age=verified".to_owned(), "existmag=all".to_owned()];
+    if !provider.secret.trim().is_empty() {
+        parts.push(provider.secret.trim().to_owned());
+    }
+    parts.extend(session.iter().cloned());
+    parts.join("; ")
+}
+
+async fn javbus_request_html(
+    provider: &SourceProviderConfig,
+    url: reqwest::Url,
+) -> anyhow::Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Luma/1.0")
+        .build()?;
+    let initial_cookie = javbus_cookie(provider, &[]);
+    let html = client
+        .get(url.clone())
+        .header(reqwest::header::COOKIE, &initial_cookie)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    if !is_javbus_age_page(&html) {
+        return Ok(html);
+    }
+
+    let mut verify_url = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    verify_url.set_path("/doc/driver-verify");
+    verify_url
+        .query_pairs_mut()
+        .append_pair("referer", url.path());
+    let verification = client
+        .post(verify_url)
+        .header(reqwest::header::COOKIE, &initial_cookie)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body("Submit=confirm")
         .send()
         .await?
         .error_for_status()?;
-    Ok(())
+    let session = verification
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let retried = client
+        .get(url)
+        .header(reqwest::header::COOKIE, javbus_cookie(provider, &session))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    if is_javbus_age_page(&retried) {
+        anyhow::bail!("JavBus 要求年龄验证，请在该来源中填写可用 Cookie 或更换镜像");
+    }
+    Ok(retried)
+}
+
+fn is_javbus_age_page(html: &str) -> bool {
+    html.contains("driver-verify")
+        && (html.contains("Age Verification") || html.contains("你是否已經成年"))
 }
 
 #[derive(Debug)]
@@ -1620,19 +1830,28 @@ struct SourceMedia {
     source_url: String,
 }
 
-fn parse_javdb_search_html(html: &str, fallback: &str) -> Vec<SourceMedia> {
+fn parse_javbus_search_html(html: &str, fallback: &str, base_url: &str) -> Vec<SourceMedia> {
     let mut items = Vec::new();
     let mut cursor = 0;
-    while let Some(offset) = html[cursor..].find("href=\"") {
-        let start = cursor + offset + 6;
-        let Some(end_offset) = html[start..].find('"') else {
+    while let Some(offset) = html[cursor..].find("movie-box") {
+        let marker = cursor + offset;
+        let anchor_start = html[..marker].rfind("<a").unwrap_or(marker);
+        let Some(open_end_offset) = html[anchor_start..].find('>') else {
             break;
         };
-        let href = &html[start..start + end_offset];
-        cursor = start + end_offset + 1;
-        if !(href.starts_with("/v/") || href.contains("javdb.com/v/")) {
+        if anchor_start + open_end_offset < marker {
+            cursor = marker + "movie-box".len();
             continue;
         }
+        let Some(anchor_end_offset) = html[marker..].find("</a>") else {
+            break;
+        };
+        let anchor_end = marker + anchor_end_offset + 4;
+        let card = &html[anchor_start..anchor_end];
+        cursor = anchor_end;
+        let Some(href) = extract_attribute(card, "href=") else {
+            continue;
+        };
         let provider_id = href
             .trim_end_matches('/')
             .rsplit('/')
@@ -1646,17 +1865,26 @@ fn parse_javdb_search_html(html: &str, fallback: &str) -> Vec<SourceMedia> {
         {
             continue;
         }
-        let tail = &html[cursor..html.len().min(cursor + 2500)];
-        let code = extract_tag_text_after(tail, "uid").unwrap_or_else(|| fallback.to_owned());
-        let title = extract_tag_text_after(tail, "video-title").unwrap_or_else(|| code.clone());
-        let poster_url =
-            extract_attribute(tail, "src=").or_else(|| extract_attribute(tail, "data-src="));
+        let code = if provider_id.is_empty() {
+            fallback.to_owned()
+        } else {
+            provider_id.clone()
+        };
+        let title = extract_attribute(card, "title=")
+            .or_else(|| extract_attribute(card, "alt="))
+            .map(|value| strip_tags(&value))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| code.clone());
+        let poster_url = extract_attribute(card, "data-original=")
+            .or_else(|| extract_attribute(card, "src="))
+            .and_then(|value| absolute_url(base_url, &value));
+        let source_url = absolute_url(base_url, &href).unwrap_or(href);
         items.push(SourceMedia {
             provider_id,
             code: normalize_code(&code),
-            title: strip_tags(&title),
+            title,
             poster_url,
-            source_url: href.to_owned(),
+            source_url,
         });
         if items.len() >= 40 {
             break;
@@ -1665,7 +1893,18 @@ fn parse_javdb_search_html(html: &str, fallback: &str) -> Vec<SourceMedia> {
     items
 }
 
-async fn persist_source_media(state: &AppState, item: &SourceMedia) -> anyhow::Result<i64> {
+fn absolute_url(base_url: &str, value: &str) -> Option<String> {
+    reqwest::Url::parse(value)
+        .or_else(|_| reqwest::Url::parse(base_url)?.join(value))
+        .ok()
+        .map(Into::into)
+}
+
+async fn persist_source_media(
+    state: &AppState,
+    provider_key: &str,
+    item: &SourceMedia,
+) -> anyhow::Result<i64> {
     let code = if item.code.is_empty() {
         normalize_code(&item.title)
     } else {
@@ -1674,8 +1913,8 @@ async fn persist_source_media(state: &AppState, item: &SourceMedia) -> anyhow::R
     let row = sqlx::query("INSERT INTO media(normalized_code, title, poster_url) VALUES (?, ?, ?) ON CONFLICT(normalized_code) DO UPDATE SET title = CASE WHEN length(excluded.title) > length(media.title) THEN excluded.title ELSE media.title END, poster_url = COALESCE(excluded.poster_url, media.poster_url), updated_at = datetime('now') RETURNING id")
         .bind(&code).bind(&item.title).bind(&item.poster_url).fetch_one(&state.pool).await?;
     let id: i64 = row.get("id");
-    sqlx::query("INSERT INTO provider_entity_mapping(provider_key, entity_type, provider_entity_id, media_id, source_url) VALUES ('javdb', 'media', ?, ?, ?) ON CONFLICT(provider_key, entity_type, provider_entity_id) DO UPDATE SET media_id = excluded.media_id, source_url = excluded.source_url, last_seen_at = datetime('now')")
-        .bind(&item.provider_id).bind(id).bind(&item.source_url).execute(&state.pool).await?;
+    sqlx::query("INSERT INTO provider_entity_mapping(provider_key, entity_type, provider_entity_id, media_id, source_url) VALUES (?, 'media', ?, ?, ?) ON CONFLICT(provider_key, entity_type, provider_entity_id) DO UPDATE SET media_id = excluded.media_id, source_url = excluded.source_url, last_seen_at = datetime('now')")
+        .bind(provider_key).bind(&item.provider_id).bind(id).bind(&item.source_url).execute(&state.pool).await?;
     Ok(id)
 }
 
@@ -1734,65 +1973,154 @@ async fn resources_for_media(state: &AppState, media_id: i64) -> AppResult<Vec<R
         .fetch_one(&state.pool)
         .await?;
     if count == 0
-        && let Err(error) = refresh_javdb_media(state, media_id).await
+        && let Err(error) = refresh_source_media(state, media_id).await
     {
-        tracing::warn!(%error, media_id, "JavDB detail refresh failed");
+        tracing::warn!(%error, media_id, "source detail refresh failed");
     }
     let rows = sqlx::query("SELECT * FROM resource WHERE media_id = ? ORDER BY available DESC, score DESC, published_at DESC, id DESC").bind(media_id).fetch_all(&state.pool).await?;
     Ok(rows.iter().map(resource_from_row).collect())
 }
 
-async fn refresh_javdb_media(state: &AppState, media_id: i64) -> anyhow::Result<usize> {
-    let row = sqlx::query("SELECT pem.provider_entity_id, pem.source_url, pc.base_url, pc.secret FROM provider_entity_mapping pem JOIN provider_config pc ON pc.provider_key = pem.provider_key WHERE pem.provider_key='javdb' AND pem.entity_type='media' AND pem.media_id=? AND pc.enabled=1")
-        .bind(media_id).fetch_optional(&state.pool).await?.ok_or_else(|| anyhow::anyhow!("media has no JavDB mapping"))?;
-    let provider_id: String = row.get("provider_entity_id");
-    let source_url: String = row.get("source_url");
-    let base_url: String = row.get("base_url");
-    let cookie: String = row.get("secret");
-    let url = reqwest::Url::parse(&base_url)?
-        .join(&source_url)
-        .or_else(|_| {
-            reqwest::Url::parse(&format!(
-                "{}/v/{provider_id}",
-                base_url.trim_end_matches('/')
-            ))
-        })?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent("Mozilla/5.0 Luma/1.0")
-        .build()?;
-    let mut request = client.get(url);
-    if !cookie.is_empty() {
-        request = request.header(reqwest::header::COOKIE, cookie);
+async fn refresh_source_media(state: &AppState, media_id: i64) -> anyhow::Result<usize> {
+    let rows = sqlx::query("SELECT pem.provider_entity_id, pem.source_url, pc.* FROM provider_entity_mapping pem JOIN provider_config pc ON pc.provider_key = pem.provider_key WHERE pem.entity_type='media' AND pem.media_id=? AND pc.provider_type='source' AND pc.enabled=1 ORDER BY pc.provider_key")
+        .bind(media_id).fetch_all(&state.pool).await?;
+    if rows.is_empty() {
+        anyhow::bail!("媒体没有启用的来源映射");
     }
-    let html = request.send().await?.error_for_status()?.text().await?;
+    let mut total = 0;
+    let mut errors = Vec::new();
+    for row in &rows {
+        let provider = source_provider_from_row(row);
+        let provider_id: String = row.get("provider_entity_id");
+        let source_url: Option<String> = row.get("source_url");
+        let result = match provider.adapter.as_str() {
+            "javbus" => {
+                refresh_javbus_media(
+                    state,
+                    media_id,
+                    &provider,
+                    &provider_id,
+                    source_url.as_deref().unwrap_or_default(),
+                )
+                .await
+            }
+            adapter => Err(anyhow::anyhow!("不支持的来源适配器：{adapter}")),
+        };
+        match result {
+            Ok(count) => total += count,
+            Err(error) => errors.push(format!("{}: {error}", provider.display_name)),
+        }
+    }
+    if total == 0 && !errors.is_empty() {
+        anyhow::bail!(errors.join("；"));
+    }
+    Ok(total)
+}
+
+async fn refresh_javbus_media(
+    state: &AppState,
+    media_id: i64,
+    provider: &SourceProviderConfig,
+    provider_id: &str,
+    source_url: &str,
+) -> anyhow::Result<usize> {
+    let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    let url = reqwest::Url::parse(source_url)
+        .or_else(|_| base.join(source_url))
+        .or_else(|_| base.join(provider_id))?;
+    let html = javbus_request_html(provider, url.clone()).await?;
     let title = meta_content(&html, "og:title");
     let poster = meta_content(&html, "og:image");
     let summary = meta_content(&html, "og:description").unwrap_or_default();
     sqlx::query("UPDATE media SET title=COALESCE(?,title), poster_url=COALESCE(?,poster_url), summary=CASE WHEN ?='' THEN summary ELSE ? END, updated_at=datetime('now') WHERE id=?")
         .bind(title).bind(poster).bind(&summary).bind(&summary).bind(media_id).execute(&state.pool).await?;
-    persist_javdb_actors(state, media_id, &html).await?;
-    let magnets = parse_magnets(&html);
+    persist_javbus_actors(state, media_id, &provider.key, &html).await?;
+    let magnets = fetch_javbus_magnets(provider, &url, &html).await?;
     for (index, (url, label)) in magnets.iter().enumerate() {
         let info_hash = magnet_hash(url);
-        let (score, reasons) = rank_resource(label, None, "", "JavDB");
-        sqlx::query("INSERT INTO resource(media_id,provider_key,provider_resource_id,title,download_url,info_hash,score,score_reasons_json) VALUES (?,'javdb',?,?,?,?,?,?) ON CONFLICT(info_hash) WHERE info_hash IS NOT NULL DO UPDATE SET media_id=excluded.media_id,title=excluded.title,score=excluded.score,score_reasons_json=excluded.score_reasons_json,updated_at=datetime('now')")
-            .bind(media_id).bind(format!("{provider_id}:{index}")).bind(label).bind(url).bind(info_hash).bind(score).bind(serde_json::to_string(&reasons)?).execute(&state.pool).await?;
+        let (score, reasons) = rank_resource(label, None, "", &provider.display_name);
+        sqlx::query("INSERT INTO resource(media_id,provider_key,provider_resource_id,title,download_url,info_hash,score,score_reasons_json) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(info_hash) WHERE info_hash IS NOT NULL DO UPDATE SET media_id=excluded.media_id,title=excluded.title,score=excluded.score,score_reasons_json=excluded.score_reasons_json,updated_at=datetime('now')")
+            .bind(media_id).bind(&provider.key).bind(format!("{provider_id}:{index}")).bind(label).bind(url).bind(info_hash).bind(score).bind(serde_json::to_string(&reasons)?).execute(&state.pool).await?;
     }
     Ok(magnets.len())
 }
 
-async fn persist_javdb_actors(state: &AppState, media_id: i64, html: &str) -> anyhow::Result<()> {
+async fn fetch_javbus_magnets(
+    provider: &SourceProviderConfig,
+    detail_url: &reqwest::Url,
+    html: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let embedded = parse_magnets(html);
+    if !embedded.is_empty() {
+        return Ok(embedded);
+    }
+    let Some(gid) = extract_js_value(html, "gid") else {
+        return Ok(Vec::new());
+    };
+    let img = extract_js_value(html, "img").unwrap_or_default();
+    let uc = extract_js_value(html, "uc").unwrap_or_else(|| "0".into());
+    let mut ajax = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    ajax.set_path("/ajax/uncledatoolsbyajax.php");
+    ajax.query_pairs_mut()
+        .append_pair("gid", &gid)
+        .append_pair("lang", "zh")
+        .append_pair("img", &img)
+        .append_pair("uc", &uc)
+        .append_pair("floor", "1");
+    let body = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Luma/1.0")
+        .build()?
+        .get(ajax)
+        .header(reqwest::header::COOKIE, javbus_cookie(provider, &[]))
+        .header(reqwest::header::REFERER, detail_url.as_str())
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    Ok(parse_magnets(&body))
+}
+
+fn extract_js_value(html: &str, name: &str) -> Option<String> {
+    for marker in [
+        format!("var {name}"),
+        format!("{name} ="),
+        format!("{name}="),
+    ] {
+        let Some(at) = html.find(&marker) else {
+            continue;
+        };
+        let tail = &html[at + marker.len()..html.len().min(at + marker.len() + 800)];
+        let value = tail
+            .trim_start_matches(|character: char| character.is_whitespace() || character == '=')
+            .split([';', '\n', '\r', ','])
+            .next()?
+            .trim()
+            .trim_matches(['\'', '"']);
+        if !value.is_empty() {
+            return Some(html_unescape(value));
+        }
+    }
+    None
+}
+
+async fn persist_javbus_actors(
+    state: &AppState,
+    media_id: i64,
+    provider_key: &str,
+    html: &str,
+) -> anyhow::Result<()> {
     let mut cursor = 0;
     let mut order = 0;
-    while let Some(offset) = html[cursor..].find("/actors/") {
+    while let Some(offset) = html[cursor..].find("/star/") {
         let start = cursor + offset;
         let id_end = html[start..].find(['\"', '\'', '?']).unwrap_or(64).min(64);
-        let provider_id = html[start + 8..start + id_end].trim_matches('/');
+        let provider_id = html[start + 6..start + id_end].trim_matches('/');
         let nearby_start = start.saturating_sub(100);
         let nearby_end = html.len().min(start + 300);
         let nearby = &html[nearby_start..nearby_end];
-        let name = extract_link_text(nearby, "/actors/").unwrap_or_default();
+        let name = extract_link_text(nearby, "/star/").unwrap_or_default();
         cursor = start + id_end;
         if provider_id.is_empty() || name.is_empty() {
             continue;
@@ -1807,7 +2135,7 @@ async fn persist_javdb_actors(state: &AppState, media_id: i64, html: &str) -> an
         .bind(order)
         .execute(&state.pool)
         .await?;
-        sqlx::query("INSERT INTO provider_entity_mapping(provider_key,entity_type,provider_entity_id,actor_id) VALUES ('javdb','actor',?,?) ON CONFLICT(provider_key,entity_type,provider_entity_id) DO UPDATE SET actor_id=excluded.actor_id,last_seen_at=datetime('now')").bind(provider_id).bind(actor_id).execute(&state.pool).await?;
+        sqlx::query("INSERT INTO provider_entity_mapping(provider_key,entity_type,provider_entity_id,actor_id) VALUES (?,'actor',?,?) ON CONFLICT(provider_key,entity_type,provider_entity_id) DO UPDATE SET actor_id=excluded.actor_id,last_seen_at=datetime('now')").bind(provider_key).bind(provider_id).bind(actor_id).execute(&state.pool).await?;
         order += 1;
         if order >= 40 {
             break;
@@ -1846,7 +2174,7 @@ fn parse_magnets(html: &str) -> Vec<(String, String)> {
         result.push((
             url,
             if label.is_empty() {
-                "JavDB 资源".into()
+                "JavBus 资源".into()
             } else {
                 label
             },
@@ -2038,12 +2366,6 @@ async fn sync_provider_legacy_setting(
     secret: &str,
 ) -> AppResult<()> {
     match key {
-        "javdb" => {
-            save_setting(state, "javdb_url", url).await?;
-            if !secret.is_empty() {
-                save_setting(state, "javdb_cookie", secret).await?;
-            }
-        }
         "metatube" => {
             save_setting(state, "metatube_url", url).await?;
             if !secret.is_empty() {
@@ -2120,13 +2442,6 @@ fn strip_tags(value: &str) -> String {
         }
     }
     html_unescape(out.trim())
-}
-fn extract_tag_text_after(text: &str, class: &str) -> Option<String> {
-    let at = text.find(class)?;
-    let tail = &text[at..];
-    let start = tail.find('>')? + 1;
-    let end = tail[start..].find('<')?;
-    Some(strip_tags(&tail[start..start + end]))
 }
 fn extract_attribute(text: &str, marker: &str) -> Option<String> {
     let at = text.find(marker)? + marker.len();
@@ -2290,11 +2605,55 @@ mod tests {
     }
 
     #[test]
-    fn javdb_parser_deduplicates_media_links() {
-        let html = r#"<a href="/v/abc"><div class="video-title">ABC-123 Title</div><img src="/cover.jpg"></a><a href="/v/abc">duplicate</a>"#;
-        let items = parse_javdb_search_html(html, "ABC-123");
+    fn javbus_parser_deduplicates_media_links() {
+        let html = r#"<a class="movie-box" href="/ABC-123"><div class="photo-frame"><img src="/cover.jpg" title="ABC-123 Title"></div></a><a class="movie-box" href="/ABC-123">duplicate</a>"#;
+        let items = parse_javbus_search_html(html, "ABC-123", "https://www.javbus.com");
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].provider_id, "abc");
+        assert_eq!(items[0].provider_id, "ABC-123");
+        assert_eq!(items[0].title, "ABC-123 Title");
+        assert_eq!(
+            items[0].poster_url.as_deref(),
+            Some("https://www.javbus.com/cover.jpg")
+        );
+    }
+
+    #[test]
+    fn javbus_age_gate_is_detected() {
+        assert!(is_javbus_age_page(
+            "<title>Age Verification JavBus</title><a href='/doc/driver-verify'>verify</a>"
+        ));
+    }
+
+    #[test]
+    fn javbus_javascript_values_are_parsed() {
+        let html = "<script>var gid = 12345; var uc = 0; var img = '/cover.jpg';</script>";
+        assert_eq!(extract_js_value(html, "gid").as_deref(), Some("12345"));
+        assert_eq!(extract_js_value(html, "uc").as_deref(), Some("0"));
+        assert_eq!(extract_js_value(html, "img").as_deref(), Some("/cover.jpg"));
+    }
+
+    #[tokio::test]
+    async fn migration_replaces_javdb_with_javbus_source() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let rows = sqlx::query(
+            "SELECT provider_key, config_json FROM provider_config WHERE provider_type='source'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<String, _>("provider_key"), "javbus");
+        assert_eq!(
+            parse_json(&rows[0].get::<String, _>("config_json"), json!({}))["adapter"],
+            "javbus"
+        );
+        let old_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_config WHERE provider_key='javdb'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(old_count, 0);
     }
 
     #[tokio::test]
