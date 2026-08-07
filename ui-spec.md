@@ -1,4 +1,4 @@
-# Luma Media UI Specification
+# Luma UI Specification
 
 Frontend:
 

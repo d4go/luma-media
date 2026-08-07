@@ -1,4 +1,4 @@
-# Luma Media API Design
+# Luma API Design
 
 Base path:
 
@@ -124,3 +124,39 @@ Manage:
 -   output format
 -   scan interval
 -   overwrite policy
+-   qBittorrent Web UI credentials
+-   automatic tracker source and interval
+
+MetaTube 未显式配置时，`GET /settings` 根据 `Host`/`X-Forwarded-Host` 返回部署主机的
+`http://<host>:8080`，也可使用 `LUMA_METATUBE_URL` 覆盖。
+
+POST /settings/metatube/test
+
+POST /settings/qbittorrent/test
+
+## Crawlers
+
+GET /crawlers
+
+POST /crawlers（`multipart/form-data`）
+
+PUT /crawlers/{id}（`multipart/form-data`，更新时 script 可省略）
+
+DELETE /crawlers/{id}
+
+POST /crawlers/{id}/run
+
+上传字段为 `name`、`websiteUrl`、`intervalMinutes`、`enabled`、`autoDownload` 和 `script`。
+Python 结果使用 JSON 数组或 `{ "results": [] }`，每项需要 `downloadUrl`、`magnet`、
+`torrentUrl` 或 `url` 之一，可附带 `title`/`name` 与 `trackers`。
+
+GET /crawler-runs?scriptId={id}
+
+GET /crawler-results?scriptId={id}
+
+POST /crawler-results/{id}/download
+
+POST /crawler-results/download
+
+批量下载请求为 `{ "resultIds": [1, 2] }`。提交后结果保存 qBittorrent 状态、哈希（磁力链接
+可直接解析时）与错误信息。

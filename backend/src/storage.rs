@@ -49,7 +49,26 @@ pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
         .connect(database_url)
         .await?;
     run_migrations_with_legacy_repair(&pool).await?;
+    recover_interrupted_crawler_work(&pool).await?;
     Ok(pool)
+}
+
+async fn recover_interrupted_crawler_work(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE crawler_run SET status = 'failed', \
+         error_message = 'execution interrupted by service restart', finished_at = datetime('now') \
+         WHERE status IN ('pending', 'running')",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE crawler_result SET download_status = 'failed', \
+         error_message = 'qBittorrent submission interrupted by service restart' \
+         WHERE download_status = 'downloading'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn run_migrations_with_legacy_repair(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -435,13 +454,21 @@ pub async fn load_settings(pool: &SqlitePool) -> AppResult<Settings> {
         .fetch_all(pool)
         .await?;
     let mut settings = Settings {
-        metatube_url: "http://metatube:8080".into(),
+        metatube_url: "auto".into(),
         metatube_token: String::new(),
         output_format: "nfo".into(),
         scan_interval: 60,
         overwrite_policy: "missing".into(),
         log_level: "info".into(),
+        qbittorrent_url: "http://127.0.0.1:8080".into(),
+        qbittorrent_username: "admin".into(),
+        qbittorrent_password: String::new(),
+        qbittorrent_auto_update_trackers: false,
+        qbittorrent_tracker_source_url:
+            "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt".into(),
+        qbittorrent_tracker_update_interval: 1440,
     };
+    let mut inferred_metatube_url = None;
     for row in rows {
         let key: String = row.get("key");
         let value: String = row.get("value");
@@ -452,10 +479,42 @@ pub async fn load_settings(pool: &SqlitePool) -> AppResult<Settings> {
             "scan_interval" => settings.scan_interval = value.parse().unwrap_or(60),
             "overwrite_policy" => settings.overwrite_policy = value,
             "log_level" => settings.log_level = value,
+            "deployment_metatube_url" => inferred_metatube_url = Some(value),
+            "qbittorrent_url" => settings.qbittorrent_url = value,
+            "qbittorrent_username" => settings.qbittorrent_username = value,
+            "qbittorrent_password" => settings.qbittorrent_password = value,
+            "qbittorrent_auto_update_trackers" => {
+                settings.qbittorrent_auto_update_trackers = value == "true"
+            }
+            "qbittorrent_tracker_source_url" => settings.qbittorrent_tracker_source_url = value,
+            "qbittorrent_tracker_update_interval" => {
+                settings.qbittorrent_tracker_update_interval = value.parse().unwrap_or(1440)
+            }
             _ => {}
         }
     }
+    if settings.metatube_url == "auto" {
+        settings.metatube_url = std::env::var("LUMA_METATUBE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or(inferred_metatube_url)
+            .unwrap_or_else(local_metatube_url);
+    }
     Ok(settings)
+}
+
+fn local_metatube_url() -> String {
+    let ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("8.8.8.8:80")?;
+            socket.local_addr()
+        })
+        .map(|address| address.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    match ip {
+        std::net::IpAddr::V4(ip) => format!("http://{ip}:8080"),
+        std::net::IpAddr::V6(ip) => format!("http://[{ip}]:8080"),
+    }
 }
 
 pub fn folder_from_row(row: &sqlx::sqlite::SqliteRow) -> Folder {
@@ -640,7 +699,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "luma-media-resource-test-{}-{nonce}",
+            "luma-resource-test-{}-{nonce}",
             std::process::id()
         ));
         std::fs::create_dir_all(&directory).unwrap();
@@ -829,5 +888,56 @@ mod tests {
         assert_eq!(task_count, 1);
         assert_eq!(record_count, 3);
         assert_eq!(status, "success");
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_interrupted_crawler_work() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let script_id = sqlx::query(
+            "INSERT INTO crawler_script (name, website_url, file_name, file_path) \
+             VALUES ('Crawler', 'https://example.com', 'crawler.py', '/crawler.py')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let run_id =
+            sqlx::query("INSERT INTO crawler_run (script_id, status) VALUES (?, 'running')")
+                .bind(script_id)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO crawler_result \
+             (run_id, script_id, title, download_url, raw_json, download_status) \
+             VALUES (?, ?, 'Result', 'magnet:?xt=urn:btih:A', '{}', 'downloading')",
+        )
+        .bind(run_id)
+        .bind(script_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        recover_interrupted_crawler_work(&pool).await.unwrap();
+
+        let run_status: String = sqlx::query_scalar("SELECT status FROM crawler_run WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let download_status: String =
+            sqlx::query_scalar("SELECT download_status FROM crawler_result WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(run_status, "failed");
+        assert_eq!(download_status, "failed");
     }
 }

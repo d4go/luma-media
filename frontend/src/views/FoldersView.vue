@@ -102,7 +102,7 @@ onMounted(load)
 
   <section class="panel">
     <div v-if="loading" style="padding: 20px"><n-skeleton text :repeat="7" /></div>
-    <EmptyState v-else-if="!folders.length" title="还没有媒体目录" description="添加一个服务器路径，Luma Media 就可以开始建立索引。">
+    <EmptyState v-else-if="!folders.length" title="还没有媒体目录" description="添加一个服务器路径，Luma 就可以开始建立索引。">
       <n-button type="primary" @click="openCreate"><template #icon><IconPlus /></template>添加目录</n-button>
     </EmptyState>
     <div v-else class="table-wrap"><n-data-table :columns="columns" :data="folders" :bordered="false" :single-line="false" /></div>

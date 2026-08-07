@@ -2,23 +2,25 @@ use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     routing::{get, post, put},
 };
 use serde_json::json;
 use sqlx::Row;
 
 use crate::{
-    AppState, asset,
+    AppState, asset, crawler,
     error::{AppError, AppResult},
     metadata::{self, WriteOptions},
     models::{
-        BatchScrapeInput, BatchScrapeResponse, BatchTaskInput, BatchTaskResponse, DashboardStats,
-        Folder, FolderInput, LogEntry, MediaItem, MetaTubeConnection, ScrapeOptions, Settings,
-        Task, TaskDetail,
+        BatchCrawlerResultInput, BatchScrapeInput, BatchScrapeResponse, BatchTaskInput,
+        BatchTaskResponse, CrawlerResult, CrawlerRun, CrawlerScript, DashboardStats, Folder,
+        FolderInput, LogEntry, MediaItem, MetaTubeConnection, QBittorrentConnection, ScrapeOptions,
+        ServiceHealth, ServiceStatus, Settings, Task, TaskDetail,
     },
     provider::MetaTubeClient,
+    qbittorrent::QBittorrentClient,
     scanner,
     storage::{self, folder_from_row, media_from_row, task_from_row},
 };
@@ -39,8 +41,21 @@ pub fn router() -> Router<AppState> {
         .route("/media/scrape", post(scrape_media_batch))
         .route("/media/{id}/scrape", post(scrape_media))
         .route("/settings", get(get_settings).put(update_settings))
+        .route("/status", get(service_status))
         .route("/settings/metatube/test", post(test_metatube))
+        .route("/settings/qbittorrent/test", post(test_qbittorrent))
+        .route("/crawlers", get(list_crawlers).post(create_crawler))
+        .route("/crawlers/{id}", put(update_crawler).delete(delete_crawler))
+        .route("/crawlers/{id}/run", post(run_crawler))
+        .route("/crawler-runs", get(list_crawler_runs))
+        .route("/crawler-results", get(list_crawler_results))
+        .route("/crawler-results/download", post(download_crawler_results))
+        .route(
+            "/crawler-results/{id}/download",
+            post(download_crawler_result),
+        )
         .route("/logs", get(list_logs))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
 }
 
 async fn dashboard(State(state): State<AppState>) -> AppResult<Json<DashboardStats>> {
@@ -786,7 +801,284 @@ async fn fail_scrape(state: &AppState, media_id: i64, task_id: i64, record_id: i
     storage::log(&state.pool, "error", "provider", message).await;
 }
 
-async fn get_settings(State(state): State<AppState>) -> AppResult<Json<Settings>> {
+async fn list_crawlers(State(state): State<AppState>) -> AppResult<Json<Vec<CrawlerScript>>> {
+    Ok(Json(crawler::list_scripts(&state.pool).await?))
+}
+
+struct CrawlerUpload {
+    name: String,
+    website_url: String,
+    interval_minutes: u64,
+    enabled: bool,
+    auto_download: bool,
+    file_name: Option<String>,
+    script: Option<Vec<u8>>,
+}
+
+async fn read_crawler_upload(mut multipart: Multipart) -> AppResult<CrawlerUpload> {
+    let mut name = None;
+    let mut website_url = None;
+    let mut interval_minutes = None;
+    let mut enabled = None;
+    let mut auto_download = None;
+    let mut file_name = None;
+    let mut script = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("invalid upload: {error}")))?
+    {
+        let field_name = field.name().unwrap_or_default().to_owned();
+        if field_name == "script" {
+            let original = field
+                .file_name()
+                .and_then(|name| std::path::Path::new(name).file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("crawler.py")
+                .to_owned();
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|error| AppError::BadRequest(format!("invalid script upload: {error}")))?;
+            file_name = Some(original);
+            script = Some(bytes.to_vec());
+            continue;
+        }
+        let value = field
+            .text()
+            .await
+            .map_err(|error| AppError::BadRequest(format!("invalid form field: {error}")))?;
+        match field_name.as_str() {
+            "name" => name = Some(value),
+            "websiteUrl" => website_url = Some(value),
+            "intervalMinutes" => interval_minutes = value.parse().ok(),
+            "enabled" => enabled = Some(matches!(value.as_str(), "true" | "1" | "on")),
+            "autoDownload" => auto_download = Some(matches!(value.as_str(), "true" | "1" | "on")),
+            _ => {}
+        }
+    }
+    Ok(CrawlerUpload {
+        name: name.unwrap_or_default(),
+        website_url: website_url.unwrap_or_default(),
+        interval_minutes: interval_minutes.unwrap_or(60),
+        enabled: enabled.unwrap_or(true),
+        auto_download: auto_download.unwrap_or(false),
+        file_name,
+        script,
+    })
+}
+
+fn validate_crawler_upload(upload: &CrawlerUpload, script_required: bool) -> AppResult<()> {
+    if upload.name.trim().is_empty() {
+        return Err(AppError::BadRequest("crawler name is required".into()));
+    }
+    let website = reqwest::Url::parse(upload.website_url.trim())
+        .map_err(|_| AppError::BadRequest("website URL is invalid".into()))?;
+    if !matches!(website.scheme(), "http" | "https") {
+        return Err(AppError::BadRequest(
+            "website URL must use http or https".into(),
+        ));
+    }
+    if !(1..=10080).contains(&upload.interval_minutes) {
+        return Err(AppError::BadRequest(
+            "crawler interval must be between 1 and 10080 minutes".into(),
+        ));
+    }
+    if script_required && upload.script.is_none() {
+        return Err(AppError::BadRequest("a Python script is required".into()));
+    }
+    if let Some(script) = &upload.script {
+        if script.is_empty() || script.len() > 1024 * 1024 {
+            return Err(AppError::BadRequest(
+                "Python script must be between 1 byte and 1 MiB".into(),
+            ));
+        }
+        if !upload
+            .file_name
+            .as_deref()
+            .is_some_and(|name| name.to_ascii_lowercase().ends_with(".py"))
+        {
+            return Err(AppError::BadRequest(
+                "script filename must end in .py".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn create_crawler(
+    State(state): State<AppState>,
+    multipart: Multipart,
+) -> AppResult<(StatusCode, Json<CrawlerScript>)> {
+    let upload = read_crawler_upload(multipart).await?;
+    validate_crawler_upload(&upload, true)?;
+    let mut transaction = state.pool.begin().await?;
+    let result = sqlx::query(
+        "INSERT INTO crawler_script (name, website_url, file_name, file_path, interval_minutes, enabled, auto_download, next_run_at) \
+         VALUES (?, ?, ?, '', ?, ?, ?, CASE WHEN ? THEN datetime('now') ELSE NULL END)",
+    )
+    .bind(upload.name.trim())
+    .bind(upload.website_url.trim())
+    .bind(upload.file_name.as_deref().unwrap_or("crawler.py"))
+    .bind(upload.interval_minutes as i64)
+    .bind(upload.enabled)
+    .bind(upload.auto_download)
+    .bind(upload.enabled)
+    .execute(&mut *transaction)
+    .await?;
+    let id = result.last_insert_rowid();
+    let file_path = state.script_root.join("scripts").join(format!("{id}.py"));
+    sqlx::query("UPDATE crawler_script SET file_path = ? WHERE id = ?")
+        .bind(file_path.to_string_lossy().to_string())
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    if let Err(error) = tokio::fs::write(&file_path, upload.script.unwrap_or_default()).await {
+        let _ = sqlx::query("DELETE FROM crawler_script WHERE id = ?")
+            .bind(id)
+            .execute(&state.pool)
+            .await;
+        return Err(AppError::Internal(error.into()));
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(crawler::script_by_id(&state.pool, id).await?),
+    ))
+}
+
+async fn update_crawler(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    multipart: Multipart,
+) -> AppResult<Json<CrawlerScript>> {
+    crawler::script_by_id(&state.pool, id).await?;
+    let upload = read_crawler_upload(multipart).await?;
+    validate_crawler_upload(&upload, false)?;
+    let existing_path: String =
+        sqlx::query_scalar("SELECT file_path FROM crawler_script WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?;
+    if let Some(script) = upload.script {
+        tokio::fs::write(&existing_path, script)
+            .await
+            .map_err(|error| AppError::Internal(error.into()))?;
+    }
+    sqlx::query(
+        "UPDATE crawler_script SET name = ?, website_url = ?, file_name = COALESCE(?, file_name), \
+         interval_minutes = ?, enabled = ?, auto_download = ?, \
+         next_run_at = CASE WHEN ? THEN datetime('now', '+' || ? || ' minutes') ELSE NULL END, \
+         updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(upload.name.trim())
+    .bind(upload.website_url.trim())
+    .bind(upload.file_name)
+    .bind(upload.interval_minutes as i64)
+    .bind(upload.enabled)
+    .bind(upload.auto_download)
+    .bind(upload.enabled)
+    .bind(upload.interval_minutes as i64)
+    .bind(id)
+    .execute(&state.pool)
+    .await?;
+    Ok(Json(crawler::script_by_id(&state.pool, id).await?))
+}
+
+async fn delete_crawler(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<StatusCode> {
+    let file_path: String = sqlx::query_scalar("SELECT file_path FROM crawler_script WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    sqlx::query("DELETE FROM crawler_script WHERE id = ?")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+    if !file_path.is_empty() {
+        let _ = tokio::fs::remove_file(file_path).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn run_crawler(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<(StatusCode, Json<CrawlerRun>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(crawler::queue_run(&state, id).await?),
+    ))
+}
+
+async fn list_crawler_runs(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> AppResult<Json<Vec<CrawlerRun>>> {
+    let script_id = query.get("scriptId").and_then(|value| value.parse().ok());
+    Ok(Json(crawler::list_runs(&state.pool, script_id).await?))
+}
+
+async fn list_crawler_results(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> AppResult<Json<Vec<CrawlerResult>>> {
+    let script_id = query.get("scriptId").and_then(|value| value.parse().ok());
+    Ok(Json(crawler::list_results(&state.pool, script_id).await?))
+}
+
+async fn download_crawler_result(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<(StatusCode, Json<CrawlerResult>)> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(crawler::download_result(&state, id).await?),
+    ))
+}
+
+async fn download_crawler_results(
+    State(state): State<AppState>,
+    Json(input): Json<BatchCrawlerResultInput>,
+) -> AppResult<Json<Vec<CrawlerResult>>> {
+    if input.result_ids.is_empty() || input.result_ids.len() > 100 {
+        return Err(AppError::BadRequest(
+            "select between 1 and 100 results".into(),
+        ));
+    }
+    let mut downloaded = Vec::new();
+    for id in input.result_ids {
+        downloaded.push(crawler::download_result(&state, id).await?);
+    }
+    Ok(Json(downloaded))
+}
+
+async fn get_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Settings>> {
+    let configured: Option<String> =
+        sqlx::query_scalar("SELECT value FROM app_setting WHERE key = 'metatube_url'")
+            .fetch_optional(&state.pool)
+            .await?;
+    let environment_override = std::env::var("LUMA_METATUBE_URL")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    if configured.as_deref().is_none_or(|value| value == "auto")
+        && !environment_override
+        && let Some(url) = inferred_metatube_url(&headers)
+    {
+        sqlx::query(
+            "INSERT INTO app_setting (key, value, updated_at) VALUES ('deployment_metatube_url', ?, datetime('now')) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')",
+        )
+        .bind(url)
+        .execute(&state.pool)
+        .await?;
+    }
     Ok(Json(storage::load_settings(&state.pool).await?))
 }
 
@@ -802,6 +1094,27 @@ async fn update_settings(
         ("scan_interval", settings.scan_interval.to_string()),
         ("overwrite_policy", settings.overwrite_policy.clone()),
         ("log_level", settings.log_level.clone()),
+        ("qbittorrent_url", settings.qbittorrent_url.clone()),
+        (
+            "qbittorrent_username",
+            settings.qbittorrent_username.clone(),
+        ),
+        (
+            "qbittorrent_password",
+            settings.qbittorrent_password.clone(),
+        ),
+        (
+            "qbittorrent_auto_update_trackers",
+            settings.qbittorrent_auto_update_trackers.to_string(),
+        ),
+        (
+            "qbittorrent_tracker_source_url",
+            settings.qbittorrent_tracker_source_url.clone(),
+        ),
+        (
+            "qbittorrent_tracker_update_interval",
+            settings.qbittorrent_tracker_update_interval.to_string(),
+        ),
     ];
     let mut transaction = state.pool.begin().await?;
     for (key, value) in values {
@@ -819,8 +1132,75 @@ async fn update_settings(
     Ok(Json(settings))
 }
 
+async fn service_status(State(state): State<AppState>) -> AppResult<Json<ServiceStatus>> {
+    let settings = storage::load_settings(&state.pool).await?;
+    let checked_at: String = sqlx::query_scalar("SELECT datetime('now')")
+        .fetch_one(&state.pool)
+        .await?;
+    let (meta_tube, qbittorrent) = tokio::join!(
+        probe_metatube(settings.clone()),
+        probe_qbittorrent(settings)
+    );
+    Ok(Json(ServiceStatus {
+        luma: ServiceHealth {
+            connected: true,
+            message: "Luma is running".into(),
+            latency_ms: Some(0),
+        },
+        meta_tube,
+        qbittorrent,
+        checked_at,
+    }))
+}
+
+async fn probe_metatube(settings: Settings) -> ServiceHealth {
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let client = MetaTubeClient::new(&settings)?;
+        let provider_count = client.test_connection().await?;
+        Ok::<_, anyhow::Error>(format!("{provider_count} movie providers"))
+    })
+    .await;
+    health_from_probe(result, started)
+}
+
+async fn probe_qbittorrent(settings: Settings) -> ServiceHealth {
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let client = QBittorrentClient::new(&settings)?;
+        let version = client.version().await?;
+        Ok::<_, anyhow::Error>(version)
+    })
+    .await;
+    health_from_probe(result, started)
+}
+
+fn health_from_probe(
+    result: Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>,
+    started: std::time::Instant,
+) -> ServiceHealth {
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok(Ok(message)) => ServiceHealth {
+            connected: true,
+            message,
+            latency_ms: Some(latency_ms),
+        },
+        Ok(Err(error)) => ServiceHealth {
+            connected: false,
+            message: error.to_string(),
+            latency_ms: Some(latency_ms),
+        },
+        Err(_) => ServiceHealth {
+            connected: false,
+            message: "connection check timed out after 5 seconds".into(),
+            latency_ms: Some(latency_ms),
+        },
+    }
+}
+
 async fn test_metatube(Json(settings): Json<Settings>) -> AppResult<Json<MetaTubeConnection>> {
-    validate_settings(&settings)?;
+    validate_metatube_settings(&settings)?;
     let client =
         MetaTubeClient::new(&settings).map_err(|error| AppError::BadRequest(error.to_string()))?;
     let provider_count = client
@@ -834,9 +1214,25 @@ async fn test_metatube(Json(settings): Json<Settings>) -> AppResult<Json<MetaTub
     }))
 }
 
+async fn test_qbittorrent(
+    Json(settings): Json<Settings>,
+) -> AppResult<Json<QBittorrentConnection>> {
+    validate_qbittorrent_settings(&settings)?;
+    let version = QBittorrentClient::new(&settings)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?
+        .version()
+        .await
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    Ok(Json(QBittorrentConnection {
+        connected: true,
+        message: format!("Connected to qBittorrent {version}"),
+        version,
+    }))
+}
+
 async fn ensure_metatube_connected(state: &AppState) -> AppResult<()> {
     let settings = storage::load_settings(&state.pool).await?;
-    validate_settings(&settings)?;
+    validate_metatube_settings(&settings)?;
     let client = MetaTubeClient::new(&settings)
         .map_err(|error| AppError::BadRequest(format!("MetaTube connection failed: {error}")))?;
     client
@@ -880,6 +1276,11 @@ fn validate_folder(input: &FolderInput) -> AppResult<()> {
             "output format must be nfo, json, or both".into(),
         ));
     }
+    if !matches!(input.scan_mode.as_str(), "manual" | "watch" | "interval") {
+        return Err(AppError::BadRequest(
+            "scan mode must be manual, watch, or interval".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -909,9 +1310,8 @@ fn validate_batch_task_input(input: &BatchTaskInput) -> AppResult<()> {
 }
 
 fn validate_settings(settings: &Settings) -> AppResult<()> {
-    if settings.metatube_url.trim().is_empty() {
-        return Err(AppError::BadRequest("MetaTube URL is required".into()));
-    }
+    validate_metatube_settings(settings)?;
+    validate_qbittorrent_settings(settings)?;
     if settings.scan_interval == 0 {
         return Err(AppError::BadRequest(
             "scan interval must be greater than zero".into(),
@@ -931,4 +1331,92 @@ fn validate_settings(settings: &Settings) -> AppResult<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_metatube_settings(settings: &Settings) -> AppResult<()> {
+    if settings.metatube_url.trim().is_empty() {
+        return Err(AppError::BadRequest("MetaTube URL is required".into()));
+    }
+    let metatube_url = reqwest::Url::parse(settings.metatube_url.trim())
+        .map_err(|_| AppError::BadRequest("MetaTube URL is invalid".into()))?;
+    if !matches!(metatube_url.scheme(), "http" | "https") {
+        return Err(AppError::BadRequest(
+            "MetaTube URL must use http or https".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_qbittorrent_settings(settings: &Settings) -> AppResult<()> {
+    let qbit_url = reqwest::Url::parse(settings.qbittorrent_url.trim())
+        .map_err(|_| AppError::BadRequest("qBittorrent URL is invalid".into()))?;
+    if !matches!(qbit_url.scheme(), "http" | "https") {
+        return Err(AppError::BadRequest(
+            "qBittorrent URL must use http or https".into(),
+        ));
+    }
+    if settings.qbittorrent_tracker_update_interval == 0 {
+        return Err(AppError::BadRequest(
+            "tracker update interval must be greater than zero".into(),
+        ));
+    }
+    if settings.qbittorrent_auto_update_trackers {
+        let tracker_url = reqwest::Url::parse(settings.qbittorrent_tracker_source_url.trim())
+            .map_err(|_| AppError::BadRequest("tracker source URL is invalid".into()))?;
+        if !matches!(tracker_url.scheme(), "http" | "https") {
+            return Err(AppError::BadRequest(
+                "tracker source URL must use http or https".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn inferred_metatube_url(headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim();
+    let hostname = if host.starts_with('[') {
+        let end = host.find(']')?;
+        &host[..=end]
+    } else if let Some((name, port)) = host.rsplit_once(':') {
+        if port.chars().all(|character| character.is_ascii_digit()) {
+            name
+        } else {
+            host
+        }
+    } else {
+        host
+    };
+    (!hostname.is_empty()).then(|| format!("http://{hostname}:8080"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infers_metatube_from_deployment_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "192.168.1.20:3000".parse().unwrap());
+        assert_eq!(
+            inferred_metatube_url(&headers).as_deref(),
+            Some("http://192.168.1.20:8080")
+        );
+    }
+
+    #[test]
+    fn supports_forwarded_ipv6_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", "[2001:db8::1]:3000".parse().unwrap());
+        assert_eq!(
+            inferred_metatube_url(&headers).as_deref(),
+            Some("http://[2001:db8::1]:8080")
+        );
+    }
 }

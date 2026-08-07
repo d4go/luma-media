@@ -189,6 +189,53 @@ pub struct Settings {
     pub scan_interval: u64,
     pub overwrite_policy: String,
     pub log_level: String,
+    #[serde(default = "default_qbittorrent_url")]
+    pub qbittorrent_url: String,
+    #[serde(default = "default_qbittorrent_username")]
+    pub qbittorrent_username: String,
+    #[serde(default)]
+    pub qbittorrent_password: String,
+    #[serde(default)]
+    pub qbittorrent_auto_update_trackers: bool,
+    #[serde(default = "default_tracker_source_url")]
+    pub qbittorrent_tracker_source_url: String,
+    #[serde(default = "default_tracker_update_interval")]
+    pub qbittorrent_tracker_update_interval: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            metatube_url: "http://127.0.0.1:8080".into(),
+            metatube_token: String::new(),
+            output_format: "nfo".into(),
+            scan_interval: 60,
+            overwrite_policy: "missing".into(),
+            log_level: "info".into(),
+            qbittorrent_url: default_qbittorrent_url(),
+            qbittorrent_username: default_qbittorrent_username(),
+            qbittorrent_password: String::new(),
+            qbittorrent_auto_update_trackers: false,
+            qbittorrent_tracker_source_url: default_tracker_source_url(),
+            qbittorrent_tracker_update_interval: default_tracker_update_interval(),
+        }
+    }
+}
+
+fn default_qbittorrent_url() -> String {
+    "http://127.0.0.1:8080".into()
+}
+
+fn default_qbittorrent_username() -> String {
+    "admin".into()
+}
+
+fn default_tracker_source_url() -> String {
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt".into()
+}
+
+fn default_tracker_update_interval() -> u64 {
+    1440
 }
 
 #[derive(Debug, Serialize)]
@@ -217,6 +264,88 @@ pub struct LogEntry {
     pub module: String,
     pub message: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QBittorrentConnection {
+    pub connected: bool,
+    pub version: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceHealth {
+    pub connected: bool,
+    pub message: String,
+    pub latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStatus {
+    pub luma: ServiceHealth,
+    pub meta_tube: ServiceHealth,
+    pub qbittorrent: ServiceHealth,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrawlerScript {
+    pub id: i64,
+    pub name: String,
+    pub website_url: String,
+    pub file_name: String,
+    pub interval_minutes: u64,
+    pub enabled: bool,
+    pub auto_download: bool,
+    pub last_started_at: Option<String>,
+    pub last_finished_at: Option<String>,
+    pub next_run_at: Option<String>,
+    pub last_run_status: Option<String>,
+    pub last_result_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrawlerRun {
+    pub id: i64,
+    pub script_id: i64,
+    pub status: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub result_count: i64,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrawlerResult {
+    pub id: i64,
+    pub run_id: i64,
+    pub script_id: i64,
+    pub title: String,
+    pub download_url: String,
+    pub trackers: Vec<String>,
+    pub raw: serde_json::Value,
+    pub download_status: String,
+    pub qbit_hash: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub downloaded_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCrawlerResultInput {
+    pub result_ids: Vec<i64>,
 }
 
 #[cfg(test)]

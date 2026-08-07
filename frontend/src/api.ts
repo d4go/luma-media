@@ -1,6 +1,7 @@
 import type {
-  BatchScrapeResponse, BatchTaskResponse, DashboardStats, Folder, FolderInput, MediaItem,
-  MetaTubeConnection, ScrapeOptions, Settings, Task, TaskDetail,
+  BatchScrapeResponse, BatchTaskResponse, CrawlerForm, CrawlerResult, CrawlerRun, CrawlerScript,
+  DashboardStats, Folder, FolderInput, MediaItem, MetaTubeConnection, QBittorrentConnection,
+  ScrapeOptions, ServiceStatus, Settings, Task, TaskDetail,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
@@ -15,9 +16,10 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const isFormData = options?.body instanceof FormData
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
-    headers: {
+    headers: isFormData ? options?.headers : {
       'Content-Type': 'application/json',
       ...options?.headers,
     },
@@ -30,7 +32,19 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+function crawlerForm(input: CrawlerForm) {
+  const form = new FormData()
+  form.set('name', input.name)
+  form.set('websiteUrl', input.websiteUrl)
+  form.set('intervalMinutes', String(input.intervalMinutes))
+  form.set('enabled', String(input.enabled))
+  form.set('autoDownload', String(input.autoDownload))
+  if (input.script) form.set('script', input.script)
+  return form
+}
+
 export const api = {
+  serviceStatus: () => request<ServiceStatus>('/status'),
   dashboard: () => request<DashboardStats>('/dashboard'),
   folders: () => request<Folder[]>('/folders'),
   createFolder: (input: FolderInput) => request<Folder>('/folders', { method: 'POST', body: JSON.stringify(input) }),
@@ -64,4 +78,16 @@ export const api = {
   settings: () => request<Settings>('/settings'),
   updateSettings: (settings: Settings) => request<Settings>('/settings', { method: 'PUT', body: JSON.stringify(settings) }),
   testMetaTube: (settings: Settings) => request<MetaTubeConnection>('/settings/metatube/test', { method: 'POST', body: JSON.stringify(settings) }),
+  testQBittorrent: (settings: Settings) => request<QBittorrentConnection>('/settings/qbittorrent/test', { method: 'POST', body: JSON.stringify(settings) }),
+  crawlers: () => request<CrawlerScript[]>('/crawlers'),
+  createCrawler: (input: CrawlerForm) => request<CrawlerScript>('/crawlers', { method: 'POST', body: crawlerForm(input) }),
+  updateCrawler: (id: number, input: CrawlerForm) => request<CrawlerScript>(`/crawlers/${id}`, { method: 'PUT', body: crawlerForm(input) }),
+  deleteCrawler: (id: number) => request<void>(`/crawlers/${id}`, { method: 'DELETE' }),
+  runCrawler: (id: number) => request<CrawlerRun>(`/crawlers/${id}/run`, { method: 'POST' }),
+  crawlerRuns: (scriptId?: number) => request<CrawlerRun[]>(`/crawler-runs${scriptId ? `?scriptId=${scriptId}` : ''}`),
+  crawlerResults: (scriptId?: number) => request<CrawlerResult[]>(`/crawler-results${scriptId ? `?scriptId=${scriptId}` : ''}`),
+  downloadCrawlerResult: (id: number) => request<CrawlerResult>(`/crawler-results/${id}/download`, { method: 'POST' }),
+  downloadCrawlerResults: (resultIds: number[]) => request<CrawlerResult[]>('/crawler-results/download', {
+    method: 'POST', body: JSON.stringify({ resultIds }),
+  }),
 }

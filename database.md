@@ -1,4 +1,4 @@
-# Luma Media Database Design
+# Luma Database Design
 
 ## media_item
 
@@ -82,3 +82,9 @@
     module
     message
     created_at
+
+## crawler_script / crawler_run / crawler_result
+
+`crawler_script` 保存脚本文件、目标网站、循环间隔、启停与自动下载策略；`crawler_run` 保存每次
+Python 执行的状态、stdout、stderr 和结果数；`crawler_result` 保存结构化下载地址、Tracker、
+原始 JSON 以及 qBittorrent 提交状态。删除脚本时相关运行与结果级联删除。

@@ -1,10 +1,10 @@
 services:
-    luma-media:
+    luma:
       build:
         context: .
         dockerfile: Dockerfile
-      image: luma-media:latest
-      container_name: luma-media
+      image: luma:latest
+      container_name: luma
       restart: unless-stopped
 
       ports:
@@ -12,13 +12,13 @@ services:
 
       volumes:
         # SQLite 数据库和运行数据
-        - ${LUMA_DATA_ROOT:-/vol3/1000/docker/luma-media-data}:/data
+        - ${LUMA_DATA_ROOT:-/vol3/1000/docker/luma-data}:/data
 
         # 需要读写权限，刮削结果会写在视频文件旁边
         - ${MEDIA_ROOT:-/vol1/1000/a1}:/media:rw
 
       environment:
-        DATABASE_URL: sqlite:///data/luma-media.db?mode=rwc
+        DATABASE_URL: sqlite:///data/luma.db?mode=rwc
         LUMA_DATA_DIR: /data
         LUMA_STATIC_DIR: /app/web
         LUMA_BIND: 0.0.0.0:3000
