@@ -1462,7 +1462,17 @@ struct CreateProviderInput {
 }
 
 fn default_source_adapter() -> String {
-    "javbus".into()
+    "jav321".into()
+}
+
+fn source_adapter_label(adapter: &str) -> Option<&'static str> {
+    match adapter {
+        "jav321" => Some("Jav321"),
+        "javdb" => Some("JavDB"),
+        "javbus" => Some("JavBus"),
+        "javlibrary" => Some("JavLibrary"),
+        _ => None,
+    }
 }
 
 async fn create_provider(
@@ -1472,13 +1482,21 @@ async fn create_provider(
     if input.display_name.trim().is_empty() {
         return Err(AppError::BadRequest("来源名称不能为空".into()));
     }
-    if input.adapter != "javbus" {
-        return Err(AppError::BadRequest("当前仅支持 JavBus 来源适配器".into()));
+    let adapter = input.adapter.trim().to_ascii_lowercase();
+    if source_adapter_label(&adapter).is_none() {
+        return Err(AppError::BadRequest(format!(
+            "不支持的来源适配器：{}",
+            input.adapter
+        )));
     }
     validate_http_url(&input.base_url)?;
-    let mut suffix = 2_i64;
+    let mut suffix = 1_i64;
     let key = loop {
-        let candidate = format!("javbus-{suffix}");
+        let candidate = if suffix == 1 {
+            adapter.clone()
+        } else {
+            format!("{adapter}-{suffix}")
+        };
         let exists: i64 = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM provider_config WHERE provider_key = ?)",
         )
@@ -1495,7 +1513,7 @@ async fn create_provider(
         .bind(input.display_name.trim())
         .bind(input.base_url.trim())
         .bind(input.secret.trim())
-        .bind(json!({"adapter": input.adapter}).to_string())
+        .bind(json!({"adapter": adapter}).to_string())
         .execute(&state.pool)
         .await?;
     provider_by_key(&state, &key).await
@@ -1711,6 +1729,9 @@ async fn source_search(
 ) -> anyhow::Result<usize> {
     match provider.adapter.as_str() {
         "javbus" => javbus_search(state, provider, query).await,
+        "javdb" => javdb_search(state, provider, query).await,
+        "jav321" => jav321_search(state, provider, query).await,
+        "javlibrary" => javlibrary_search(state, provider, query).await,
         adapter => anyhow::bail!("不支持的来源适配器：{adapter}"),
     }
 }
@@ -1725,8 +1746,347 @@ async fn source_probe(provider: &SourceProviderConfig) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        "javdb" => {
+            let (_, html) =
+                source_get_html(provider, reqwest::Url::parse(&provider.base_url)?).await?;
+            reject_cloudflare(&html, "JavDB")?;
+            if !html.to_ascii_lowercase().contains("javdb") {
+                anyhow::bail!("响应内容不是 JavDB 页面");
+            }
+            Ok(())
+        }
+        "jav321" => {
+            let (_, html) =
+                source_get_html(provider, reqwest::Url::parse(&provider.base_url)?).await?;
+            if !html.to_ascii_lowercase().contains("jav321") {
+                anyhow::bail!("响应内容不是 Jav321 页面");
+            }
+            Ok(())
+        }
+        "javlibrary" => {
+            let (_, html) =
+                source_get_html(provider, reqwest::Url::parse(&provider.base_url)?).await?;
+            reject_cloudflare(&html, "JavLibrary")?;
+            if !html.to_ascii_lowercase().contains("javlibrary") {
+                anyhow::bail!("响应内容不是 JavLibrary 页面");
+            }
+            Ok(())
+        }
         adapter => anyhow::bail!("不支持的来源适配器：{adapter}"),
     }
+}
+
+fn source_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/127 Safari/537.36 Luma/1.0",
+        )
+        .build()?)
+}
+
+async fn source_get_html(
+    provider: &SourceProviderConfig,
+    url: reqwest::Url,
+) -> anyhow::Result<(reqwest::Url, String)> {
+    let mut request = source_client()?.get(url);
+    if !provider.secret.trim().is_empty() {
+        request = request.header(reqwest::header::COOKIE, provider.secret.trim());
+    }
+    let response = request.send().await?.error_for_status()?;
+    let final_url = response.url().clone();
+    Ok((final_url, response.text().await?))
+}
+
+fn reject_cloudflare(html: &str, name: &str) -> anyhow::Result<()> {
+    if html.contains("challenge-platform") || html.contains("Just a moment...") {
+        anyhow::bail!(
+            "{name} 触发 Cloudflare 验证，请填写浏览器中的 cf_clearance Cookie 或更换镜像"
+        );
+    }
+    Ok(())
+}
+
+async fn javdb_search(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    query: &str,
+) -> anyhow::Result<usize> {
+    let mut url = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    url.set_path("/search");
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("f", "all");
+    let (_, html) = source_get_html(provider, url).await?;
+    reject_cloudflare(&html, "JavDB")?;
+    let items = parse_javdb_search_html(&html, query, &provider.base_url);
+    for item in &items {
+        persist_source_media(state, &provider.key, item).await?;
+    }
+    Ok(items.len())
+}
+
+async fn jav321_search(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    query: &str,
+) -> anyhow::Result<usize> {
+    let mut url = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    url.set_path("/search");
+    let mut encoded = reqwest::Url::parse("https://luma.invalid/")?;
+    encoded.query_pairs_mut().append_pair("sn", query);
+    let mut request = source_client()?
+        .post(url)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(encoded.query().unwrap_or_default().to_owned());
+    if !provider.secret.trim().is_empty() {
+        request = request.header(reqwest::header::COOKIE, provider.secret.trim());
+    }
+    let response = request.send().await?.error_for_status()?;
+    let final_url = response.url().clone();
+    let html = response.text().await?;
+    let items = parse_jav321_html(&html, query, &provider.base_url, &final_url);
+    for item in &items {
+        let media_id = persist_source_media(state, &provider.key, item).await?;
+        if final_url.path().contains("/video/") {
+            persist_source_detail_html(
+                state,
+                media_id,
+                provider,
+                &item.provider_id,
+                &html,
+                "/star/",
+            )
+            .await?;
+        }
+    }
+    Ok(items.len())
+}
+
+async fn javlibrary_search(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    query: &str,
+) -> anyhow::Result<usize> {
+    let mut url = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    url.set_path("/cn/vl_searchbyid.php");
+    url.query_pairs_mut().append_pair("keyword", query);
+    let (final_url, html) = source_get_html(provider, url).await?;
+    reject_cloudflare(&html, "JavLibrary")?;
+    let items = parse_javlibrary_html(&html, query, &provider.base_url, &final_url);
+    for item in &items {
+        persist_source_media(state, &provider.key, item).await?;
+    }
+    Ok(items.len())
+}
+
+fn parse_javdb_search_html(html: &str, fallback: &str, base_url: &str) -> Vec<SourceMedia> {
+    let mut items = Vec::new();
+    let mut cursor = 0;
+    while let Some(offset) = html[cursor..].find("href=\"") {
+        let start = cursor + offset + 6;
+        let Some(end_offset) = html[start..].find('"') else {
+            break;
+        };
+        let href = &html[start..start + end_offset];
+        cursor = start + end_offset + 1;
+        if !(href.starts_with("/v/") || href.contains("/v/")) {
+            continue;
+        }
+        let provider_id = href
+            .split('?')
+            .next()
+            .unwrap_or(href)
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if provider_id.is_empty()
+            || items
+                .iter()
+                .any(|item: &SourceMedia| item.provider_id == provider_id)
+        {
+            continue;
+        }
+        let tail = &html[cursor..char_boundary_before(html, cursor + 3000)];
+        let code = extract_tag_text_after(tail, "uid").unwrap_or_else(|| fallback.to_owned());
+        let title = extract_tag_text_after(tail, "video-title")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| code.clone());
+        let poster_url = extract_attribute(tail, "data-src=")
+            .or_else(|| extract_attribute(tail, "src="))
+            .and_then(|value| absolute_url(base_url, &value));
+        items.push(SourceMedia {
+            provider_id,
+            code: normalize_code(&code),
+            title,
+            poster_url,
+            source_url: absolute_url(base_url, href).unwrap_or_else(|| href.to_owned()),
+        });
+        if items.len() >= 40 {
+            break;
+        }
+    }
+    items
+}
+
+fn parse_jav321_html(
+    html: &str,
+    fallback: &str,
+    base_url: &str,
+    final_url: &reqwest::Url,
+) -> Vec<SourceMedia> {
+    if final_url.path().contains("/video/") {
+        let provider_id = final_url
+            .path_segments()
+            .and_then(Iterator::last)
+            .unwrap_or(fallback)
+            .to_owned();
+        let code = text_after_label(html, "<b>品番</b>").unwrap_or_else(|| fallback.to_owned());
+        let title = extract_tag_text_after(html, "panel-heading")
+            .map(|value| {
+                value
+                    .split(&code)
+                    .next()
+                    .unwrap_or(&value)
+                    .trim()
+                    .to_owned()
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| code.clone());
+        let detail_html = &html[html.find("panel-heading").unwrap_or(0)..];
+        let poster_url = extract_attribute(detail_html, "poster=")
+            .or_else(|| extract_attribute(detail_html, "src="))
+            .map(|value| value.replace("http://pics.dmm.co.jp", "https://pics.dmm.co.jp"))
+            .and_then(|value| absolute_url(base_url, &value));
+        return vec![SourceMedia {
+            provider_id,
+            code: normalize_code(&code),
+            title,
+            poster_url,
+            source_url: final_url.to_string(),
+        }];
+    }
+
+    parse_video_links(html, fallback, base_url, "/video/")
+}
+
+fn parse_javlibrary_html(
+    html: &str,
+    fallback: &str,
+    base_url: &str,
+    final_url: &reqwest::Url,
+) -> Vec<SourceMedia> {
+    if final_url
+        .query()
+        .is_some_and(|query| query.contains("v=jav"))
+    {
+        let provider_id = final_url
+            .query_pairs()
+            .find(|(key, _)| key == "v")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_else(|| fallback.to_owned());
+        let title = extract_tag_text_after(html, "video_title")
+            .or_else(|| meta_content(html, "og:title"))
+            .unwrap_or_else(|| fallback.to_owned());
+        return vec![SourceMedia {
+            provider_id,
+            code: normalize_code(fallback),
+            title,
+            poster_url: meta_content(html, "og:image")
+                .and_then(|value| absolute_url(base_url, &value)),
+            source_url: final_url.to_string(),
+        }];
+    }
+    parse_video_links(html, fallback, base_url, "?v=jav")
+}
+
+fn parse_video_links(html: &str, fallback: &str, base_url: &str, marker: &str) -> Vec<SourceMedia> {
+    let mut items = Vec::new();
+    let mut cursor = 0;
+    while let Some(offset) = html[cursor..].find(marker) {
+        let at = cursor + offset;
+        let anchor_start = html[..at].rfind("<a").unwrap_or(at);
+        let anchor_end = html[at..]
+            .find("</a>")
+            .map(|offset| at + offset + 4)
+            .unwrap_or(at);
+        cursor = at + marker.len();
+        if anchor_end <= anchor_start {
+            continue;
+        }
+        let anchor = &html[anchor_start..anchor_end];
+        let Some(href) = extract_attribute(anchor, "href=") else {
+            continue;
+        };
+        let provider_id = href
+            .split(['?', '&', '/'])
+            .filter(|part| !part.is_empty() && *part != "video" && *part != "v=jav")
+            .next_back()
+            .unwrap_or(fallback)
+            .trim_start_matches("v=")
+            .to_owned();
+        if items
+            .iter()
+            .any(|item: &SourceMedia| item.provider_id == provider_id)
+        {
+            continue;
+        }
+        let title = extract_attribute(anchor, "title=")
+            .unwrap_or_else(|| strip_tags(anchor))
+            .trim()
+            .to_owned();
+        let poster_url = extract_attribute(anchor, "data-original=")
+            .or_else(|| extract_attribute(anchor, "src="))
+            .and_then(|value| absolute_url(base_url, &value));
+        items.push(SourceMedia {
+            provider_id,
+            code: normalize_code(fallback),
+            title: if title.is_empty() {
+                fallback.to_owned()
+            } else {
+                title
+            },
+            poster_url,
+            source_url: absolute_url(base_url, &href).unwrap_or(href),
+        });
+        if items.len() >= 40 {
+            break;
+        }
+    }
+    items
+}
+
+fn text_after_label(html: &str, label: &str) -> Option<String> {
+    let at = html.find(label)? + label.len();
+    let tail = &html[at..char_boundary_before(html, at + 300)];
+    let end = tail
+        .find("<br")
+        .or_else(|| tail.find("</p>"))
+        .unwrap_or(tail.len());
+    let text = strip_tags(&tail[..end])
+        .trim_start_matches([':', '：', ' '])
+        .trim()
+        .to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+fn extract_tag_text_after(html: &str, marker: &str) -> Option<String> {
+    let at = html.find(marker)?;
+    let tail = &html[at..char_boundary_before(html, at + 2000)];
+    let start = tail.find('>')? + 1;
+    let body = &tail[start..];
+    let end = ["</h3>", "</strong>", "</div>", "</a>"]
+        .iter()
+        .filter_map(|closing| body.find(closing))
+        .min()
+        .unwrap_or(body.len());
+    let value = strip_tags(&body[..end]).trim().to_owned();
+    (!value.is_empty()).then_some(value)
 }
 
 async fn javbus_search(
@@ -2004,6 +2364,16 @@ async fn refresh_source_media(state: &AppState, media_id: i64) -> anyhow::Result
                 )
                 .await
             }
+            "javdb" | "jav321" | "javlibrary" => {
+                refresh_generic_source_media(
+                    state,
+                    media_id,
+                    &provider,
+                    &provider_id,
+                    source_url.as_deref().unwrap_or_default(),
+                )
+                .await
+            }
             adapter => Err(anyhow::anyhow!("不支持的来源适配器：{adapter}")),
         };
         match result {
@@ -2034,8 +2404,63 @@ async fn refresh_javbus_media(
     let summary = meta_content(&html, "og:description").unwrap_or_default();
     sqlx::query("UPDATE media SET title=COALESCE(?,title), poster_url=COALESCE(?,poster_url), summary=CASE WHEN ?='' THEN summary ELSE ? END, updated_at=datetime('now') WHERE id=?")
         .bind(title).bind(poster).bind(&summary).bind(&summary).bind(media_id).execute(&state.pool).await?;
-    persist_javbus_actors(state, media_id, &provider.key, &html).await?;
+    persist_source_actors(state, media_id, &provider.key, &html, "/star/").await?;
     let magnets = fetch_javbus_magnets(provider, &url, &html).await?;
+    for (index, (url, label)) in magnets.iter().enumerate() {
+        let info_hash = magnet_hash(url);
+        let (score, reasons) = rank_resource(label, None, "", &provider.display_name);
+        sqlx::query("INSERT INTO resource(media_id,provider_key,provider_resource_id,title,download_url,info_hash,score,score_reasons_json) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(info_hash) WHERE info_hash IS NOT NULL DO UPDATE SET media_id=excluded.media_id,title=excluded.title,score=excluded.score,score_reasons_json=excluded.score_reasons_json,updated_at=datetime('now')")
+            .bind(media_id).bind(&provider.key).bind(format!("{provider_id}:{index}")).bind(label).bind(url).bind(info_hash).bind(score).bind(serde_json::to_string(&reasons)?).execute(&state.pool).await?;
+    }
+    Ok(magnets.len())
+}
+
+async fn refresh_generic_source_media(
+    state: &AppState,
+    media_id: i64,
+    provider: &SourceProviderConfig,
+    provider_id: &str,
+    source_url: &str,
+) -> anyhow::Result<usize> {
+    let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    let url = reqwest::Url::parse(source_url).or_else(|_| match provider.adapter.as_str() {
+        "javdb" => base.join(&format!("/v/{provider_id}")),
+        "jav321" => base.join(&format!("/video/{provider_id}")),
+        _ => base.join(source_url),
+    })?;
+    let (_, html) = source_get_html(provider, url).await?;
+    if provider.adapter == "javdb" {
+        reject_cloudflare(&html, "JavDB")?;
+    } else if provider.adapter == "javlibrary" {
+        reject_cloudflare(&html, "JavLibrary")?;
+    }
+    let actor_marker = if provider.adapter == "javdb" {
+        "/actors/"
+    } else {
+        "/star/"
+    };
+    persist_source_detail_html(state, media_id, provider, provider_id, &html, actor_marker).await
+}
+
+async fn persist_source_detail_html(
+    state: &AppState,
+    media_id: i64,
+    provider: &SourceProviderConfig,
+    provider_id: &str,
+    html: &str,
+    actor_marker: &str,
+) -> anyhow::Result<usize> {
+    let title = meta_content(html, "og:title")
+        .or_else(|| extract_tag_text_after(html, "panel-heading"))
+        .or_else(|| extract_tag_text_after(html, "video_title"));
+    let poster = meta_content(html, "og:image")
+        .or_else(|| extract_attribute(html, "poster="))
+        .map(|value| value.replace("http://pics.dmm.co.jp", "https://pics.dmm.co.jp"));
+    let summary = meta_content(html, "og:description").unwrap_or_default();
+    sqlx::query("UPDATE media SET title=COALESCE(?,title), poster_url=COALESCE(?,poster_url), summary=CASE WHEN ?='' THEN summary ELSE ? END, updated_at=datetime('now') WHERE id=?")
+        .bind(title).bind(poster).bind(&summary).bind(&summary).bind(media_id).execute(&state.pool).await?;
+    persist_source_actors(state, media_id, &provider.key, html, actor_marker).await?;
+    let magnets = parse_magnets(html);
     for (index, (url, label)) in magnets.iter().enumerate() {
         let info_hash = magnet_hash(url);
         let (score, reasons) = rank_resource(label, None, "", &provider.display_name);
@@ -2091,7 +2516,7 @@ fn extract_js_value(html: &str, name: &str) -> Option<String> {
         let Some(at) = html.find(&marker) else {
             continue;
         };
-        let tail = &html[at + marker.len()..html.len().min(at + marker.len() + 800)];
+        let tail = &html[at + marker.len()..char_boundary_before(html, at + marker.len() + 800)];
         let value = tail
             .trim_start_matches(|character: char| character.is_whitespace() || character == '=')
             .split([';', '\n', '\r', ','])
@@ -2105,22 +2530,23 @@ fn extract_js_value(html: &str, name: &str) -> Option<String> {
     None
 }
 
-async fn persist_javbus_actors(
+async fn persist_source_actors(
     state: &AppState,
     media_id: i64,
     provider_key: &str,
     html: &str,
+    marker: &str,
 ) -> anyhow::Result<()> {
     let mut cursor = 0;
     let mut order = 0;
-    while let Some(offset) = html[cursor..].find("/star/") {
+    while let Some(offset) = html[cursor..].find(marker) {
         let start = cursor + offset;
         let id_end = html[start..].find(['\"', '\'', '?']).unwrap_or(64).min(64);
-        let provider_id = html[start + 6..start + id_end].trim_matches('/');
-        let nearby_start = start.saturating_sub(100);
-        let nearby_end = html.len().min(start + 300);
+        let provider_id = html[start + marker.len()..start + id_end].trim_matches('/');
+        let nearby_start = char_boundary_before(html, start.saturating_sub(100));
+        let nearby_end = char_boundary_before(html, start + 300);
         let nearby = &html[nearby_start..nearby_end];
-        let name = extract_link_text(nearby, "/star/").unwrap_or_default();
+        let name = extract_link_text(nearby, marker).unwrap_or_default();
         cursor = start + id_end;
         if provider_id.is_empty() || name.is_empty() {
             continue;
@@ -2161,7 +2587,7 @@ fn parse_magnets(html: &str) -> Vec<(String, String)> {
         {
             continue;
         }
-        let label_start = start.saturating_sub(500);
+        let label_start = char_boundary_before(html, start.saturating_sub(500));
         let label = strip_tags(&html[label_start..start])
             .split_whitespace()
             .rev()
@@ -2186,7 +2612,7 @@ fn parse_magnets(html: &str) -> Vec<(String, String)> {
 fn meta_content(html: &str, property: &str) -> Option<String> {
     let marker = format!("property=\"{property}\"");
     let at = html.find(&marker)?;
-    let end = html.len().min(at + 600);
+    let end = char_boundary_before(html, at + 600);
     extract_attribute(&html[at..end], "content=")
 }
 fn extract_link_text(html: &str, marker: &str) -> Option<String> {
@@ -2430,6 +2856,13 @@ fn magnet_hash(url: &str) -> Option<String> {
         .find_map(|part| part.strip_prefix("xt=urn:btih:"))
         .map(|v| v.to_ascii_lowercase())
 }
+fn char_boundary_before(value: &str, index: usize) -> usize {
+    let mut index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
 fn strip_tags(value: &str) -> String {
     let mut out = String::new();
     let mut inside = false;
@@ -2632,8 +3065,41 @@ mod tests {
         assert_eq!(extract_js_value(html, "img").as_deref(), Some("/cover.jpg"));
     }
 
+    #[test]
+    fn javdb_parser_deduplicates_media_links() {
+        let html = r#"<a href="/v/abc"><div class="video-title">ABC-123 Title</div><img data-src="/cover.jpg"></a><a href="/v/abc">duplicate</a>"#;
+        let items = parse_javdb_search_html(html, "ABC-123", "https://javdb.com");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].provider_id, "abc");
+        assert_eq!(items[0].title, "ABC-123 Title");
+    }
+
+    #[test]
+    fn jav321_detail_parser_extracts_media() {
+        let html = r#"<div class="panel-heading"><h3>Example title <small>abp-123</small></h3></div><div><img src="http://pics.dmm.co.jp/cover.jpg"><b>品番</b>: abp-123<br></div>"#;
+        let url = reqwest::Url::parse("https://www.jav321.com/video/118abp00123").unwrap();
+        let items = parse_jav321_html(html, "ABP-123", "https://www.jav321.com", &url);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].code, "abp-123");
+        assert_eq!(items[0].title, "Example title");
+        assert_eq!(
+            items[0].poster_url.as_deref(),
+            Some("https://pics.dmm.co.jp/cover.jpg")
+        );
+    }
+
+    #[test]
+    fn magnet_parser_handles_multibyte_labels() {
+        let prefix = "中文字幕作品".repeat(80);
+        let html = format!(
+            "{prefix}<a href=\"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567\">下载</a>"
+        );
+        let magnets = parse_magnets(&html);
+        assert_eq!(magnets.len(), 1);
+    }
+
     #[tokio::test]
-    async fn migration_replaces_javdb_with_javbus_source() {
+    async fn migration_seeds_multiple_source_adapters() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let rows = sqlx::query(
@@ -2642,18 +3108,26 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get::<String, _>("provider_key"), "javbus");
-        assert_eq!(
-            parse_json(&rows[0].get::<String, _>("config_json"), json!({}))["adapter"],
-            "javbus"
-        );
-        let old_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM provider_config WHERE provider_key='javdb'")
+        assert_eq!(rows.len(), 4);
+        let adapters = rows
+            .iter()
+            .map(|row| {
+                parse_json(&row.get::<String, _>("config_json"), json!({}))["adapter"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(adapters.contains(&"javbus".to_owned()));
+        assert!(adapters.contains(&"javdb".to_owned()));
+        assert!(adapters.contains(&"jav321".to_owned()));
+        assert!(adapters.contains(&"javlibrary".to_owned()));
+        let jav321_enabled: i64 =
+            sqlx::query_scalar("SELECT enabled FROM provider_config WHERE provider_key='jav321'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(old_count, 0);
+        assert_eq!(jav321_enabled, 1);
     }
 
     #[tokio::test]

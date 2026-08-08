@@ -38,7 +38,13 @@ const testing = ref('')
 const providers = ref<ProviderConfig[]>([])
 const secrets = reactive<Record<string, string>>({})
 const testMessages = reactive<Record<string, { ok: boolean; text: string }>>({})
-const newSource = reactive({ displayName: 'JavBus 镜像', baseUrl: 'https://www.javbus.com', secret: '' })
+const sourceAdapterOptions = [
+  { label: 'Jav321（当前可直连）', value: 'jav321', name: 'Jav321', baseUrl: 'https://www.jav321.com', hint: '搜索番号时可直接返回作品信息和磁力资源。' },
+  { label: 'JavDB', value: 'javdb', name: 'JavDB', baseUrl: 'https://javdb.com', hint: '支持官方站和镜像；Cloudflare 环境需填写 cf_clearance Cookie。' },
+  { label: 'JavBus', value: 'javbus', name: 'JavBus', baseUrl: 'https://www.javbus.com', hint: '支持主站、反代和多个镜像；年龄验证站点需 Cookie。' },
+  { label: 'JavLibrary', value: 'javlibrary', name: 'JavLibrary', baseUrl: 'https://www.javlibrary.com', hint: '适合作为补充元数据来源，官方站可能需要 Cloudflare Cookie。' },
+]
+const newSource = reactive({ adapter: 'jav321', displayName: 'Jav321', baseUrl: 'https://www.jav321.com', secret: '' })
 
 const legacy = reactive<Settings>({
   metatubeUrl: '',
@@ -67,6 +73,25 @@ const product = reactive<ProductSettings>({
 
 const providerMap = computed(() => Object.fromEntries(providers.value.map(item => [item.key, item])))
 const sourceProviders = computed(() => providers.value.filter(item => item.type === 'source'))
+const selectedSourceAdapter = computed(() => sourceAdapterOptions.find(item => item.value === newSource.adapter) ?? sourceAdapterOptions[0])
+
+function sourceAdapter(provider: ProviderConfig) {
+  return String(provider.config.adapter ?? provider.key.split('-')[0] ?? 'source')
+}
+
+function sourceAdapterName(provider: ProviderConfig) {
+  const adapter = sourceAdapter(provider)
+  return sourceAdapterOptions.find(item => item.value === adapter)?.name ?? adapter
+}
+
+function selectSourceAdapter(value: string) {
+  const adapter = sourceAdapterOptions.find(item => item.value === value)
+  if (!adapter) return
+  newSource.adapter = adapter.value
+  newSource.displayName = adapter.name
+  newSource.baseUrl = adapter.baseUrl
+  newSource.secret = ''
+}
 
 async function load() {
   loading.value = true
@@ -119,11 +144,9 @@ async function addSource() {
   }
   creatingSource.value = true
   try {
-    const created = await api.createProvider({ ...newSource, adapter: 'javbus' })
+    const created = await api.createProvider({ ...newSource })
     providers.value.push(created)
-    newSource.displayName = 'JavBus 镜像'
-    newSource.baseUrl = 'https://www.javbus.com'
-    newSource.secret = ''
+    selectSourceAdapter(newSource.adapter)
     showNewSource.value = false
     message.success('来源已添加')
   } catch (reason) {
@@ -196,13 +219,17 @@ onMounted(load)
         </header>
 
         <article v-if="showNewSource" class="new-source-card panel">
-          <div>
+          <div class="new-source-intro">
             <span class="provider-icon"><IconPlus /></span>
-            <div><strong>添加 JavBus 来源</strong><small>可以添加主站、反代或多个镜像地址</small></div>
+            <div><strong>添加搜索来源</strong><small>同一种适配器也可以添加多个镜像，搜索时并发聚合</small></div>
           </div>
-          <n-form-item label="来源名称"><n-input v-model:value="newSource.displayName" /></n-form-item>
-          <n-form-item label="服务地址"><n-input v-model:value="newSource.baseUrl" placeholder="https://www.javbus.com" /></n-form-item>
-          <n-form-item label="Cookie（可选）"><n-input v-model:value="newSource.secret" type="password" show-password-on="click" /></n-form-item>
+          <n-form-item class="new-source-adapter" label="适配器">
+            <n-select :value="newSource.adapter" :options="sourceAdapterOptions" @update:value="selectSourceAdapter" />
+          </n-form-item>
+          <n-alert class="new-source-hint" type="info" :show-icon="false">{{ selectedSourceAdapter.hint }}</n-alert>
+          <n-form-item class="new-source-name" label="来源名称"><n-input v-model:value="newSource.displayName" /></n-form-item>
+          <n-form-item class="new-source-url" label="服务地址"><n-input v-model:value="newSource.baseUrl" :placeholder="selectedSourceAdapter.baseUrl" /></n-form-item>
+          <n-form-item class="new-source-cookie" label="Cookie（可选）"><n-input v-model:value="newSource.secret" type="password" show-password-on="click" placeholder="完整复制浏览器 Cookie；普通直连来源可留空" /></n-form-item>
           <div class="new-source-actions">
             <n-button @click="showNewSource = false">取消</n-button>
             <n-button type="primary" :loading="creatingSource" @click="addSource">添加来源</n-button>
@@ -213,7 +240,7 @@ onMounted(load)
           <article v-for="provider in sourceProviders" :key="provider.key" class="provider-card">
             <header>
               <span class="provider-icon"><IconDatabase /></span>
-              <div><strong>{{ provider.displayName }}</strong><small>JavBus Source · {{ provider.key }}</small></div>
+              <div><strong>{{ provider.displayName }}</strong><small>{{ sourceAdapterName(provider) }} · {{ provider.key }}</small></div>
               <div class="provider-header-actions">
                 <n-switch :value="provider.enabled" @update:value="value => toggleProvider(provider, value)" />
                 <n-button quaternary circle type="error" title="移除来源" @click="removeSource(provider)">
@@ -228,7 +255,7 @@ onMounted(load)
                 v-model:value="secrets[provider.key]"
                 type="password"
                 show-password-on="click"
-                :placeholder="provider.hasSecret ? '已保存，留空保持不变' : '年龄验证或受限镜像可填写'"
+                :placeholder="provider.hasSecret ? '已保存，留空保持不变' : 'Cloudflare / 年龄验证站点可填写完整 Cookie'"
               />
             </n-form-item>
             <n-button secondary :loading="testing === provider.key" @click="testProvider(provider.key)">

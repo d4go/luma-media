@@ -51,7 +51,7 @@
 ## Provider 与设置
 
 - `GET /providers`
-- `POST /providers`（添加 JavBus 来源）
+- `POST /providers`（添加 `jav321`、`javdb`、`javbus` 或 `javlibrary` 来源，可重复添加同类镜像）
 - `PUT /providers/{key}`
 - `DELETE /providers/{key}`（仅 Source Provider）
 - `POST /providers/{key}/enabled`
