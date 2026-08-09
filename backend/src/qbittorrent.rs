@@ -83,6 +83,7 @@ impl QBittorrentClient {
         tags: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
         let cookie = self.login().await?;
+        let hash = magnet_hash(download_url);
         let mut form = vec![("urls", download_url)];
         if let Some(value) = save_path.filter(|value| !value.trim().is_empty()) {
             form.push(("savepath", value));
@@ -103,10 +104,23 @@ impl QBittorrentClient {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() || body.trim() != "Ok." {
-            bail!("qBittorrent rejected the download: HTTP {status} {body}");
+            let already_present = if status.is_success() {
+                match hash.as_deref() {
+                    Some(hash) => self.torrent_exists_with_session(&cookie, hash).await?,
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if !already_present {
+                bail!("qBittorrent rejected the download: HTTP {status} {body}");
+            }
+            tracing::info!(
+                hash = hash.as_deref(),
+                "qBittorrent already has this download"
+            );
         }
 
-        let hash = magnet_hash(download_url);
         if let Some(hash) = hash.as_deref()
             && !trackers.is_empty()
         {
@@ -131,6 +145,31 @@ impl QBittorrentClient {
             }
         }
         Ok(hash)
+    }
+
+    async fn torrent_exists_with_session(
+        &self,
+        cookie: &str,
+        expected_hash: &str,
+    ) -> anyhow::Result<bool> {
+        let response = self
+            .http
+            .get(format!("{}/api/v2/torrents/info", self.base_url))
+            .header(COOKIE, cookie)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            bail!(
+                "qBittorrent torrent list returned HTTP {}",
+                response.status()
+            );
+        }
+        let expected_hash = normalize_hash(expected_hash);
+        Ok(response
+            .json::<Vec<TorrentInfo>>()
+            .await?
+            .iter()
+            .any(|torrent| normalize_hash(&torrent.hash) == expected_hash))
     }
 
     pub async fn torrents(&self) -> anyhow::Result<Vec<DownloadItem>> {
@@ -512,6 +551,52 @@ mod tests {
         client.resume(torrent_hash).await.unwrap();
         client.remove(torrent_hash).await.unwrap();
         assert_eq!(lifecycle_actions.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn treats_qbit_fails_as_success_when_torrent_already_exists() {
+        let app = Router::new()
+            .route(
+                "/api/v2/auth/login",
+                post(|| async { ([(header::SET_COOKIE, "SID=test; HttpOnly")], "Ok.") }),
+            )
+            .route("/api/v2/torrents/add", post(|| async { "Fails." }))
+            .route(
+                "/api/v2/torrents/info",
+                get(|| async {
+                    Json(serde_json::json!([{
+                        "hash": "abcdef0123456789abcdef0123456789abcdef01",
+                        "name": "Existing Movie",
+                        "progress": 0.25,
+                        "state": "downloading"
+                    }]))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let settings = Settings {
+            qbittorrent_url: format!("http://{address}"),
+            ..Settings::default()
+        };
+        let client = QBittorrentClient::new(&settings).unwrap();
+
+        let hash = client
+            .add_download_with_options(
+                "magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+                &[],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hash.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
         server.abort();
     }
 }

@@ -25,6 +25,7 @@ use crate::{
 };
 
 const ACTIVE_STATES: &str = "'REQUESTED','RESOURCE_RESOLVING','QUEUED','DOWNLOADING','DOWNLOADED','PROCESSING','METADATA','LIBRARY_COMMIT'";
+const RESOLVE_QBIT_ATTENTION: &str = "UPDATE attention_item SET status = 'resolved', resolved_at = datetime('now'), updated_at = datetime('now'), resolution_json = '{\"action\":\"qbit_reconciled\"}' WHERE acquisition_id = ? AND status = 'open' AND kind IN ('provider_unavailable','qbit_task_missing')";
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "wmv", "m4v", "ts", "webm"];
 
 pub fn router() -> Router<AppState> {
@@ -601,8 +602,18 @@ async fn retry_acquisition(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
 ) -> AppResult<Json<Acquisition>> {
+    if let Err(error) = reconcile_active(&state).await {
+        tracing::warn!(%error, acquisition_id = id, "acquisition retry reconciliation failed");
+    }
     let item = acquisition_by_id(&state, id).await?;
     if item.state != "NEEDS_ATTENTION" {
+        if acquisition_has_live_qbit_task(item.qbit_hash.as_deref(), item.qbit_state.as_deref()) {
+            sqlx::query(RESOLVE_QBIT_ATTENTION)
+                .bind(id)
+                .execute(&state.pool)
+                .await?;
+            return Ok(Json(item));
+        }
         return Err(AppError::BadRequest("只有需要关注的获取可以重试".into()));
     }
     sqlx::query("UPDATE attention_item SET status = 'resolved', resolved_at = datetime('now'), updated_at = datetime('now'), resolution_json = '{\"action\":\"retry\"}' WHERE acquisition_id = ? AND status = 'open'")
@@ -696,6 +707,10 @@ pub async fn reconcile_active(state: &AppState) -> anyhow::Result<()> {
             let mut tx = state.pool.begin().await?;
             sqlx::query("UPDATE acquisition SET qbit_hash = ?, progress = ?, download_speed = ?, eta_seconds = ?, download_path = ?, qbit_state = ?, qbit_missing_since = NULL, updated_at = datetime('now') WHERE id = ?")
                 .bind(&torrent.hash).bind(torrent.progress).bind(torrent.download_speed).bind(torrent.eta).bind(download_path).bind(&torrent.state).bind(id).execute(&mut *tx).await?;
+            sqlx::query(RESOLVE_QBIT_ATTENTION)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
             let mut changed_to = None;
             if let Some(target) = target_state {
                 let message = if target == "DOWNLOADED" {
@@ -706,8 +721,6 @@ pub async fn reconcile_active(state: &AppState) -> anyhow::Result<()> {
                 let changed = sqlx::query("UPDATE acquisition SET state = ?, state_message = ?, last_error = NULL, updated_at = datetime('now') WHERE id = ? AND state = ?")
                     .bind(target).bind(&message).bind(id).bind(&state_name).execute(&mut *tx).await?;
                 if changed.rows_affected() != 0 {
-                    sqlx::query("UPDATE attention_item SET status = 'resolved', resolved_at = datetime('now'), updated_at = datetime('now'), resolution_json = '{\"action\":\"qbit_reconciled\"}' WHERE acquisition_id = ? AND status = 'open' AND kind = 'qbit_task_missing'")
-                        .bind(id).execute(&mut *tx).await?;
                     let key = format!(
                         "qbit-reconciled-{}-{}",
                         target.to_lowercase(),
@@ -795,6 +808,10 @@ fn reconciled_acquisition_state(current: &str, complete: bool) -> Option<&'stati
         "DOWNLOADING"
     };
     (current != target).then_some(target)
+}
+
+fn acquisition_has_live_qbit_task(qbit_hash: Option<&str>, qbit_state: Option<&str>) -> bool {
+    qbit_hash.is_some() && qbit_state.is_some_and(|state| !state.is_empty() && state != "missing")
 }
 
 pub async fn recover(state: &AppState) -> anyhow::Result<()> {
@@ -1342,6 +1359,9 @@ async fn reorganize_library(
 }
 
 async fn list_attention(State(state): State<AppState>) -> AppResult<Json<Vec<Value>>> {
+    if let Err(error) = reconcile_active(&state).await {
+        tracing::warn!(%error, "attention list reconciliation failed");
+    }
     let rows = sqlx::query("SELECT ai.*, m.title AS media_title, m.normalized_code FROM attention_item ai LEFT JOIN media m ON m.id = ai.media_id WHERE ai.status = 'open' ORDER BY CASE ai.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, ai.id DESC").fetch_all(&state.pool).await?;
     Ok(Json(rows.iter().map(attention_json).collect()))
 }
@@ -1370,7 +1390,9 @@ async fn attention_action(
             .await?
             .ok_or(AppError::NotFound)?;
     if row.get::<String, _>("status") != "open" {
-        return Err(AppError::BadRequest("该问题已经处理".into()));
+        return Ok(Json(
+            json!({"id": id, "resolved": true, "alreadyResolved": true, "action": input.action}),
+        ));
     }
     let allowed: Vec<String> =
         serde_json::from_str(&row.get::<String, _>("actions_json")).unwrap_or_default();
@@ -3271,6 +3293,71 @@ mod tests {
         assert!(torrent_state_is_complete(0.5, 0, "stalledUP"));
         assert!(torrent_state_is_complete(1.0, 0, "pausedDL"));
         assert!(!torrent_state_is_complete(0.5, 0, "stalledDL"));
+    }
+
+    #[test]
+    fn live_qbit_task_makes_retry_idempotent() {
+        assert!(acquisition_has_live_qbit_task(
+            Some("abcdef0123456789abcdef0123456789abcdef01"),
+            Some("stalledDL")
+        ));
+        assert!(!acquisition_has_live_qbit_task(
+            Some("abcdef0123456789abcdef0123456789abcdef01"),
+            Some("missing")
+        ));
+        assert!(!acquisition_has_live_qbit_task(None, Some("downloading")));
+    }
+
+    #[tokio::test]
+    async fn qbit_reconciliation_resolves_only_stale_qbit_attention() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let media_id: i64 = sqlx::query(
+            "INSERT INTO media(normalized_code,title) VALUES ('stars-123','STARS-123') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("id");
+        let acquisition_id: i64 = sqlx::query(
+            "INSERT INTO acquisition(media_id,state) VALUES (?,'DOWNLOADING') RETURNING id",
+        )
+        .bind(media_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("id");
+        for kind in [
+            "provider_unavailable",
+            "qbit_task_missing",
+            "organizer_conflict",
+        ] {
+            sqlx::query("INSERT INTO attention_item(kind,title,message,acquisition_id,media_id) VALUES (?,'problem','problem',?,?)")
+                .bind(kind)
+                .bind(acquisition_id)
+                .bind(media_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        sqlx::query(RESOLVE_QBIT_ATTENTION)
+            .bind(acquisition_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows = sqlx::query("SELECT kind,status FROM attention_item ORDER BY kind")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let statuses = rows
+            .iter()
+            .map(|row| (row.get::<String, _>("kind"), row.get::<String, _>("status")))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(statuses["provider_unavailable"], "resolved");
+        assert_eq!(statuses["qbit_task_missing"], "resolved");
+        assert_eq!(statuses["organizer_conflict"], "open");
     }
 
     #[test]
