@@ -661,6 +661,22 @@ body.luma-dark .state-chip { color:#b8bdc5; background:#282c31; }
 .provider-card header small { overflow:hidden; color:var(--text-secondary); font-size:8px; text-overflow:ellipsis; white-space:nowrap; }
 .provider-card .n-alert { margin-top:10px; }
 .provider-header-actions { display:flex!important; grid-auto-flow:column; align-items:center; gap:5px; }
+.provider-card-actions { margin-top:12px; display:flex; gap:8px; }
+.source-sync-settings { margin-top:4px; padding-top:15px; border-top:1px solid var(--hairline); }
+.source-sync-settings .compact-switch-row { margin-top:0; }
+.source-sync-summary { padding:12px; background:var(--surface-muted); border:1px solid var(--hairline); border-radius:9px; }
+.source-sync-summary > header { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+.source-sync-summary > header div { min-width:0; display:grid; }
+.source-sync-summary > header strong { font-size:10px; }
+.source-sync-summary > header small { margin-top:2px; overflow:hidden; color:var(--text-secondary); font-size:8px; line-height:1.4; text-overflow:ellipsis; white-space:nowrap; }
+.source-sync-status { flex:0 0 auto; padding:3px 6px; color:var(--text-secondary); background:var(--surface); border-radius:5px; font-size:8px; font-weight:750; }
+.source-sync-status[data-status="running"] { color:var(--accent); background:var(--accent-soft); }
+.source-sync-status[data-status="success"] { color:var(--success); background:color-mix(in srgb,var(--success) 10%,var(--surface)); }
+.source-sync-status[data-status="failed"] { color:var(--danger); background:color-mix(in srgb,var(--danger) 10%,var(--surface)); }
+.source-sync-summary dl { margin:11px 0 0; display:grid; grid-template-columns:1fr 1fr; gap:8px 14px; }
+.source-sync-summary dl div { min-width:0; display:grid; gap:2px; }
+.source-sync-summary dt { color:var(--text-secondary); font-size:8px; }
+.source-sync-summary dd { margin:0; overflow:hidden; font-size:9px; font-weight:650; text-overflow:ellipsis; white-space:nowrap; }
 .new-source-card { margin-bottom:12px; padding:18px; display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); align-items:end; gap:12px; }
 .new-source-intro { grid-column:span 4; align-self:center; display:grid; grid-template-columns:38px minmax(0,1fr); align-items:center; gap:10px; }
 .new-source-intro > div { min-width:0; display:grid; }

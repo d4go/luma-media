@@ -71,6 +71,7 @@ export const api = {
   deleteProvider: (key: string) => request<void>(`/providers/${key}`, { method: 'DELETE' }),
   setProviderEnabled: (key: string, enabled: boolean) => request<ProviderConfig>(`/providers/${key}/enabled`, { method: 'POST', body: JSON.stringify({ enabled }) }),
   testProvider: (key: string) => request<{ connected: boolean; message: string; latencyMs: number }>(`/providers/${key}/test`, { method: 'POST' }),
+  syncProvider: (key: string) => request<ProviderConfig>(`/providers/${key}/sync`, { method: 'POST' }),
   productSettings: () => request<ProductSettings>('/product-settings'),
   updateProductSettings: (input: ProductSettings) => request<ProductSettings>('/product-settings', { method: 'PUT', body: JSON.stringify(input) }),
   serviceStatus: () => request<ServiceStatus>('/status'),

@@ -245,6 +245,27 @@ export interface AcquisitionEvent { id: number; eventKey: string; fromState: str
 export interface AcquisitionDetail { acquisition: Acquisition; events: AcquisitionEvent[] }
 export interface AttentionItem { id: number; kind: string; severity: string; title: string; message: string; acquisitionId: number | null; mediaId: number | null; mediaTitle: string | null; mediaCode: string | null; actions: string[]; createdAt: string }
 export interface LibraryItem { id: number; mediaId: number; acquisitionId: number | null; videoPath: string; nfoPath: string | null; posterPath: string | null; status: string; fileSize: number | null; addedAt: string; media: { code: string; title: string; posterUrl: string | null; releaseDate: string | null; metadataStatus: string } }
-export interface ProviderConfig { key: string; type: string; displayName: string; enabled: boolean; baseUrl: string; hasSecret: boolean; config: Record<string, unknown>; lastStatus: string; lastMessage: string; lastCheckedAt: string | null }
+export interface ProviderConfig {
+  key: string
+  type: string
+  displayName: string
+  enabled: boolean
+  baseUrl: string
+  hasSecret: boolean
+  config: Record<string, unknown>
+  lastStatus: string
+  lastMessage: string
+  lastCheckedAt: string | null
+  syncStatus: 'idle' | 'running' | 'success' | 'failed'
+  syncLastStartedAt: string | null
+  syncLastFinishedAt: string | null
+  syncLastSuccessAt: string | null
+  syncNextRunAt: string | null
+  syncLastMessage: string
+  syncFailureCount: number
+  syncItemCount: number
+  syncInsertedCount: number
+  syncUpdatedCount: number
+}
 export interface ProductSettings { downloadRoot: string; mediaRoot: string; qbittorrentSavePath: string; qbittorrentCategory: string; qbittorrentTags: string; organizerMode: 'hardlink' | 'copy'; organizerMovieTemplate: string; organizerConflictPolicy: string }
 export interface AutomationRule { id: number; name: string; enabled: boolean; triggerType: string; triggerConfig: Record<string, unknown>; conditions: Record<string, unknown>; actionType: string; actionConfig: Record<string, unknown>; mode: 'AUTO' | 'CONFIRM' | 'NOTIFY'; lastRunAt: string | null; nextRunAt: string | null; lastStatus: string | null; lastExplanation: string | null; createdAt: string }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
   NAlert,
   NButton,
@@ -21,10 +21,12 @@ import {
   IconFolder,
   IconPlus,
   IconPlugConnected,
+  IconRefresh,
   IconServer,
   IconTrash,
 } from '@tabler/icons-vue'
 import { api } from '../api'
+import { formatDate } from '../format'
 import type { ProductSettings, ProviderConfig, Settings } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 
@@ -35,6 +37,7 @@ const saving = ref(false)
 const creatingSource = ref(false)
 const showNewSource = ref(false)
 const testing = ref('')
+const syncing = ref('')
 const providers = ref<ProviderConfig[]>([])
 const secrets = reactive<Record<string, string>>({})
 const testMessages = reactive<Record<string, { ok: boolean; text: string }>>({})
@@ -44,7 +47,8 @@ const sourceAdapterOptions = [
   { label: 'JavBus', value: 'javbus', name: 'JavBus', baseUrl: 'https://www.javbus.com', hint: '支持主站、反代和多个镜像；年龄验证站点需 Cookie。' },
   { label: 'JavLibrary', value: 'javlibrary', name: 'JavLibrary', baseUrl: 'https://www.javlibrary.com', hint: '适合作为补充元数据来源，官方站可能需要 Cloudflare Cookie。' },
 ]
-const newSource = reactive({ adapter: 'jav321', displayName: 'Jav321', baseUrl: 'https://www.jav321.com', secret: '', config: { proxyUrl: '', userAgent: '' } })
+const newSource = reactive({ adapter: 'jav321', displayName: 'Jav321', baseUrl: 'https://www.jav321.com', secret: '', config: { proxyUrl: '', userAgent: '', syncEnabled: true, syncIntervalMinutes: 1440, syncDetailLimit: 8 } })
+let syncPollTimer: ReturnType<typeof setTimeout> | undefined
 
 const legacy = reactive<Settings>({
   metatubeUrl: '',
@@ -92,6 +96,43 @@ function updateSourceConfig(provider: ProviderConfig, key: 'proxyUrl' | 'userAge
   provider.config = { ...provider.config, [key]: value }
 }
 
+function sourceSyncEnabled(provider: ProviderConfig) {
+  return typeof provider.config.syncEnabled === 'boolean' ? provider.config.syncEnabled : true
+}
+
+function sourceSyncInterval(provider: ProviderConfig) {
+  const value = Number(provider.config.syncIntervalMinutes)
+  return Number.isFinite(value) ? value : 1440
+}
+
+function updateSourceSyncEnabled(provider: ProviderConfig, value: boolean) {
+  provider.config = { ...provider.config, syncEnabled: value }
+}
+
+function updateSourceSyncInterval(provider: ProviderConfig, value: number | null) {
+  provider.config = { ...provider.config, syncIntervalMinutes: value ?? 1440 }
+}
+
+function sourceSyncDetailLimit(provider: ProviderConfig) {
+  const value = Number(provider.config.syncDetailLimit)
+  return Number.isFinite(value) ? value : 8
+}
+
+function updateSourceSyncDetailLimit(provider: ProviderConfig, value: number | null) {
+  provider.config = { ...provider.config, syncDetailLimit: value ?? 8 }
+}
+
+const syncStatusLabel: Record<ProviderConfig['syncStatus'], string> = {
+  idle: '等待同步',
+  running: '同步中',
+  success: '同步成功',
+  failed: '同步失败',
+}
+
+function syncDate(value: string | null, fallback: string) {
+  return value ? formatDate(value) : fallback
+}
+
 function selectSourceAdapter(value: string) {
   const adapter = sourceAdapterOptions.find(item => item.value === value)
   if (!adapter) return
@@ -99,7 +140,21 @@ function selectSourceAdapter(value: string) {
   newSource.displayName = adapter.name
   newSource.baseUrl = adapter.baseUrl
   newSource.secret = ''
-  newSource.config = { proxyUrl: '', userAgent: '' }
+  newSource.config = { proxyUrl: '', userAgent: '', syncEnabled: true, syncIntervalMinutes: 1440, syncDetailLimit: 8 }
+}
+
+function scheduleSyncPoll() {
+  if (syncPollTimer || !sourceProviders.value.some(provider => provider.syncStatus === 'running')) return
+  syncPollTimer = setTimeout(async () => {
+    syncPollTimer = undefined
+    try {
+      providers.value = await api.providers()
+    } catch {
+      // Keep the current status visible and retry while a synchronization is running.
+    } finally {
+      scheduleSyncPoll()
+    }
+  }, 2000)
 }
 
 async function load() {
@@ -113,11 +168,23 @@ async function load() {
     providers.value = providerData
     Object.assign(legacy, legacyData)
     Object.assign(product, productData)
+    scheduleSyncPoll()
   } catch (reason) {
     message.error(reason instanceof Error ? reason.message : '设置加载失败')
   } finally {
     loading.value = false
   }
+}
+
+async function persistProvider(provider: ProviderConfig) {
+  const updated = await api.updateProvider(provider.key, {
+    displayName: provider.displayName,
+    baseUrl: provider.baseUrl,
+    secret: secrets[provider.key] ?? '',
+    config: provider.config,
+  })
+  Object.assign(provider, updated)
+  secrets[provider.key] = ''
 }
 
 async function save() {
@@ -185,13 +252,7 @@ async function testProvider(key: string) {
   try {
     const provider = providers.value.find(item => item.key === key)
     if (provider?.type === 'source') {
-      Object.assign(provider, await api.updateProvider(provider.key, {
-        displayName: provider.displayName,
-        baseUrl: provider.baseUrl,
-        secret: secrets[provider.key] ?? '',
-        config: provider.config,
-      }))
-      secrets[provider.key] = ''
+      await persistProvider(provider)
     }
     const result = await api.testProvider(key)
     testMessages[key] = { ok: result.connected, text: `${result.message} · ${result.latencyMs} ms` }
@@ -200,6 +261,20 @@ async function testProvider(key: string) {
     testMessages[key] = { ok: false, text: reason instanceof Error ? reason.message : '连接测试失败' }
   } finally {
     testing.value = ''
+  }
+}
+
+async function syncProvider(provider: ProviderConfig) {
+  syncing.value = provider.key
+  try {
+    await persistProvider(provider)
+    Object.assign(provider, await api.syncProvider(provider.key))
+    message.success(`${provider.displayName} 已开始后台同步`)
+    scheduleSyncPoll()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '来源同步启动失败')
+  } finally {
+    syncing.value = ''
   }
 }
 
@@ -212,6 +287,9 @@ async function toggleProvider(provider: ProviderConfig, value: boolean) {
 }
 
 onMounted(load)
+onUnmounted(() => {
+  if (syncPollTimer) clearTimeout(syncPollTimer)
+})
 </script>
 
 <template>
@@ -229,7 +307,7 @@ onMounted(load)
           <div>
             <span class="eyebrow">SOURCE PROVIDERS</span>
             <h2>内容来源</h2>
-            <p>搜索会同时查询全部启用来源，聚合去重后统一排序。单一镜像故障不会中断其他来源。</p>
+            <p>来源在后台定时采集并去重写入本地索引；前台搜索只查询本地数据，不会因外部站点超时或拒绝访问而中断。</p>
           </div>
           <n-button secondary @click="showNewSource = !showNewSource">
             <template #icon><IconPlus /></template>
@@ -240,7 +318,7 @@ onMounted(load)
         <article v-if="showNewSource" class="new-source-card panel">
           <div class="new-source-intro">
             <span class="provider-icon"><IconPlus /></span>
-            <div><strong>添加搜索来源</strong><small>同一种适配器也可以添加多个镜像，搜索时并发聚合</small></div>
+            <div><strong>添加内容来源</strong><small>同一种适配器可以添加多个镜像，并在后台独立同步</small></div>
           </div>
           <n-form-item class="new-source-adapter" label="适配器">
             <n-select :value="newSource.adapter" :options="sourceAdapterOptions" @update:value="selectSourceAdapter" />
@@ -293,13 +371,70 @@ onMounted(load)
                 @update:value="value => updateSourceConfig(provider, 'userAgent', value)"
               />
             </n-form-item>
+            <div class="source-sync-settings">
+              <div class="compact-switch-row">
+                <div><strong>每日后台同步</strong><span>按设定间隔更新本地索引，搜索时不直接请求该网站。</span></div>
+                <n-switch
+                  :value="sourceSyncEnabled(provider)"
+                  @update:value="value => updateSourceSyncEnabled(provider, value)"
+                />
+              </div>
+              <n-form-item label="同步间隔（分钟）">
+                <n-input-number
+                  :value="sourceSyncInterval(provider)"
+                  :min="60"
+                  :max="10080"
+                  :disabled="!sourceSyncEnabled(provider)"
+                  style="width: 100%"
+                  @update:value="value => updateSourceSyncInterval(provider, value)"
+                />
+              </n-form-item>
+              <n-form-item label="每轮补全详情数">
+                <n-input-number
+                  :value="sourceSyncDetailLimit(provider)"
+                  :min="0"
+                  :max="40"
+                  :disabled="!sourceSyncEnabled(provider)"
+                  style="width: 100%"
+                  @update:value="value => updateSourceSyncDetailLimit(provider, value)"
+                />
+              </n-form-item>
+              <div class="source-sync-summary">
+                <header>
+                  <div><strong>本地索引同步</strong><small>{{ provider.syncLastMessage || '等待第一次同步' }}</small></div>
+                  <span class="source-sync-status" :data-status="provider.syncStatus">{{ syncStatusLabel[provider.syncStatus] }}</span>
+                </header>
+                <dl>
+                  <div><dt>最近成功</dt><dd>{{ syncDate(provider.syncLastSuccessAt, '尚未成功') }}</dd></div>
+                  <div><dt>下次执行</dt><dd>{{ sourceSyncEnabled(provider) ? syncDate(provider.syncNextRunAt, '等待安排') : '已关闭' }}</dd></div>
+                  <div><dt>本轮收录</dt><dd>{{ provider.syncItemCount }} 项</dd></div>
+                  <div><dt>数据变化</dt><dd>新增 {{ provider.syncInsertedCount }} · 更新 {{ provider.syncUpdatedCount }}</dd></div>
+                  <div><dt>连续失败</dt><dd>{{ provider.syncFailureCount }} 次</dd></div>
+                  <div><dt>最近完成</dt><dd>{{ syncDate(provider.syncLastFinishedAt, '尚未执行') }}</dd></div>
+                </dl>
+                <n-alert v-if="provider.syncStatus === 'failed' && provider.syncLastMessage" type="error" title="最近一次同步失败">
+                  {{ provider.syncLastMessage }}
+                </n-alert>
+              </div>
+            </div>
             <n-alert type="info" :show-icon="false">
               403 代表站点已收到请求但拒绝访问，并非断网。Cloudflare Cookie、User-Agent 和出口 IP 必须保持一致；本机 127.0.0.1 代理不能直接给 Docker 容器使用。
             </n-alert>
-            <n-button secondary :loading="testing === provider.key" @click="testProvider(provider.key)">
-              <template #icon><IconPlugConnected /></template>
-              测试来源
-            </n-button>
+            <div class="provider-card-actions">
+              <n-button secondary :loading="testing === provider.key" @click="testProvider(provider.key)">
+                <template #icon><IconPlugConnected /></template>
+                测试来源
+              </n-button>
+              <n-button
+                type="primary"
+                :loading="syncing === provider.key || provider.syncStatus === 'running'"
+                :disabled="!provider.enabled"
+                @click="syncProvider(provider)"
+              >
+                <template #icon><IconRefresh /></template>
+                立即同步
+              </n-button>
+            </div>
             <n-alert v-if="testMessages[provider.key]" :type="testMessages[provider.key].ok ? 'success' : 'error'">
               {{ testMessages[provider.key].text }}
             </n-alert>

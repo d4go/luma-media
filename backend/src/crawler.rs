@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::Stdio};
+use std::{collections::HashSet, path::PathBuf, process::Stdio};
 
 use anyhow::{Context, bail};
 use serde_json::Value;
@@ -68,7 +68,7 @@ pub async fn list_results(
         sqlx::query(
             "SELECT cr.*, cs.name AS source, cs.website_url AS source_url \
              FROM crawler_result cr JOIN crawler_script cs ON cs.id = cr.script_id \
-             WHERE cr.script_id = ? ORDER BY cr.id DESC LIMIT 500",
+             WHERE cr.script_id = ? ORDER BY COALESCE(cr.last_seen_at, cr.created_at) DESC, cr.id DESC LIMIT 500",
         )
         .bind(script_id)
         .fetch_all(pool)
@@ -77,7 +77,7 @@ pub async fn list_results(
         sqlx::query(
             "SELECT cr.*, cs.name AS source, cs.website_url AS source_url \
              FROM crawler_result cr JOIN crawler_script cs ON cs.id = cr.script_id \
-             ORDER BY cr.id DESC LIMIT 500",
+             ORDER BY COALESCE(cr.last_seen_at, cr.created_at) DESC, cr.id DESC LIMIT 500",
         )
         .fetch_all(pool)
         .await?
@@ -258,6 +258,7 @@ async fn run_script(state: AppState, script: CrawlerScript, path: PathBuf, run_i
     };
 
     let mut result_ids = Vec::with_capacity(parsed.len());
+    let mut fingerprints = HashSet::with_capacity(parsed.len());
     let mut transaction = match state.pool.begin().await {
         Ok(transaction) => transaction,
         Err(error) => {
@@ -274,22 +275,23 @@ async fn run_script(state: AppState, script: CrawlerScript, path: PathBuf, run_i
         }
     };
     for item in parsed {
-        match sqlx::query(
-            "INSERT INTO crawler_result (run_id, script_id, title, download_url, trackers_json, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(run_id)
-        .bind(script.id)
-        .bind(&item.title)
-        .bind(&item.download_url)
-        .bind(serde_json::to_string(&item.trackers).unwrap_or_else(|_| "[]".into()))
-        .bind(item.raw.to_string())
-        .execute(&mut *transaction)
-        .await
-        {
-            Ok(result) => result_ids.push(result.last_insert_rowid()),
+        let fingerprint = item.fingerprint();
+        if !fingerprints.insert(fingerprint.clone()) {
+            continue;
+        }
+        match upsert_result_row(&mut transaction, run_id, script.id, &item, &fingerprint).await {
+            Ok(id) => result_ids.push(id),
             Err(error) => {
                 let _ = transaction.rollback().await;
-                finish_failed(&state, script.id, run_id, &stdout, &stderr, &error.to_string()).await;
+                finish_failed(
+                    &state,
+                    script.id,
+                    run_id,
+                    &stdout,
+                    &stderr,
+                    &error.to_string(),
+                )
+                .await;
                 return;
             }
         }
@@ -328,6 +330,34 @@ async fn run_script(state: AppState, script: CrawlerScript, path: PathBuf, run_i
         ),
     )
     .await;
+
+    for result_id in &result_ids {
+        match product::ingest_crawler_result(&state, *result_id).await {
+            Ok((media_id, resource_id)) => {
+                if let Err(error) = sqlx::query(
+                    "UPDATE crawler_result SET media_id = ?, resource_id = ? WHERE id = ?",
+                )
+                .bind(media_id)
+                .bind(resource_id)
+                .bind(result_id)
+                .execute(&state.pool)
+                .await
+                {
+                    tracing::warn!(%error, result_id, "could not link crawler result to local catalog");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, result_id, "could not index crawler result in local catalog");
+                storage::log(
+                    &state.pool,
+                    "error",
+                    "crawler",
+                    &format!("Could not index crawler result #{result_id}: {error}"),
+                )
+                .await;
+            }
+        }
+    }
 
     if script.auto_download {
         for result_id in result_ids {
@@ -455,6 +485,137 @@ struct ParsedResult {
     download_url: String,
     trackers: Vec<String>,
     raw: Value,
+}
+
+async fn upsert_result_row(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: i64,
+    script_id: i64,
+    item: &ParsedResult,
+    fingerprint: &str,
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(
+        "INSERT INTO crawler_result \
+         (run_id, script_id, title, download_url, trackers_json, raw_json, fingerprint, first_seen_at, last_seen_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) \
+         ON CONFLICT(script_id, fingerprint) WHERE fingerprint IS NOT NULL DO UPDATE SET \
+             run_id = excluded.run_id, \
+             title = excluded.title, \
+             download_url = excluded.download_url, \
+             trackers_json = excluded.trackers_json, \
+             raw_json = excluded.raw_json, \
+             first_seen_at = COALESCE(crawler_result.first_seen_at, excluded.first_seen_at), \
+             last_seen_at = excluded.last_seen_at, \
+             seen_count = crawler_result.seen_count + 1 \
+         RETURNING id",
+    )
+    .bind(run_id)
+    .bind(script_id)
+    .bind(&item.title)
+    .bind(&item.download_url)
+    .bind(serde_json::to_string(&item.trackers).unwrap_or_else(|_| "[]".into()))
+    .bind(item.raw.to_string())
+    .bind(fingerprint)
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(row.get("id"))
+}
+
+impl ParsedResult {
+    fn fingerprint(&self) -> String {
+        result_fingerprint(&self.raw, &self.download_url)
+    }
+}
+
+fn result_fingerprint(raw: &Value, download_url: &str) -> String {
+    if let Some(value) = first_identity(raw, &["fingerprint"]) {
+        return format!("fingerprint:{}", normalize_identity(&value));
+    }
+    if let Some(value) = first_identity(raw, &["infoHash", "info_hash", "btih", "hash"])
+        .and_then(|value| normalize_info_hash(&value))
+    {
+        return format!("btih:{value}");
+    }
+    if let Some(value) = magnet_info_hash(download_url) {
+        return format!("btih:{value}");
+    }
+    if let Some(value) = first_identity(
+        raw,
+        &[
+            "resourceId",
+            "resource_id",
+            "externalId",
+            "external_id",
+            "providerResourceId",
+            "provider_resource_id",
+            "guid",
+            "id",
+        ],
+    ) {
+        return format!("source:{}", normalize_identity(&value));
+    }
+    format!("url:{}", canonical_download_url(download_url))
+}
+
+fn first_identity(raw: &Value, keys: &[&str]) -> Option<String> {
+    let object = raw.as_object()?;
+    keys.iter().find_map(|key| match object.get(*key) {
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.trim().to_owned()),
+        Some(Value::Number(value)) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn normalize_identity(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn normalize_info_hash(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let normalized = normalized.strip_prefix("urn:btih:").unwrap_or(&normalized);
+    ((normalized.len() == 40
+        && normalized
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()))
+        || (normalized.len() == 32
+            && normalized
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())))
+    .then_some(normalized.to_owned())
+}
+
+fn magnet_info_hash(download_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(download_url.trim()).ok()?;
+    if url.scheme() != "magnet" {
+        return None;
+    }
+    url.query_pairs()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("xt"))
+        .find_map(|(_, value)| normalize_info_hash(&value))
+}
+
+fn canonical_download_url(download_url: &str) -> String {
+    let trimmed = download_url.trim();
+    let Ok(mut url) = reqwest::Url::parse(trimmed) else {
+        return trimmed.to_lowercase();
+    };
+    url.set_fragment(None);
+    let mut query = url
+        .query_pairs()
+        .filter(|(key, _)| !key.eq_ignore_ascii_case("utm_source"))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    query.sort();
+    url.set_query(None);
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query);
+    }
+    url.into()
 }
 
 fn parse_results(text: &str) -> anyhow::Result<Vec<ParsedResult>> {
@@ -618,5 +779,138 @@ mod tests {
     fn accepts_json_on_last_stdout_line() {
         let results = parse_results("log line\n[{\"url\":\"https://example/t.torrent\"}]").unwrap();
         assert_eq!(results[0].title, "Result 1");
+    }
+
+    #[test]
+    fn fingerprint_prefers_explicit_source_identity() {
+        let raw = serde_json::json!({
+            "fingerprint": " JAVDB / 123 ",
+            "downloadUrl": "https://example.com/file.torrent"
+        });
+        assert_eq!(
+            result_fingerprint(&raw, "https://example.com/file.torrent"),
+            "fingerprint:javdb/123"
+        );
+    }
+
+    #[test]
+    fn fingerprint_uses_magnet_hash_without_tracker_noise() {
+        let hash = "0123456789ABCDEF0123456789ABCDEF01234567";
+        let first = format!("magnet:?xt=urn:btih:{hash}&tr=udp://tracker-one");
+        let second = format!("magnet:?tr=udp://tracker-two&xt=URN:BTIH:{hash}");
+        assert_eq!(
+            result_fingerprint(&serde_json::json!({}), &first),
+            result_fingerprint(&serde_json::json!({}), &second)
+        );
+        assert_eq!(
+            result_fingerprint(&serde_json::json!({}), &first),
+            format!("btih:{}", hash.to_ascii_lowercase())
+        );
+    }
+
+    #[test]
+    fn fingerprint_uses_resource_id_before_url_fallback() {
+        let first = serde_json::json!({ "resourceId": 42 });
+        let second = serde_json::json!({ "resourceId": "42" });
+        assert_eq!(
+            result_fingerprint(&first, "https://example.com/old.torrent"),
+            result_fingerprint(&second, "https://example.com/new.torrent")
+        );
+        assert_eq!(
+            result_fingerprint(&first, "https://example.com/old.torrent"),
+            "source:42"
+        );
+    }
+
+    #[test]
+    fn fingerprint_canonicalizes_url_query_order_and_fragment() {
+        let first = "https://example.com/file.torrent?b=2&a=1#download";
+        let second = "https://example.com/file.torrent?a=1&b=2";
+        assert_eq!(
+            result_fingerprint(&serde_json::json!({}), first),
+            result_fingerprint(&serde_json::json!({}), second)
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_deduplicates_the_same_resource_across_runs() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let script_id = sqlx::query(
+            "INSERT INTO crawler_script(name, website_url, file_name, file_path) \
+             VALUES ('Test', 'https://example.com', 'test.py', '/test.py')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let first_run = sqlx::query("INSERT INTO crawler_run(script_id) VALUES (?)")
+            .bind(script_id)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let item = ParsedResult {
+            title: "First title".into(),
+            download_url:
+                "magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567&tr=udp://one".into(),
+            trackers: vec!["udp://one".into()],
+            raw: serde_json::json!({}),
+        };
+        let fingerprint = item.fingerprint();
+        let mut transaction = pool.begin().await.unwrap();
+        let first_id =
+            upsert_result_row(&mut transaction, first_run, script_id, &item, &fingerprint)
+                .await
+                .unwrap();
+        transaction.commit().await.unwrap();
+
+        sqlx::query("UPDATE crawler_run SET status='success' WHERE id=?")
+            .bind(first_run)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second_run = sqlx::query("INSERT INTO crawler_run(script_id) VALUES (?)")
+            .bind(script_id)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let updated_item = ParsedResult {
+            title: "Updated title".into(),
+            download_url:
+                "magnet:?tr=udp://two&xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+            trackers: vec!["udp://two".into()],
+            raw: serde_json::json!({}),
+        };
+        let mut transaction = pool.begin().await.unwrap();
+        let second_id = upsert_result_row(
+            &mut transaction,
+            second_run,
+            script_id,
+            &updated_item,
+            &updated_item.fingerprint(),
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS row_count, MAX(seen_count) AS seen_count, MAX(title) AS title \
+             FROM crawler_result WHERE script_id=? AND fingerprint=?",
+        )
+        .bind(script_id)
+        .bind(fingerprint)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(first_id, second_id);
+        assert_eq!(row.get::<i64, _>("row_count"), 1);
+        assert_eq!(row.get::<i64, _>("seen_count"), 2);
+        assert_eq!(row.get::<String, _>("title"), "Updated title");
     }
 }

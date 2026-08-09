@@ -74,6 +74,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/providers/{key}/enabled", post(set_provider_enabled))
         .route("/providers/{key}/test", post(test_provider))
+        .route("/providers/{key}/sync", post(sync_provider))
         .route(
             "/product-settings",
             get(get_product_settings).put(update_product_settings),
@@ -266,83 +267,41 @@ async fn search(
             provider_reports: Vec::new(),
         }));
     }
-    let mut reports = Vec::new();
-    let providers = enabled_source_providers(&state).await?;
-    let source_terms = expanded_search_terms(&state, term).await?;
-    let mut searches = tokio::task::JoinSet::new();
-    for provider in providers {
-        let source_state = state.clone();
-        let provider_terms = source_terms.clone();
-        searches.spawn(async move {
-            let key = provider.key.clone();
-            let result = source_search_all(&source_state, &provider, &provider_terms).await;
-            (key, result)
-        });
-    }
-    while let Some(result) = searches.join_next().await {
-        match result {
-            Ok((provider_key, Ok(count))) => reports.push(ProviderReport {
-                provider_key,
-                ok: true,
-                message: "搜索完成".into(),
-                result_count: count,
-            }),
-            Ok((provider_key, Err(error))) => reports.push(ProviderReport {
-                provider_key,
-                ok: false,
-                message: error.to_string(),
-                result_count: 0,
-            }),
-            Err(error) => reports.push(ProviderReport {
-                provider_key: "source-runtime".into(),
-                ok: false,
-                message: error.to_string(),
-                result_count: 0,
-            }),
-        }
-    }
-    reports.sort_by(|left, right| left.provider_key.cmp(&right.provider_key));
-    let pattern = format!("%{}%", term.to_lowercase());
-    let alias_pattern = format!("%{}%", normalize_alias(term));
-    let media_rows = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m WHERE lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ? OR lower(COALESCE(m.original_title,'')) LIKE ? OR lower(COALESCE(legacy_filename,'')) LIKE ? OR lower(COALESCE(legacy_provider_id,'')) LIKE ? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias LIKE ?) ORDER BY m.updated_at DESC LIMIT 60")
-        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&alias_pattern).fetch_all(&state.pool).await?;
-    let actor_rows = sqlx::query("SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id = a.id) AS media_count FROM actor a WHERE lower(a.name) LIKE ? OR lower(a.aliases_json) LIKE ? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias LIKE ?) ORDER BY a.followed DESC, media_count DESC LIMIT 30")
-        .bind(&pattern).bind(&pattern).bind(&alias_pattern).fetch_all(&state.pool).await?;
+    // User-facing search is deliberately local-only. External providers are
+    // refreshed by the background catalogue synchronizer, so a slow or blocked
+    // provider can never hold this request open.
+    let normalized_code = extract_media_code(term)
+        .map(|code| normalize_code(&code))
+        .unwrap_or_else(|| normalize_code(term));
+    let normalized_alias = normalize_alias(term);
+    let (media_rows, actor_rows) = if term.chars().count() >= 3 {
+        let phrase = fts_phrase(term);
+        let media_rows = sqlx::query("WITH matches AS (SELECT rowid AS media_id, bm25(media_search_fts) AS rank FROM media_search_fts WHERE media_search_fts MATCH ?) SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m LEFT JOIN matches x ON x.media_id=m.id WHERE m.normalized_code=? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias=?) OR x.media_id IS NOT NULL ORDER BY CASE WHEN m.normalized_code=? THEN 0 WHEN EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias=?) THEN 1 ELSE 2 END, COALESCE(x.rank,0), m.updated_at DESC LIMIT 60")
+            .bind(&phrase).bind(&normalized_code).bind(&normalized_alias).bind(&normalized_code).bind(&normalized_alias).fetch_all(&state.pool).await?;
+        let actor_rows = sqlx::query("WITH matches AS (SELECT rowid AS actor_id, bm25(actor_search_fts) AS rank FROM actor_search_fts WHERE actor_search_fts MATCH ?) SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id=a.id) AS media_count FROM actor a LEFT JOIN matches x ON x.actor_id=a.id WHERE a.normalized_name=? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias=?) OR x.actor_id IS NOT NULL ORDER BY CASE WHEN a.normalized_name=? THEN 0 WHEN EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias=?) THEN 1 ELSE 2 END, a.followed DESC, COALESCE(x.rank,0), media_count DESC LIMIT 30")
+            .bind(&phrase).bind(&normalized_alias).bind(&normalized_alias).bind(&normalized_alias).bind(&normalized_alias).fetch_all(&state.pool).await?;
+        (media_rows, actor_rows)
+    } else {
+        // FTS5 trigram has no tokens for one- or two-character queries. Keep
+        // this bounded fallback for short names while exact aliases still use
+        // their B-tree indexes.
+        let pattern = format!("%{}%", term.to_lowercase());
+        let media_rows = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m JOIN media_search_document d ON d.media_id=m.id WHERE m.normalized_code=? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias=?) OR lower(d.title) LIKE ? OR lower(d.original_title) LIKE ? OR lower(d.aliases) LIKE ? OR lower(d.actors) LIKE ? OR lower(d.resources) LIKE ? ORDER BY CASE WHEN m.normalized_code=? THEN 0 ELSE 1 END, m.updated_at DESC LIMIT 60")
+            .bind(&normalized_code).bind(&normalized_alias).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&normalized_code).fetch_all(&state.pool).await?;
+        let actor_rows = sqlx::query("SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id=a.id) AS media_count FROM actor a JOIN actor_search_document d ON d.actor_id=a.id WHERE a.normalized_name=? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias=?) OR lower(d.name) LIKE ? OR lower(d.aliases) LIKE ? ORDER BY CASE WHEN a.normalized_name=? THEN 0 ELSE 1 END, a.followed DESC, media_count DESC LIMIT 30")
+            .bind(&normalized_alias).bind(&normalized_alias).bind(&pattern).bind(&pattern).bind(&normalized_alias).fetch_all(&state.pool).await?;
+        (media_rows, actor_rows)
+    };
     Ok(Json(SearchResponse {
         query: term.into(),
         media: media_rows.iter().map(media_from_row).collect(),
         actors: actor_rows.iter().map(actor_from_row).collect(),
-        provider_reports: reports,
+        provider_reports: Vec::new(),
     }))
 }
 
-async fn expanded_search_terms(state: &AppState, term: &str) -> AppResult<Vec<String>> {
-    let mut terms = Vec::new();
-    push_search_term(&mut terms, term);
-    let pattern = format!("%{}%", term.to_lowercase());
-    let alias_pattern = format!("%{}%", normalize_alias(term));
-    let media_rows = sqlx::query("SELECT DISTINCT m.id, m.normalized_code, m.title FROM media m WHERE lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ? OR lower(COALESCE(m.original_title,'')) LIKE ? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias LIKE ?) ORDER BY m.updated_at DESC LIMIT 4")
-        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&alias_pattern).fetch_all(&state.pool).await?;
-    for row in &media_rows {
-        push_search_term(&mut terms, &row.get::<String, _>("normalized_code"));
-        let aliases = sqlx::query_scalar::<_, String>("SELECT alias FROM media_title_alias WHERE media_id=? ORDER BY is_primary DESC, updated_at DESC LIMIT 2")
-            .bind(row.get::<i64, _>("id")).fetch_all(&state.pool).await?;
-        for alias in aliases {
-            push_search_term(&mut terms, &alias);
-        }
-    }
-    let actor_rows = sqlx::query("SELECT DISTINCT a.id, a.name FROM actor a WHERE lower(a.name) LIKE ? OR lower(a.aliases_json) LIKE ? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias LIKE ?) ORDER BY a.updated_at DESC LIMIT 3")
-        .bind(&pattern).bind(&pattern).bind(&alias_pattern).fetch_all(&state.pool).await?;
-    for row in &actor_rows {
-        push_search_term(&mut terms, &row.get::<String, _>("name"));
-        let aliases = sqlx::query_scalar::<_, String>("SELECT alias FROM actor_name_alias WHERE actor_id=? ORDER BY is_primary DESC, updated_at DESC LIMIT 2")
-            .bind(row.get::<i64, _>("id")).fetch_all(&state.pool).await?;
-        for alias in aliases {
-            push_search_term(&mut terms, &alias);
-        }
-    }
-    terms.truncate(8);
-    Ok(terms)
+fn fts_phrase(value: &str) -> String {
+    format!("\"{}\"", value.trim().replace('"', "\"\""))
 }
 
 fn push_search_term(terms: &mut Vec<String>, value: &str) {
@@ -1187,7 +1146,7 @@ async fn enrich_with_metatube(
     }
     sqlx::query("INSERT INTO provider_entity_mapping(provider_key,entity_type,provider_entity_id,media_id,raw_json) VALUES ('metatube','media',?,?,?) ON CONFLICT(provider_key,entity_type,provider_entity_id) DO UPDATE SET media_id=excluded.media_id,raw_json=excluded.raw_json,last_seen_at=datetime('now')")
         .bind(format!("{}:{}", match_item.provider, match_item.id)).bind(media_id).bind(remote.to_string()).execute(&state.pool).await?;
-    persist_remote_actors(state, media_id, &remote).await?;
+    persist_remote_actors(state, media_id, &remote, "metatube").await?;
     let poster_path = if let Some(url) = poster_url {
         match client.download_image(url).await {
             Ok(image) => {
@@ -1213,6 +1172,7 @@ async fn persist_remote_actors(
     state: &AppState,
     media_id: i64,
     remote: &Value,
+    source_key: &str,
 ) -> anyhow::Result<()> {
     for (order, item) in remote
         .get("actors")
@@ -1235,14 +1195,14 @@ async fn persist_remote_actors(
             continue;
         }
         let aliases = actor_alias_strings(item);
-        let actor_id = upsert_actor_with_aliases(state, name, &aliases, avatar, "metatube").await?;
+        let actor_id = upsert_actor_with_aliases(state, name, &aliases, avatar, source_key).await?;
         for (alias, locale) in localized_actor_names(item) {
             upsert_actor_name_alias(
                 state,
                 actor_id,
                 &alias,
                 Some(locale),
-                "metatube",
+                source_key,
                 alias == name,
             )
             .await?;
@@ -1256,6 +1216,7 @@ async fn persist_remote_actors(
         .execute(&state.pool)
         .await?;
     }
+    refresh_media_search_document(state, media_id).await?;
     Ok(())
 }
 
@@ -1623,7 +1584,7 @@ async fn automation_by_id(state: &AppState, id: i64) -> AppResult<Json<Value>> {
 }
 
 async fn list_providers(State(state): State<AppState>) -> AppResult<Json<Vec<Value>>> {
-    let rows = sqlx::query("SELECT * FROM provider_config ORDER BY provider_type, provider_key")
+    let rows = sqlx::query("SELECT pc.*,ss.status AS sync_status,ss.last_started_at AS sync_last_started_at,ss.last_finished_at AS sync_last_finished_at,ss.last_success_at AS sync_last_success_at,ss.next_run_at AS sync_next_run_at,ss.last_message AS sync_last_message,ss.failure_count AS sync_failure_count,ss.item_count AS sync_item_count,ss.inserted_count AS sync_inserted_count,ss.updated_count AS sync_updated_count FROM provider_config pc LEFT JOIN source_sync_state ss ON ss.provider_key=pc.provider_key ORDER BY pc.provider_type,pc.provider_key")
         .fetch_all(&state.pool)
         .await?;
     Ok(Json(rows.iter().map(provider_json).collect()))
@@ -1710,6 +1671,10 @@ async fn create_provider(
         .bind(input.base_url.trim())
         .bind(input.secret.trim())
         .bind(Value::Object(config).to_string())
+        .execute(&state.pool)
+        .await?;
+    sqlx::query("INSERT OR IGNORE INTO source_sync_state(provider_key) VALUES (?)")
+        .bind(&key)
         .execute(&state.pool)
         .await?;
     provider_by_key(&state, &key).await
@@ -1803,8 +1768,340 @@ async fn test_provider(
     ))
 }
 
+async fn sync_provider(
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+) -> AppResult<Json<Value>> {
+    start_source_sync(&state, &key, true).await?;
+    provider_by_key(&state, &key).await
+}
+
+pub async fn schedule_source_sync(state: &AppState) -> anyhow::Result<()> {
+    recover_stale_source_syncs(state).await?;
+    let rows = sqlx::query("SELECT pc.* FROM provider_config pc JOIN source_sync_state ss ON ss.provider_key=pc.provider_key WHERE pc.provider_type='source' AND pc.enabled=1 AND ss.status!='running' AND ss.next_run_at<=datetime('now') ORDER BY ss.next_run_at,pc.provider_key LIMIT 8")
+        .fetch_all(&state.pool)
+        .await?;
+    if let Some(provider) = rows
+        .iter()
+        .map(source_provider_from_row)
+        .find(|provider| provider.sync_enabled)
+    {
+        start_source_sync(state, &provider.key, false).await?;
+    }
+    Ok(())
+}
+
+async fn recover_stale_source_syncs(state: &AppState) -> anyhow::Result<()> {
+    sqlx::query("UPDATE source_sync_run SET status='failed',error_message='服务重启或同步超时',finished_at=datetime('now') WHERE status='running' AND started_at<datetime('now','-1 hour')")
+        .execute(&state.pool)
+        .await?;
+    sqlx::query("UPDATE source_sync_state SET status='failed',last_finished_at=datetime('now'),last_message='服务重启或同步超时',failure_count=failure_count+1,next_run_at=datetime('now','+1 hour'),updated_at=datetime('now') WHERE status='running' AND last_started_at<datetime('now','-1 hour')")
+        .execute(&state.pool)
+        .await?;
+    Ok(())
+}
+
+async fn start_source_sync(state: &AppState, key: &str, manual: bool) -> AppResult<()> {
+    recover_stale_source_syncs(state).await?;
+    let provider = source_provider_by_key(state, key)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !manual && !provider.sync_enabled {
+        return Ok(());
+    }
+    sqlx::query("INSERT OR IGNORE INTO source_sync_state(provider_key) VALUES (?)")
+        .bind(key)
+        .execute(&state.pool)
+        .await?;
+    let mut transaction = state.pool.begin().await?;
+    let claimed = sqlx::query("UPDATE source_sync_state SET status='running',last_started_at=datetime('now'),last_finished_at=NULL,last_message='正在采集最新目录',updated_at=datetime('now') WHERE provider_key=? AND status!='running'")
+        .bind(key)
+        .execute(&mut *transaction)
+        .await?;
+    if claimed.rows_affected() == 0 {
+        return Err(AppError::BadRequest("这个来源已经在同步中".into()));
+    }
+    let run_id: i64 = sqlx::query(
+        "INSERT INTO source_sync_run(provider_key,status) VALUES (?,'running') RETURNING id",
+    )
+    .bind(key)
+    .fetch_one(&mut *transaction)
+    .await?
+    .get("id");
+    transaction.commit().await?;
+
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        run_source_sync(task_state, provider, run_id).await;
+    });
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SourceSyncStats {
+    item_count: i64,
+    inserted_count: i64,
+    updated_count: i64,
+    detail_count: usize,
+    detail_failures: usize,
+}
+
+async fn run_source_sync(state: AppState, provider: SourceProviderConfig, run_id: i64) {
+    let permit = match state.crawler_limiter.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            finish_source_sync_failure(&state, &provider, run_id, &error.to_string()).await;
+            return;
+        }
+    };
+    let outcome = synchronize_source_catalogue(&state, &provider).await;
+    drop(permit);
+    match outcome {
+        Ok(stats) => finish_source_sync_success(&state, &provider, run_id, &stats).await,
+        Err(error) => {
+            tracing::warn!(%error, provider = provider.key, "source catalogue sync failed");
+            finish_source_sync_failure(&state, &provider, run_id, &error.to_string()).await;
+        }
+    }
+}
+
+async fn synchronize_source_catalogue(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+) -> anyhow::Result<SourceSyncStats> {
+    let items = fetch_source_catalogue_with_retry(provider).await?;
+    anyhow::ensure!(
+        !items.is_empty(),
+        "{} 首页没有解析出作品，已保留旧索引并停止本轮同步",
+        provider.display_name
+    );
+    let mut stats = SourceSyncStats {
+        item_count: 0,
+        inserted_count: 0,
+        updated_count: 0,
+        detail_count: 0,
+        detail_failures: 0,
+    };
+    let mut details = Vec::new();
+    for item in items {
+        let existed: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM provider_entity_mapping WHERE provider_key=? AND entity_type='media' AND provider_entity_id=?)")
+            .bind(&provider.key)
+            .bind(&item.provider_id)
+            .fetch_one(&state.pool)
+            .await?;
+        match persist_source_media(state, &provider.key, &item).await {
+            Ok(media_id) => {
+                stats.item_count += 1;
+                if existed == 0 {
+                    stats.inserted_count += 1;
+                } else {
+                    stats.updated_count += 1;
+                }
+                if details.len() < provider.sync_detail_limit {
+                    details.push((media_id, item));
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                provider = provider.key,
+                provider_id = item.provider_id,
+                "source item was not canonical enough to index"
+            ),
+        }
+    }
+    anyhow::ensure!(
+        stats.item_count > 0,
+        "{} 最新目录中没有可识别番号的作品，已保留旧索引",
+        provider.display_name
+    );
+    for (index, (media_id, item)) in details.iter().enumerate() {
+        let detail = match provider.adapter.as_str() {
+            "javbus" => {
+                refresh_javbus_media(
+                    state,
+                    *media_id,
+                    provider,
+                    &item.provider_id,
+                    &item.source_url,
+                )
+                .await
+            }
+            "javdb" | "jav321" | "javlibrary" => {
+                refresh_generic_source_media(
+                    state,
+                    *media_id,
+                    provider,
+                    &item.provider_id,
+                    &item.source_url,
+                )
+                .await
+            }
+            adapter => Err(anyhow::anyhow!("不支持的来源适配器：{adapter}")),
+        };
+        match detail {
+            Ok(_) => stats.detail_count += 1,
+            Err(error) => {
+                stats.detail_failures += 1;
+                tracing::warn!(%error, provider = provider.key, media_id, "source detail refresh failed");
+            }
+        }
+        if index + 1 < details.len() {
+            tokio::time::sleep(Duration::from_millis(900)).await;
+        }
+    }
+    Ok(stats)
+}
+
+async fn fetch_source_catalogue_with_retry(
+    provider: &SourceProviderConfig,
+) -> anyhow::Result<Vec<SourceMedia>> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match fetch_source_catalogue(provider).await {
+            Ok(items) => return Ok(items),
+            Err(error) => {
+                let message = error.to_string();
+                if message.contains("403")
+                    || message.contains("Cloudflare")
+                    || message.contains("验证")
+                    || attempt == 2
+                {
+                    return Err(error);
+                }
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_secs(if attempt == 0 { 2 } else { 5 })).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("来源同步失败")))
+}
+
+async fn fetch_source_catalogue(
+    provider: &SourceProviderConfig,
+) -> anyhow::Result<Vec<SourceMedia>> {
+    let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    match provider.adapter.as_str() {
+        "javbus" => {
+            let html = javbus_request_html(provider, base).await?;
+            Ok(parse_javbus_search_html(&html, "", &provider.base_url))
+        }
+        "javdb" => {
+            let (_, html) = source_get_html(provider, base).await?;
+            reject_cloudflare(&html, "JavDB")?;
+            Ok(parse_javdb_search_html(&html, "", &provider.base_url))
+        }
+        "jav321" => {
+            let (final_url, html) = source_get_html(provider, base).await?;
+            Ok(parse_jav321_html(&html, "", &provider.base_url, &final_url))
+        }
+        "javlibrary" => {
+            let (final_url, html) = source_get_html(provider, base).await?;
+            reject_cloudflare(&html, "JavLibrary")?;
+            Ok(parse_javlibrary_html(
+                &html,
+                "",
+                &provider.base_url,
+                &final_url,
+            ))
+        }
+        adapter => anyhow::bail!("不支持的来源适配器：{adapter}"),
+    }
+}
+
+async fn finish_source_sync_success(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    run_id: i64,
+    stats: &SourceSyncStats,
+) {
+    let message = if stats.detail_failures == 0 {
+        format!(
+            "目录同步完成，收录 {} 项；更新 {} 项详情",
+            stats.item_count, stats.detail_count
+        )
+    } else {
+        format!(
+            "目录同步完成，收录 {} 项；{} 项详情暂时失败",
+            stats.item_count, stats.detail_failures
+        )
+    };
+    let modifier = format!("+{} minutes", provider.sync_interval_minutes);
+    let result = async {
+        let mut transaction = state.pool.begin().await?;
+        sqlx::query("UPDATE source_sync_run SET status='success',item_count=?,inserted_count=?,updated_count=?,finished_at=datetime('now') WHERE id=?")
+            .bind(stats.item_count).bind(stats.inserted_count).bind(stats.updated_count).bind(run_id).execute(&mut *transaction).await?;
+        sqlx::query("UPDATE source_sync_state SET status='success',last_finished_at=datetime('now'),last_success_at=datetime('now'),next_run_at=datetime('now',?),last_message=?,failure_count=0,item_count=?,inserted_count=?,updated_count=?,updated_at=datetime('now') WHERE provider_key=?")
+            .bind(&modifier).bind(&message).bind(stats.item_count).bind(stats.inserted_count).bind(stats.updated_count).bind(&provider.key).execute(&mut *transaction).await?;
+        transaction.commit().await
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::error!(%error, provider = provider.key, "could not persist source sync success");
+    }
+    storage::log(
+        &state.pool,
+        "info",
+        "source-sync",
+        &format!("{}: {message}", provider.display_name),
+    )
+    .await;
+    emit(
+        state,
+        "source-sync",
+        json!({"providerKey":provider.key,"status":"success","message":message}),
+    );
+}
+
+async fn finish_source_sync_failure(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    run_id: i64,
+    error: &str,
+) {
+    let failure_count: i64 =
+        sqlx::query_scalar("SELECT failure_count FROM source_sync_state WHERE provider_key=?")
+            .bind(&provider.key)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            + 1;
+    let retry_minutes = match failure_count {
+        0 | 1 => 60,
+        2 => 180,
+        3 => 360,
+        _ => 720,
+    };
+    let modifier = format!("+{retry_minutes} minutes");
+    let result = async {
+        let mut transaction = state.pool.begin().await?;
+        sqlx::query("UPDATE source_sync_run SET status='failed',error_message=?,finished_at=datetime('now') WHERE id=?")
+            .bind(error).bind(run_id).execute(&mut *transaction).await?;
+        sqlx::query("UPDATE source_sync_state SET status='failed',last_finished_at=datetime('now'),next_run_at=datetime('now',?),last_message=?,failure_count=?,updated_at=datetime('now') WHERE provider_key=?")
+            .bind(&modifier).bind(error).bind(failure_count).bind(&provider.key).execute(&mut *transaction).await?;
+        transaction.commit().await
+    }
+    .await;
+    if let Err(persist_error) = result {
+        tracing::error!(%persist_error, provider = provider.key, "could not persist source sync failure");
+    }
+    storage::log(
+        &state.pool,
+        "warn",
+        "source-sync",
+        &format!("{}: {error}", provider.display_name),
+    )
+    .await;
+    emit(
+        state,
+        "source-sync",
+        json!({"providerKey":provider.key,"status":"failed","message":error}),
+    );
+}
+
 async fn provider_by_key(state: &AppState, key: &str) -> AppResult<Json<Value>> {
-    let row = sqlx::query("SELECT * FROM provider_config WHERE provider_key = ?")
+    let row = sqlx::query("SELECT pc.*,ss.status AS sync_status,ss.last_started_at AS sync_last_started_at,ss.last_finished_at AS sync_last_finished_at,ss.last_success_at AS sync_last_success_at,ss.next_run_at AS sync_next_run_at,ss.last_message AS sync_last_message,ss.failure_count AS sync_failure_count,ss.item_count AS sync_item_count,ss.inserted_count AS sync_inserted_count,ss.updated_count AS sync_updated_count FROM provider_config pc LEFT JOIN source_sync_state ss ON ss.provider_key=pc.provider_key WHERE pc.provider_key=?")
         .bind(key)
         .fetch_optional(&state.pool)
         .await?
@@ -1882,15 +2179,9 @@ struct SourceProviderConfig {
     adapter: String,
     proxy_url: String,
     user_agent: String,
-}
-
-async fn enabled_source_providers(state: &AppState) -> AppResult<Vec<SourceProviderConfig>> {
-    let rows = sqlx::query(
-        "SELECT * FROM provider_config WHERE provider_type = 'source' AND enabled = 1 ORDER BY provider_key",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    Ok(rows.iter().map(source_provider_from_row).collect())
+    sync_enabled: bool,
+    sync_interval_minutes: i64,
+    sync_detail_limit: usize,
 }
 
 async fn source_provider_by_key(
@@ -1930,45 +2221,21 @@ fn source_provider_from_row(row: &sqlx::sqlite::SqliteRow) -> SourceProviderConf
             .unwrap_or_default()
             .trim()
             .to_owned(),
+        sync_enabled: config
+            .get("syncEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        sync_interval_minutes: config
+            .get("syncIntervalMinutes")
+            .and_then(Value::as_i64)
+            .unwrap_or(1440)
+            .clamp(60, 10080),
+        sync_detail_limit: config
+            .get("syncDetailLimit")
+            .and_then(Value::as_u64)
+            .unwrap_or(8)
+            .min(40) as usize,
     }
-}
-
-async fn source_search(
-    state: &AppState,
-    provider: &SourceProviderConfig,
-    query: &str,
-) -> anyhow::Result<usize> {
-    match provider.adapter.as_str() {
-        "javbus" => javbus_search(state, provider, query).await,
-        "javdb" => javdb_search(state, provider, query).await,
-        "jav321" => jav321_search(state, provider, query).await,
-        "javlibrary" => javlibrary_search(state, provider, query).await,
-        adapter => anyhow::bail!("不支持的来源适配器：{adapter}"),
-    }
-}
-
-async fn source_search_all(
-    state: &AppState,
-    provider: &SourceProviderConfig,
-    terms: &[String],
-) -> anyhow::Result<usize> {
-    let mut total = 0;
-    for term in terms {
-        match source_search(state, provider, term).await {
-            Ok(count) => total += count,
-            Err(error) if total == 0 => return Err(error),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    provider = provider.key,
-                    query = term,
-                    "source alias search stopped after a partial success"
-                );
-                break;
-            }
-        }
-    }
-    Ok(total)
 }
 
 async fn source_probe(provider: &SourceProviderConfig) -> anyhow::Result<()> {
@@ -2064,91 +2331,6 @@ fn reject_cloudflare(html: &str, name: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-async fn javdb_search(
-    state: &AppState,
-    provider: &SourceProviderConfig,
-    query: &str,
-) -> anyhow::Result<usize> {
-    let mut url = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
-    url.set_path("/search");
-    url.query_pairs_mut()
-        .append_pair("q", query)
-        .append_pair("f", "all");
-    let (_, html) = source_get_html(provider, url).await?;
-    reject_cloudflare(&html, "JavDB")?;
-    let items = parse_javdb_search_html(&html, query, &provider.base_url);
-    for item in &items {
-        persist_source_media(state, &provider.key, item).await?;
-    }
-    Ok(items.len())
-}
-
-async fn jav321_search(
-    state: &AppState,
-    provider: &SourceProviderConfig,
-    query: &str,
-) -> anyhow::Result<usize> {
-    let mut url = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
-    url.set_path("/search");
-    let mut encoded = reqwest::Url::parse("https://luma.invalid/")?;
-    encoded.query_pairs_mut().append_pair("sn", query);
-    let mut request = source_client(provider)?
-        .post(url)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .body(encoded.query().unwrap_or_default().to_owned());
-    if !provider.secret.trim().is_empty() {
-        request = request.header(reqwest::header::COOKIE, provider.secret.trim());
-    }
-    let response = request.send().await?;
-    reject_source_status(provider, &response)?;
-    let final_url = response.url().clone();
-    let html = response.text().await?;
-    let items = parse_jav321_html(&html, query, &provider.base_url, &final_url);
-    for item in &items {
-        let media_id = persist_source_media(state, &provider.key, item).await?;
-        if final_url.path().contains("/video/") {
-            persist_source_detail_html(
-                state,
-                media_id,
-                provider,
-                &item.provider_id,
-                &html,
-                "/star/",
-            )
-            .await?;
-        }
-    }
-    Ok(items.len())
-}
-
-async fn javlibrary_search(
-    state: &AppState,
-    provider: &SourceProviderConfig,
-    query: &str,
-) -> anyhow::Result<usize> {
-    let mut url = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
-    url.set_path(javlibrary_search_path(query));
-    url.query_pairs_mut().append_pair("keyword", query);
-    let (final_url, html) = source_get_html(provider, url).await?;
-    reject_cloudflare(&html, "JavLibrary")?;
-    let items = parse_javlibrary_html(&html, query, &provider.base_url, &final_url);
-    for item in &items {
-        persist_source_media(state, &provider.key, item).await?;
-    }
-    Ok(items.len())
-}
-
-fn javlibrary_search_path(query: &str) -> &'static str {
-    if extract_media_code(query).is_some() {
-        "/cn/vl_searchbyid.php"
-    } else {
-        "/cn/vl_searchbyword.php"
-    }
 }
 
 fn parse_javdb_search_html(html: &str, fallback: &str, base_url: &str) -> Vec<SourceMedia> {
@@ -2365,25 +2547,6 @@ fn extract_tag_text_after(html: &str, marker: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-async fn javbus_search(
-    state: &AppState,
-    provider: &SourceProviderConfig,
-    query: &str,
-) -> anyhow::Result<usize> {
-    let mut url = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
-    url.path_segments_mut()
-        .map_err(|_| anyhow::anyhow!("JavBus 地址不能作为基础地址"))?
-        .clear()
-        .push("search")
-        .push(query);
-    let html = javbus_request_html(provider, url).await?;
-    let items = parse_javbus_search_html(&html, query, &provider.base_url);
-    for item in &items {
-        persist_source_media(state, &provider.key, item).await?;
-    }
-    Ok(items.len())
-}
-
 fn javbus_cookie(provider: &SourceProviderConfig, session: &[String]) -> String {
     let mut parts = vec!["age=verified".to_owned(), "existmag=all".to_owned()];
     if !provider.secret.trim().is_empty() {
@@ -2540,7 +2703,8 @@ async fn persist_source_media(
         .or_else(|| extract_media_code(&item.title))
         .or_else(|| extract_media_code(&item.provider_id))
         .map(|code| normalize_code(&code))
-        .unwrap_or_else(|| normalize_code(&format!("{provider_key}-{}", item.provider_id)));
+        .filter(|code| !code.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("无法从来源条目提取真实番号"))?;
     let row = sqlx::query("INSERT INTO media(normalized_code, title, poster_url) VALUES (?, ?, ?) ON CONFLICT(normalized_code) DO UPDATE SET title = CASE WHEN length(excluded.title) > length(media.title) THEN excluded.title ELSE media.title END, poster_url = COALESCE(excluded.poster_url, media.poster_url), updated_at = datetime('now') RETURNING id")
         .bind(&code).bind(&item.title).bind(&item.poster_url).fetch_one(&state.pool).await?;
     let id: i64 = row.get("id");
@@ -2552,16 +2716,78 @@ async fn persist_source_media(
 
 pub async fn ingest_crawler_result(state: &AppState, result_id: i64) -> AppResult<(i64, i64)> {
     let result = crate::crawler::result_by_id(&state.pool, result_id).await?;
-    let code = normalize_code(&result.title);
-    let media_id: i64 = sqlx::query("INSERT INTO media(normalized_code, title) VALUES (?, ?) ON CONFLICT(normalized_code) DO UPDATE SET title = excluded.title, updated_at = datetime('now') RETURNING id")
-        .bind(&code).bind(&result.title).fetch_one(&state.pool).await?.get("id");
+    let code = [
+        "code",
+        "number",
+        "mediaCode",
+        "media_code",
+        "videoId",
+        "video_id",
+    ]
+    .into_iter()
+    .find_map(|key| result.raw.get(key))
+    .and_then(json_value_string)
+    .and_then(|value| extract_media_code(&value))
+    .or_else(|| extract_media_code(&result.title))
+    .map(|code| normalize_code(&code))
+    .filter(|code| !code.is_empty())
+    .ok_or_else(|| {
+        AppError::BadRequest(
+            "爬虫结果缺少可识别的番号；请让脚本输出 code 或在标题中包含番号".into(),
+        )
+    })?;
+    let media_title = ["mediaTitle", "media_title", "title"]
+        .into_iter()
+        .find_map(|key| result.raw.get(key))
+        .and_then(json_value_string)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| result.title.clone());
+    let original_title = ["originalTitle", "original_title", "titleJa", "title_ja"]
+        .into_iter()
+        .find_map(|key| result.raw.get(key))
+        .and_then(json_value_string);
+    let poster_url = ["posterUrl", "poster_url", "coverUrl", "cover_url"]
+        .into_iter()
+        .find_map(|key| result.raw.get(key))
+        .and_then(json_value_string);
+    let media_id: i64 = sqlx::query("INSERT INTO media(normalized_code,title,original_title,poster_url) VALUES (?,?,?,?) ON CONFLICT(normalized_code) DO UPDATE SET title=CASE WHEN media.title='' OR media.title=media.normalized_code THEN excluded.title ELSE media.title END,original_title=COALESCE(media.original_title,excluded.original_title),poster_url=COALESCE(media.poster_url,excluded.poster_url),updated_at=datetime('now') RETURNING id")
+        .bind(&code).bind(&media_title).bind(&original_title).bind(&poster_url).fetch_one(&state.pool).await?.get("id");
     upsert_media_title_alias(
         state,
         media_id,
-        &result.title,
+        &media_title,
         None,
         &format!("crawler:{}", result.script_id),
         true,
+    )
+    .await?;
+    if let Some(original_title) = original_title.as_deref() {
+        upsert_media_title_alias(
+            state,
+            media_id,
+            original_title,
+            Some("ja"),
+            &format!("crawler:{}", result.script_id),
+            false,
+        )
+        .await?;
+    }
+    for (alias, locale) in localized_media_titles(&result.raw) {
+        upsert_media_title_alias(
+            state,
+            media_id,
+            &alias,
+            Some(locale),
+            &format!("crawler:{}", result.script_id),
+            alias == media_title,
+        )
+        .await?;
+    }
+    persist_remote_actors(
+        state,
+        media_id,
+        &result.raw,
+        &format!("crawler:{}", result.script_id),
     )
     .await?;
     let info_hash = magnet_hash(&result.download_url);
@@ -2571,10 +2797,79 @@ pub async fn ingest_crawler_result(state: &AppState, result_id: i64) -> AppResul
         &result.published_at,
         &result.source,
     );
-    let resource_id: i64 = sqlx::query("INSERT INTO resource(media_id, provider_key, provider_resource_id, title, download_url, info_hash, trackers_json, published_at, score, score_reasons_json, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(info_hash) WHERE info_hash IS NOT NULL DO UPDATE SET media_id = excluded.media_id, title = excluded.title, trackers_json = excluded.trackers_json, score = excluded.score, score_reasons_json = excluded.score_reasons_json, updated_at = datetime('now') RETURNING id")
-        .bind(media_id).bind(format!("crawler:{}", result.script_id)).bind(result.id.to_string()).bind(&result.title).bind(&result.download_url).bind(info_hash)
-        .bind(serde_json::to_string(&result.trackers).unwrap_or_else(|_| "[]".into())).bind(&result.published_at).bind(score).bind(serde_json::to_string(&reasons).unwrap_or_else(|_| "[]".into())).bind(result.raw.to_string()).fetch_one(&state.pool).await?.get("id");
+    let provider_key = format!("crawler:{}", result.script_id);
+    let provider_resource_id = [
+        "resourceId",
+        "resource_id",
+        "externalId",
+        "external_id",
+        "providerResourceId",
+        "provider_resource_id",
+        "guid",
+        "id",
+    ]
+    .into_iter()
+    .find_map(|key| result.raw.get(key))
+    .and_then(json_value_string)
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or_else(|| {
+        info_hash
+            .clone()
+            .map(|hash| format!("btih:{hash}"))
+            .unwrap_or_else(|| format!("result:{}", result.id))
+    });
+    let trackers_json = serde_json::to_string(&result.trackers).unwrap_or_else(|_| "[]".into());
+    let reasons_json = serde_json::to_string(&reasons).unwrap_or_else(|_| "[]".into());
+    let raw_json = result.raw.to_string();
+    let resource_id = if let Some(info_hash) = info_hash.as_deref() {
+        if let Some(row) = sqlx::query("SELECT id,media_id FROM resource WHERE info_hash=?")
+            .bind(info_hash)
+            .fetch_optional(&state.pool)
+            .await?
+        {
+            let existing_media_id: i64 = row.get("media_id");
+            if existing_media_id != media_id {
+                tracing::warn!(
+                    info_hash,
+                    existing_media_id,
+                    media_id,
+                    "crawler hash already belongs to another media item; preserving the original association"
+                );
+            }
+            let resource_id: i64 = row.get("id");
+            sqlx::query("UPDATE resource SET title=?,download_url=?,trackers_json=?,published_at=?,score=?,score_reasons_json=?,raw_json=?,available=1,updated_at=datetime('now') WHERE id=?")
+                .bind(&result.title).bind(&result.download_url).bind(&trackers_json).bind(&result.published_at).bind(score).bind(&reasons_json).bind(&raw_json).bind(resource_id).execute(&state.pool).await?;
+            resource_id
+        } else {
+            sqlx::query("INSERT INTO resource(media_id,provider_key,provider_resource_id,title,download_url,info_hash,trackers_json,published_at,score,score_reasons_json,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id")
+                .bind(media_id).bind(&provider_key).bind(&provider_resource_id).bind(&result.title).bind(&result.download_url).bind(info_hash).bind(&trackers_json).bind(&result.published_at).bind(score).bind(&reasons_json).bind(&raw_json).fetch_one(&state.pool).await?.get("id")
+        }
+    } else if let Some(resource_id) = sqlx::query_scalar::<_, i64>("SELECT id FROM resource WHERE provider_key=? AND provider_resource_id=? ORDER BY id LIMIT 1")
+        .bind(&provider_key).bind(&provider_resource_id).fetch_optional(&state.pool).await?
+    {
+        sqlx::query("UPDATE resource SET media_id=?,title=?,download_url=?,trackers_json=?,published_at=?,score=?,score_reasons_json=?,raw_json=?,available=1,updated_at=datetime('now') WHERE id=?")
+            .bind(media_id).bind(&result.title).bind(&result.download_url).bind(&trackers_json).bind(&result.published_at).bind(score).bind(&reasons_json).bind(&raw_json).bind(resource_id).execute(&state.pool).await?;
+        resource_id
+    } else {
+        sqlx::query("INSERT INTO resource(media_id,provider_key,provider_resource_id,title,download_url,trackers_json,published_at,score,score_reasons_json,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING id")
+            .bind(media_id).bind(&provider_key).bind(&provider_resource_id).bind(&result.title).bind(&result.download_url).bind(&trackers_json).bind(&result.published_at).bind(score).bind(&reasons_json).bind(&raw_json).fetch_one(&state.pool).await?.get("id")
+    };
+    sqlx::query("UPDATE crawler_result SET media_id=?,resource_id=? WHERE id=?")
+        .bind(media_id)
+        .bind(resource_id)
+        .bind(result.id)
+        .execute(&state.pool)
+        .await?;
+    refresh_media_search_document(state, media_id).await?;
     Ok((media_id, resource_id))
+}
+
+fn json_value_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.trim().is_empty() => Some(value.trim().to_owned()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn rank_resource(
@@ -2741,6 +3036,7 @@ async fn refresh_javbus_media(
         sqlx::query("INSERT INTO resource(media_id,provider_key,provider_resource_id,title,download_url,info_hash,score,score_reasons_json) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(info_hash) WHERE info_hash IS NOT NULL DO UPDATE SET media_id=excluded.media_id,title=excluded.title,score=excluded.score,score_reasons_json=excluded.score_reasons_json,updated_at=datetime('now')")
             .bind(media_id).bind(&provider.key).bind(format!("{provider_id}:{index}")).bind(label).bind(url).bind(info_hash).bind(score).bind(serde_json::to_string(&reasons)?).execute(&state.pool).await?;
     }
+    refresh_media_search_document(state, media_id).await?;
     Ok(magnets.len())
 }
 
@@ -2799,6 +3095,7 @@ async fn persist_source_detail_html(
         sqlx::query("INSERT INTO resource(media_id,provider_key,provider_resource_id,title,download_url,info_hash,score,score_reasons_json) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(info_hash) WHERE info_hash IS NOT NULL DO UPDATE SET media_id=excluded.media_id,title=excluded.title,score=excluded.score,score_reasons_json=excluded.score_reasons_json,updated_at=datetime('now')")
             .bind(media_id).bind(&provider.key).bind(format!("{provider_id}:{index}")).bind(label).bind(url).bind(info_hash).bind(score).bind(serde_json::to_string(&reasons)?).execute(&state.pool).await?;
     }
+    refresh_media_search_document(state, media_id).await?;
     Ok(magnets.len())
 }
 
@@ -2894,6 +3191,7 @@ async fn persist_source_actors(
             break;
         }
     }
+    refresh_media_search_document(state, media_id).await?;
     Ok(())
 }
 
@@ -3114,7 +3412,7 @@ fn automation_json(row: &sqlx::sqlite::SqliteRow) -> Value {
 }
 fn provider_json(row: &sqlx::sqlite::SqliteRow) -> Value {
     let secret: String = row.get("secret");
-    json!({"key":row.get::<String,_>("provider_key"),"type":row.get::<String,_>("provider_type"),"displayName":row.get::<String,_>("display_name"),"enabled":row.get::<i64,_>("enabled") != 0,"baseUrl":row.get::<String,_>("base_url"),"hasSecret":!secret.is_empty(),"config":parse_json(&row.get::<String,_>("config_json"),json!({})),"lastStatus":row.get::<String,_>("last_status"),"lastMessage":row.get::<String,_>("last_message"),"lastCheckedAt":row.get::<Option<String>,_>("last_checked_at")})
+    json!({"key":row.get::<String,_>("provider_key"),"type":row.get::<String,_>("provider_type"),"displayName":row.get::<String,_>("display_name"),"enabled":row.get::<i64,_>("enabled") != 0,"baseUrl":row.get::<String,_>("base_url"),"hasSecret":!secret.is_empty(),"config":parse_json(&row.get::<String,_>("config_json"),json!({})),"lastStatus":row.get::<String,_>("last_status"),"lastMessage":row.get::<String,_>("last_message"),"lastCheckedAt":row.get::<Option<String>,_>("last_checked_at"),"syncStatus":row.try_get::<Option<String>,_>("sync_status").unwrap_or(None),"syncLastStartedAt":row.try_get::<Option<String>,_>("sync_last_started_at").unwrap_or(None),"syncLastFinishedAt":row.try_get::<Option<String>,_>("sync_last_finished_at").unwrap_or(None),"syncLastSuccessAt":row.try_get::<Option<String>,_>("sync_last_success_at").unwrap_or(None),"syncNextRunAt":row.try_get::<Option<String>,_>("sync_next_run_at").unwrap_or(None),"syncLastMessage":row.try_get::<Option<String>,_>("sync_last_message").unwrap_or(None),"syncFailureCount":row.try_get::<Option<i64>,_>("sync_failure_count").unwrap_or(None),"syncItemCount":row.try_get::<Option<i64>,_>("sync_item_count").unwrap_or(None),"syncInsertedCount":row.try_get::<Option<i64>,_>("sync_inserted_count").unwrap_or(None),"syncUpdatedCount":row.try_get::<Option<i64>,_>("sync_updated_count").unwrap_or(None)})
 }
 
 async fn provider_enabled(state: &AppState, key: &str) -> AppResult<bool> {
@@ -3214,6 +3512,24 @@ fn validate_source_transport_config(config: &Value) -> AppResult<()> {
         .is_some_and(|value| value.contains(['\r', '\n']))
     {
         return Err(AppError::BadRequest("User-Agent 不能包含换行".into()));
+    }
+    if config
+        .get("syncIntervalMinutes")
+        .and_then(Value::as_i64)
+        .is_some_and(|minutes| !(60..=10080).contains(&minutes))
+    {
+        return Err(AppError::BadRequest(
+            "来源同步间隔必须在 60 到 10080 分钟之间".into(),
+        ));
+    }
+    if config
+        .get("syncDetailLimit")
+        .and_then(Value::as_i64)
+        .is_some_and(|limit| !(0..=40).contains(&limit))
+    {
+        return Err(AppError::BadRequest(
+            "每轮详情数量必须在 0 到 40 之间".into(),
+        ));
     }
     Ok(())
 }
@@ -3347,6 +3663,7 @@ async fn upsert_media_title_alias(
     }
     sqlx::query("INSERT INTO media_title_alias(media_id,locale,alias,normalized_alias,source_key,is_primary) VALUES (?,?,?,?,?,?) ON CONFLICT(media_id,normalized_alias) DO UPDATE SET alias=excluded.alias,locale=CASE WHEN excluded.locale!='und' THEN excluded.locale ELSE media_title_alias.locale END,source_key=excluded.source_key,is_primary=MAX(media_title_alias.is_primary,excluded.is_primary),updated_at=datetime('now')")
         .bind(media_id).bind(alias_locale(alias, locale)).bind(alias).bind(normalized).bind(source_key).bind(is_primary).execute(&state.pool).await?;
+    refresh_media_search_document(state, media_id).await?;
     Ok(())
 }
 async fn upsert_actor_name_alias(
@@ -3371,6 +3688,37 @@ async fn upsert_actor_name_alias(
         .bind(actor_id)
         .execute(&state.pool)
         .await?;
+    refresh_actor_search_document(state, actor_id).await?;
+    refresh_media_documents_for_actor(state, actor_id).await?;
+    Ok(())
+}
+
+async fn refresh_media_search_document(state: &AppState, media_id: i64) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO media_search_document(media_id,code,title,original_title,aliases,actors,resources,updated_at) SELECT m.id,m.normalized_code,m.title,COALESCE(m.original_title,''),COALESCE((SELECT group_concat(alias,' ') FROM media_title_alias WHERE media_id=m.id),''),COALESCE((SELECT group_concat(actor_text,' ') FROM (SELECT a.name || ' ' || COALESCE((SELECT group_concat(alias,' ') FROM actor_name_alias WHERE actor_id=a.id),'') AS actor_text FROM media_actor ma JOIN actor a ON a.id=ma.actor_id WHERE ma.media_id=m.id)),''),COALESCE((SELECT group_concat(title,' ') FROM resource WHERE media_id=m.id AND available=1),'') ,datetime('now') FROM media m WHERE m.id=? ON CONFLICT(media_id) DO UPDATE SET code=excluded.code,title=excluded.title,original_title=excluded.original_title,aliases=excluded.aliases,actors=excluded.actors,resources=excluded.resources,updated_at=datetime('now')")
+        .bind(media_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(())
+}
+
+async fn refresh_actor_search_document(state: &AppState, actor_id: i64) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO actor_search_document(actor_id,name,aliases,updated_at) SELECT a.id,a.name,COALESCE((SELECT group_concat(alias,' ') FROM actor_name_alias WHERE actor_id=a.id),''),datetime('now') FROM actor a WHERE a.id=? ON CONFLICT(actor_id) DO UPDATE SET name=excluded.name,aliases=excluded.aliases,updated_at=datetime('now')")
+        .bind(actor_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(())
+}
+
+async fn refresh_media_documents_for_actor(state: &AppState, actor_id: i64) -> anyhow::Result<()> {
+    let media_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT media_id FROM media_actor WHERE actor_id=? ORDER BY media_id",
+    )
+    .bind(actor_id)
+    .fetch_all(&state.pool)
+    .await?;
+    for media_id in media_ids {
+        refresh_media_search_document(state, media_id).await?;
+    }
     Ok(())
 }
 async fn upsert_actor_with_aliases(
@@ -3829,13 +4177,82 @@ mod tests {
         assert_eq!(items[0].title, "ABC-123 Title");
     }
 
-    #[test]
-    fn javlibrary_uses_keyword_search_for_names_and_id_search_for_codes() {
-        assert_eq!(
-            javlibrary_search_path("紗倉まな"),
-            "/cn/vl_searchbyword.php"
-        );
-        assert_eq!(javlibrary_search_path("STARS-123"), "/cn/vl_searchbyid.php");
+    #[tokio::test]
+    async fn background_source_sync_populates_the_local_search_index() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0_u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let body = if request.starts_with("GET /ABC-123 ") {
+                    r#"<meta property="og:title" content="ABC-123 Local detail"><meta property="og:image" content="/poster-large.jpg"><div>ABC-123 uncensored <a href="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567">download</a></div>"#
+                } else {
+                    r#"<a class="movie-box" href="/ABC-123"><div class="photo-frame"><img src="/poster.jpg" title="ABC-123 Local title"></div></a>"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO provider_config(provider_key,provider_type,display_name,enabled,base_url,config_json) VALUES ('mock-javbus','source','Mock JavBus',1,?,'{\"adapter\":\"javbus\"}')")
+            .bind(&base_url)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let temp = std::env::temp_dir().join(format!("luma-source-sync-{}", chrono_like_nonce()));
+        let state = AppState {
+            pool,
+            scrape_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            crawler_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            asset_root: temp.join("assets"),
+            script_root: temp.join("scripts"),
+            events: tokio::sync::broadcast::channel(32).0,
+        };
+        let provider = source_provider_by_key(&state, "mock-javbus")
+            .await
+            .unwrap()
+            .unwrap();
+        let stats = synchronize_source_catalogue(&state, &provider)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(stats.item_count, 1);
+        assert_eq!(stats.inserted_count, 1);
+        assert_eq!(stats.detail_count, 1);
+        let resource_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(resource_count, 1);
+        let indexed_resources: String =
+            sqlx::query_scalar("SELECT resources FROM media_search_document WHERE code='abc-123'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(indexed_resources.contains("uncensored"));
+        let response = search(
+            State(state),
+            Query(SearchQuery {
+                q: "ABC 123".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response.media.len(), 1);
+        assert!(response.provider_reports.is_empty());
     }
 
     #[test]
@@ -3938,7 +4355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multilingual_aliases_expand_search_terms_to_canonical_entities() {
+    async fn local_search_uses_multilingual_aliases_without_network_requests() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let temp = std::env::temp_dir().join(format!("luma-alias-test-{}", chrono_like_nonce()));
@@ -3950,6 +4367,10 @@ mod tests {
             script_root: temp.join("scripts"),
             events: tokio::sync::broadcast::channel(32).0,
         };
+        sqlx::query("UPDATE provider_config SET base_url='http://127.0.0.1:9',enabled=1 WHERE provider_type='source'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
         let media_id: i64 = sqlx::query("INSERT INTO media(normalized_code,title) VALUES ('stars-123','5年振り出勤') RETURNING id")
             .fetch_one(&state.pool).await.unwrap().get("id");
         upsert_media_title_alias(&state, media_id, "5年振り出勤", Some("ja"), "test", true)
@@ -3977,15 +4398,39 @@ mod tests {
         upsert_actor_name_alias(&state, actor_id, "紗倉まな", Some("ja"), "test", true)
             .await
             .unwrap();
-
-        let media_terms = expanded_search_terms(&state, "时隔五年再次出勤")
+        sqlx::query("INSERT INTO media_actor(media_id,actor_id,billing_order) VALUES (?,?,0)")
+            .bind(media_id)
+            .bind(actor_id)
+            .execute(&state.pool)
             .await
             .unwrap();
-        assert!(media_terms.iter().any(|term| term == "stars-123"));
-        assert!(media_terms.iter().any(|term| term == "5年振り出勤"));
-        let actor_terms = expanded_search_terms(&state, "纱仓真菜").await.unwrap();
-        assert!(actor_terms.iter().any(|term| term == "紗倉まな"));
-        assert!(actor_terms.iter().any(|term| term == "Mana Sakura"));
+        refresh_media_search_document(&state, media_id)
+            .await
+            .unwrap();
+
+        let chinese = search(
+            State(state.clone()),
+            Query(SearchQuery {
+                q: "时隔五年再次出勤".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(chinese.media[0].id, media_id);
+        assert!(chinese.provider_reports.is_empty());
+        let english = search(
+            State(state.clone()),
+            Query(SearchQuery {
+                q: "Mana Sakura".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(english.actors[0].id, actor_id);
+        assert_eq!(english.media[0].id, media_id);
+        assert!(english.provider_reports.is_empty());
         let locale: String = sqlx::query_scalar(
             "SELECT locale FROM actor_name_alias WHERE actor_id=? AND normalized_alias=?",
         )

@@ -34,6 +34,9 @@ pub fn start(state: AppState) {
             if let Err(error) = crawler::schedule_due(&state).await {
                 tracing::warn!(%error, "crawler scheduler tick failed");
             }
+            if let Err(error) = crate::product::schedule_source_sync(&state).await {
+                tracing::warn!(%error, "source catalogue scheduler tick failed");
+            }
             if let Err(error) = schedule_tracker_update(&state).await {
                 tracing::warn!(%error, "tracker scheduler tick failed");
             }
