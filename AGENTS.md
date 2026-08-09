@@ -15,4 +15,4 @@
 - Before any destructive operation, inspect the NAS and resolve the exact Luma project directory and Docker Compose project. Never recursively replace or delete the deployment root itself.
 - Preserve persistent data directories and media/download mounts, including `luma-data` and `downloads`.
 - Stop and remove only the Docker container named `luma`, update the Luma application files to the verified Git revision, then rebuild and start it with Docker Compose.
-- After startup, verify that the `luma` container is running and that `http://127.0.0.1:3000/health` succeeds from the NAS.
+- After startup, verify that the `luma` container is running and that `http://127.0.0.1:3000/api/v1/health` succeeds from the NAS.
