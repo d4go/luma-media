@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     convert::Infallible,
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -19,7 +20,7 @@ use walkdir::WalkDir;
 use crate::{
     AppState,
     error::{AppError, AppResult},
-    qbittorrent::QBittorrentClient,
+    qbittorrent::{QBittorrentClient, magnet_hash, normalize_hash},
     storage,
 };
 
@@ -136,6 +137,11 @@ struct Resource {
     score: f64,
     score_reasons: Vec<String>,
     available: bool,
+    qbit_hash: Option<String>,
+    qbit_state: Option<String>,
+    qbit_sync_status: String,
+    acquisition_id: Option<i64>,
+    acquisition_state: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -148,6 +154,7 @@ pub struct Acquisition {
     state: String,
     state_message: String,
     qbit_hash: Option<String>,
+    qbit_state: Option<String>,
     progress: f64,
     download_speed: i64,
     eta_seconds: Option<i64>,
@@ -294,8 +301,8 @@ async fn search(
     }
     reports.sort_by(|left, right| left.provider_key.cmp(&right.provider_key));
     let pattern = format!("%{}%", term.to_lowercase());
-    let media_rows = sqlx::query("SELECT * FROM media WHERE lower(title) LIKE ? OR lower(normalized_code) LIKE ? OR lower(COALESCE(original_title,'')) LIKE ? ORDER BY updated_at DESC LIMIT 60")
-        .bind(&pattern).bind(&pattern).bind(&pattern).fetch_all(&state.pool).await?;
+    let media_rows = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m WHERE lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ? OR lower(COALESCE(m.original_title,'')) LIKE ? OR lower(COALESCE(legacy_filename,'')) LIKE ? OR lower(COALESCE(legacy_provider_id,'')) LIKE ? ORDER BY m.updated_at DESC LIMIT 60")
+        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).fetch_all(&state.pool).await?;
     let actor_rows = sqlx::query("SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id = a.id) AS media_count FROM actor a WHERE lower(a.name) LIKE ? OR lower(a.aliases_json) LIKE ? ORDER BY a.followed DESC, media_count DESC LIMIT 30")
         .bind(&pattern).bind(&pattern).fetch_all(&state.pool).await?;
     Ok(Json(SearchResponse {
@@ -311,8 +318,8 @@ async fn list_media(
     Query(query): Query<ListQuery>,
 ) -> AppResult<Json<Vec<Media>>> {
     let pattern = format!("%{}%", query.q.trim().to_lowercase());
-    let rows = sqlx::query("SELECT * FROM media WHERE (? = '%%' OR lower(title) LIKE ? OR lower(normalized_code) LIKE ?) ORDER BY updated_at DESC LIMIT 200")
-        .bind(&pattern).bind(&pattern).bind(&pattern).fetch_all(&state.pool).await?;
+    let rows = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m WHERE (? = '%%' OR lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ? OR lower(COALESCE(legacy_filename,'')) LIKE ? OR lower(COALESCE(legacy_provider_id,'')) LIKE ?) ORDER BY m.updated_at DESC LIMIT 200")
+        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).fetch_all(&state.pool).await?;
     Ok(Json(rows.iter().map(media_from_row).collect()))
 }
 
@@ -320,7 +327,7 @@ async fn media_detail(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
 ) -> AppResult<Json<Value>> {
-    let row = sqlx::query("SELECT * FROM media WHERE id = ?")
+    let row = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m WHERE m.id = ?")
         .bind(id)
         .fetch_optional(&state.pool)
         .await?
@@ -649,12 +656,13 @@ pub async fn reconcile_active(state: &AppState) -> anyhow::Result<()> {
         let id: i64 = row.get("id");
         let hash: String = row.get("qbit_hash");
         let state_name: String = row.get("state");
-        if let Some(torrent) = torrents
-            .iter()
-            .find(|item| item.hash.eq_ignore_ascii_case(&hash))
-        {
-            sqlx::query("UPDATE acquisition SET progress = ?, download_speed = ?, eta_seconds = ?, download_path = ?, qbit_missing_since = NULL, updated_at = datetime('now') WHERE id = ?")
-                .bind(torrent.progress).bind(torrent.download_speed).bind(torrent.eta).bind(Path::new(&torrent.save_path).join(&torrent.name).to_string_lossy().to_string()).bind(id).execute(&state.pool).await?;
+        let normalized_hash = normalize_hash(&hash);
+        if let Some(torrent) = torrents.iter().find(|item| {
+            normalized_hash.is_some()
+                && normalize_hash(&item.hash).as_ref() == normalized_hash.as_ref()
+        }) {
+            sqlx::query("UPDATE acquisition SET progress = ?, download_speed = ?, eta_seconds = ?, download_path = ?, qbit_state = ?, qbit_missing_since = NULL, updated_at = datetime('now') WHERE id = ?")
+                .bind(torrent.progress).bind(torrent.download_speed).bind(torrent.eta).bind(Path::new(&torrent.save_path).join(&torrent.name).to_string_lossy().to_string()).bind(&torrent.state).bind(id).execute(&state.pool).await?;
             emit(
                 state,
                 "acquisition.progress",
@@ -681,8 +689,13 @@ pub async fn reconcile_active(state: &AppState) -> anyhow::Result<()> {
                 });
             }
         } else if state_name == "DOWNLOADING" {
-            sqlx::query("UPDATE acquisition SET qbit_missing_since = COALESCE(qbit_missing_since, datetime('now')), updated_at = datetime('now') WHERE id = ?")
+            sqlx::query("UPDATE acquisition SET qbit_state = 'missing', download_speed = 0, eta_seconds = NULL, qbit_missing_since = COALESCE(qbit_missing_since, datetime('now')), updated_at = datetime('now') WHERE id = ?")
                 .bind(id).execute(&state.pool).await?;
+            emit(
+                state,
+                "acquisition.progress",
+                json!({"acquisitionId": id, "qbitState": "missing"}),
+            );
             let missing_too_long: i64 = sqlx::query_scalar("SELECT CASE WHEN (julianday('now') - julianday(qbit_missing_since)) * 86400 >= 90 THEN 1 ELSE 0 END FROM acquisition WHERE id = ?")
                 .bind(id).fetch_one(&state.pool).await?;
             if missing_too_long != 0 {
@@ -1184,7 +1197,7 @@ async fn actor_detail(
     AxumPath(id): AxumPath<i64>,
 ) -> AppResult<Json<Value>> {
     let row = sqlx::query("SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id = a.id) AS media_count FROM actor a WHERE id = ?").bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
-    let media_rows = sqlx::query("SELECT m.* FROM media m JOIN media_actor ma ON ma.media_id = m.id WHERE ma.actor_id = ? ORDER BY m.release_date DESC, m.updated_at DESC").bind(id).fetch_all(&state.pool).await?;
+    let media_rows = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m JOIN media_actor ma ON ma.media_id = m.id WHERE ma.actor_id = ? ORDER BY m.release_date DESC, m.updated_at DESC").bind(id).fetch_all(&state.pool).await?;
     Ok(Json(
         json!({"actor": actor_from_row(&row), "media": media_rows.iter().map(media_from_row).collect::<Vec<_>>()}),
     ))
@@ -1221,8 +1234,8 @@ async fn list_library(
     Query(query): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
     let pattern = format!("%{}%", query.q.trim().to_lowercase());
-    let rows = sqlx::query("SELECT li.*, m.normalized_code, m.title, m.poster_url, m.release_date, m.metadata_status FROM library_item li JOIN media m ON m.id = li.media_id WHERE (? = '%%' OR lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ?) ORDER BY li.added_at DESC LIMIT 300")
-        .bind(&pattern).bind(&pattern).bind(&pattern).fetch_all(&state.pool).await?;
+    let rows = sqlx::query("SELECT li.*, m.normalized_code, m.title, m.poster_url, m.release_date, m.metadata_status, mi.filename AS legacy_filename, mi.provider_id AS legacy_provider_id FROM library_item li JOIN media m ON m.id = li.media_id LEFT JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE (? = '%%' OR lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ? OR lower(COALESCE(mi.filename,'')) LIKE ? OR lower(COALESCE(mi.provider_id,'')) LIKE ?) ORDER BY li.added_at DESC LIMIT 300")
+        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).fetch_all(&state.pool).await?;
     let values = rows.iter().map(library_json).collect::<Vec<_>>();
     Ok(Json(json!({"items": values, "total": values.len()})))
 }
@@ -1231,7 +1244,7 @@ async fn library_detail(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
 ) -> AppResult<Json<Value>> {
-    let row = sqlx::query("SELECT li.*, m.normalized_code, m.title, m.poster_url, m.release_date, m.metadata_status FROM library_item li JOIN media m ON m.id = li.media_id WHERE li.id = ?").bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
+    let row = sqlx::query("SELECT li.*, m.normalized_code, m.title, m.poster_url, m.release_date, m.metadata_status, mi.filename AS legacy_filename, mi.provider_id AS legacy_provider_id FROM library_item li JOIN media m ON m.id = li.media_id LEFT JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.id = ?").bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
     Ok(Json(library_json(&row)))
 }
 
@@ -1239,7 +1252,7 @@ async fn reorganize_library(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
 ) -> AppResult<Json<Value>> {
-    let row = sqlx::query("SELECT li.*, m.normalized_code, m.title, m.poster_url, m.release_date, m.metadata_status FROM library_item li JOIN media m ON m.id = li.media_id WHERE li.id = ?").bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
+    let row = sqlx::query("SELECT li.*, m.normalized_code, m.title, m.poster_url, m.release_date, m.metadata_status, mi.filename AS legacy_filename, mi.provider_id AS legacy_provider_id FROM library_item li JOIN media m ON m.id = li.media_id LEFT JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.id = ?").bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
     Ok(Json(
         json!({"item": library_json(&row), "message": "当前文件已符合命名模板，无需移动"}),
     ))
@@ -2337,8 +2350,53 @@ async fn resources_for_media(state: &AppState, media_id: i64) -> AppResult<Vec<R
     {
         tracing::warn!(%error, media_id, "source detail refresh failed");
     }
-    let rows = sqlx::query("SELECT * FROM resource WHERE media_id = ? ORDER BY available DESC, score DESC, published_at DESC, id DESC").bind(media_id).fetch_all(&state.pool).await?;
-    Ok(rows.iter().map(resource_from_row).collect())
+    let rows = sqlx::query("SELECT r.*, (SELECT a.id FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_id, (SELECT a.state FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_state, (SELECT a.qbit_hash FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_qbit_hash FROM resource r WHERE r.media_id = ? ORDER BY r.available DESC, r.score DESC, r.published_at DESC, r.id DESC").bind(media_id).fetch_all(&state.pool).await?;
+    let mut resources = rows.iter().map(resource_from_row).collect::<Vec<_>>();
+    let settings = storage::load_settings(&state.pool).await?;
+    match QBittorrentClient::new(&settings) {
+        Ok(client) => match client.torrents().await {
+            Ok(torrents) => {
+                let torrents = torrents
+                    .into_iter()
+                    .filter_map(|torrent| normalize_hash(&torrent.hash).map(|hash| (hash, torrent)))
+                    .collect::<HashMap<_, _>>();
+                for resource in &mut resources {
+                    let resource_hash = resource
+                        .info_hash
+                        .as_deref()
+                        .and_then(normalize_hash)
+                        .or_else(|| magnet_hash(&resource.download_url));
+                    let acquisition_hash = resource.qbit_hash.as_deref().and_then(normalize_hash);
+                    let torrent = resource_hash
+                        .as_ref()
+                        .and_then(|hash| torrents.get(hash))
+                        .or_else(|| {
+                            acquisition_hash
+                                .as_ref()
+                                .and_then(|hash| torrents.get(hash))
+                        });
+                    resource.qbit_sync_status = "synced".into();
+                    if let Some(torrent) = torrent {
+                        resource.qbit_hash = Some(torrent.hash.clone());
+                        resource.qbit_state = Some(torrent.state.clone());
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, media_id, "resource status could not reach qBittorrent");
+                for resource in &mut resources {
+                    resource.qbit_sync_status = "unavailable".into();
+                }
+            }
+        },
+        Err(error) => {
+            tracing::warn!(%error, media_id, "resource status has invalid qBittorrent settings");
+            for resource in &mut resources {
+                resource.qbit_sync_status = "unavailable".into();
+            }
+        }
+    }
+    Ok(resources)
 }
 
 async fn refresh_source_media(state: &AppState, media_id: i64) -> anyhow::Result<usize> {
@@ -2645,6 +2703,7 @@ fn acquisition_from_row(row: &sqlx::sqlite::SqliteRow) -> Acquisition {
         state: row.get("state"),
         state_message: row.get("state_message"),
         qbit_hash: row.get("qbit_hash"),
+        qbit_state: row.get("qbit_state"),
         progress: row.get("progress"),
         download_speed: row.get("download_speed"),
         eta_seconds: row.get("eta_seconds"),
@@ -2685,20 +2744,37 @@ fn acquisition_from_row(row: &sqlx::sqlite::SqliteRow) -> Acquisition {
             score: row.get("score"),
             score_reasons: parse_string_vec(&row.get::<String, _>("score_reasons_json")),
             available: row.get::<i64, _>("available") != 0,
+            qbit_hash: row.try_get("qbit_hash").unwrap_or(None),
+            qbit_state: row.try_get("qbit_state").unwrap_or(None),
+            qbit_sync_status: "unknown".into(),
+            acquisition_id: Some(row.get("id")),
+            acquisition_state: Some(row.get("state")),
         }),
     }
 }
 
 fn media_from_row(row: &sqlx::sqlite::SqliteRow) -> Media {
+    let stored_code: String = row.get("normalized_code");
+    let title: String = row.get("title");
+    let legacy_filename: Option<String> = row.try_get("legacy_filename").unwrap_or(None);
+    let legacy_provider_id: Option<String> = row.try_get("legacy_provider_id").unwrap_or(None);
+    let poster_url: Option<String> = row.get("poster_url");
+    let legacy_media_item_id: Option<i64> = row.try_get("legacy_media_item_id").unwrap_or(None);
     Media {
         id: row.get("id"),
-        code: row.get("normalized_code"),
-        title: row.get("title"),
+        code: display_media_code(
+            &stored_code,
+            &title,
+            legacy_filename.as_deref(),
+            legacy_provider_id.as_deref(),
+        ),
+        title,
         original_title: row.get("original_title"),
         summary: row.get("summary"),
         release_date: row.get("release_date"),
         duration_minutes: row.get("duration_minutes"),
-        poster_url: row.get("poster_url"),
+        poster_url: poster_url
+            .or_else(|| legacy_media_item_id.map(|id| format!("/asset/cover/{id}"))),
         backdrop_url: row.get("backdrop_url"),
         media_type: row.get("media_type"),
         metadata_status: row.get("metadata_status"),
@@ -2734,11 +2810,32 @@ fn resource_from_row(row: &sqlx::sqlite::SqliteRow) -> Resource {
         score: row.get("score"),
         score_reasons: parse_string_vec(&row.get::<String, _>("score_reasons_json")),
         available: row.get::<i64, _>("available") != 0,
+        qbit_hash: row.try_get("acquisition_qbit_hash").unwrap_or(None),
+        qbit_state: None,
+        qbit_sync_status: "unknown".into(),
+        acquisition_id: row.try_get("acquisition_id").unwrap_or(None),
+        acquisition_state: row.try_get("acquisition_state").unwrap_or(None),
     }
 }
 
 fn library_json(row: &sqlx::sqlite::SqliteRow) -> Value {
-    json!({"id":row.get::<i64,_>("id"),"mediaId":row.get::<i64,_>("media_id"),"acquisitionId":row.get::<Option<i64>,_>("acquisition_id"),"videoPath":row.get::<String,_>("video_path"),"nfoPath":row.get::<Option<String>,_>("nfo_path"),"posterPath":row.get::<Option<String>,_>("poster_path"),"status":row.get::<String,_>("status"),"fileSize":row.get::<Option<i64>,_>("file_size"),"addedAt":row.get::<String,_>("added_at"),"media":{"code":row.get::<String,_>("normalized_code"),"title":row.get::<String,_>("title"),"posterUrl":row.get::<Option<String>,_>("poster_url"),"releaseDate":row.get::<Option<String>,_>("release_date"),"metadataStatus":row.get::<String,_>("metadata_status")}})
+    let stored_code: String = row.get("normalized_code");
+    let title: String = row.get("title");
+    let code = display_media_code(
+        &stored_code,
+        &title,
+        row.try_get::<Option<String>, _>("legacy_filename")
+            .unwrap_or(None)
+            .as_deref(),
+        row.try_get::<Option<String>, _>("legacy_provider_id")
+            .unwrap_or(None)
+            .as_deref(),
+    );
+    let poster_url = row.get::<Option<String>, _>("poster_url").or_else(|| {
+        row.get::<Option<i64>, _>("legacy_media_item_id")
+            .map(|id| format!("/asset/cover/{id}"))
+    });
+    json!({"id":row.get::<i64,_>("id"),"mediaId":row.get::<i64,_>("media_id"),"acquisitionId":row.get::<Option<i64>,_>("acquisition_id"),"videoPath":row.get::<String,_>("video_path"),"nfoPath":row.get::<Option<String>,_>("nfo_path"),"posterPath":row.get::<Option<String>,_>("poster_path"),"status":row.get::<String,_>("status"),"fileSize":row.get::<Option<i64>,_>("file_size"),"addedAt":row.get::<String,_>("added_at"),"media":{"code":code,"title":title,"posterUrl":poster_url,"releaseDate":row.get::<Option<String>,_>("release_date"),"metadataStatus":row.get::<String,_>("metadata_status")}})
 }
 fn attention_json(row: &sqlx::sqlite::SqliteRow) -> Value {
     json!({"id":row.get::<i64,_>("id"),"kind":row.get::<String,_>("kind"),"severity":row.get::<String,_>("severity"),"title":row.get::<String,_>("title"),"message":row.get::<String,_>("message"),"acquisitionId":row.get::<Option<i64>,_>("acquisition_id"),"mediaId":row.get::<Option<i64>,_>("media_id"),"mediaTitle":row.get::<Option<String>,_>("media_title"),"mediaCode":row.get::<Option<String>,_>("normalized_code"),"actions":parse_string_vec(&row.get::<String,_>("actions_json")),"createdAt":row.get::<String,_>("created_at")})
@@ -2837,6 +2934,71 @@ fn first_json_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
             .filter(|text| !text.is_empty())
     })
 }
+fn display_media_code(
+    stored_code: &str,
+    title: &str,
+    legacy_filename: Option<&str>,
+    legacy_provider_id: Option<&str>,
+) -> String {
+    legacy_provider_id
+        .filter(|value| !value.eq_ignore_ascii_case("local:nfo"))
+        .and_then(extract_media_code)
+        .or_else(|| legacy_filename.and_then(extract_media_code))
+        .or_else(|| extract_media_code(stored_code))
+        .or_else(|| extract_media_code(title))
+        .unwrap_or_else(|| {
+            let normalized_title = normalize_code(title);
+            (!stored_code.eq_ignore_ascii_case(title) && stored_code != normalized_title)
+                .then(|| stored_code.to_ascii_uppercase())
+                .unwrap_or_default()
+        })
+}
+
+fn extract_media_code(value: &str) -> Option<String> {
+    let uppercase = value.to_ascii_uppercase();
+    let bytes = uppercase.as_bytes();
+    if let Some(fc2_at) = uppercase.find("FC2") {
+        let tail = &uppercase[fc2_at + 3..];
+        if let Some(digit_at) = tail.find(|character: char| character.is_ascii_digit()) {
+            let digits = tail[digit_at..]
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>();
+            if digits.len() >= 5 {
+                return Some(format!("FC2-PPV-{digits}"));
+            }
+        }
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_alphabetic() {
+            index += 1;
+            continue;
+        }
+        let prefix_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+            index += 1;
+        }
+        let prefix = &uppercase[prefix_start..index];
+        if !(2..=10).contains(&prefix.len()) {
+            continue;
+        }
+        while index < bytes.len() && matches!(bytes[index], b'-' | b'_' | b'.' | b' ') {
+            index += 1;
+        }
+        let digits_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let digits = &uppercase[digits_start..index];
+        if (2..=8).contains(&digits.len())
+            && !matches!(prefix, "HD" | "FHD" | "UHD" | "AVC" | "HEVC")
+        {
+            return Some(format!("{prefix}-{digits}"));
+        }
+    }
+    None
+}
 fn normalize_code(value: &str) -> String {
     value
         .trim()
@@ -2850,11 +3012,6 @@ fn normalize_code(value: &str) -> String {
             }
         })
         .collect()
-}
-fn magnet_hash(url: &str) -> Option<String> {
-    url.split(['?', '&'])
-        .find_map(|part| part.strip_prefix("xt=urn:btih:"))
-        .map(|v| v.to_ascii_lowercase())
 }
 fn char_boundary_before(value: &str, index: usize) -> usize {
     let mut index = index.min(value.len());
@@ -3014,6 +3171,32 @@ mod tests {
         assert!(score > 90.0);
         assert!(reasons.iter().any(|reason| reason.contains("中文字幕")));
         assert!(reasons.iter().any(|reason| reason.contains("4K")));
+    }
+
+    #[test]
+    fn legacy_media_code_comes_from_provider_or_filename() {
+        assert_eq!(
+            display_media_code(
+                "完整作品名称",
+                "完整作品名称",
+                Some("SSIS-123-CD1.mkv"),
+                None
+            ),
+            "SSIS-123"
+        );
+        assert_eq!(
+            display_media_code(
+                "fc2ppv4792609",
+                "完整作品名称",
+                Some("movie.mp4"),
+                Some("FC2-PPV-4792609")
+            ),
+            "FC2-PPV-4792609"
+        );
+        assert_eq!(
+            display_media_code("完整作品名称", "完整作品名称", None, None),
+            ""
+        );
     }
 
     #[test]

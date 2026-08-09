@@ -10,6 +10,6 @@ const failed = ref(false)
       <img v-if="posterUrl && !failed" :src="posterUrl" :alt="`${title} 海报`" loading="lazy" @error="failed = true" />
       <div v-else class="poster-fallback"><IconMovie :size="34" /><span>{{ code.slice(0, 2).toUpperCase() || 'LU' }}</span></div>
     </div>
-    <div class="poster-copy"><strong>{{ title }}</strong><span>{{ code }}</span><small v-if="subtitle">{{ subtitle }}</small></div>
+    <div class="poster-copy"><strong>{{ title }}</strong><span>{{ code || '番号待识别' }}</span><small v-if="subtitle">{{ subtitle }}</small></div>
   </RouterLink>
 </template>

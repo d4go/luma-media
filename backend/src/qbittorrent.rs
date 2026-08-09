@@ -305,14 +305,44 @@ pub fn parse_tracker_list(text: &str) -> Vec<String> {
     trackers
 }
 
-fn magnet_hash(url: &str) -> Option<String> {
-    if !url.starts_with("magnet:?") {
+pub fn magnet_hash(url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(url).ok()?;
+    if url.scheme() != "magnet" {
         return None;
     }
-    url.split('&')
-        .flat_map(|part| part.split('?'))
-        .find_map(|part| part.strip_prefix("xt=urn:btih:"))
-        .map(str::to_owned)
+    url.query_pairs().find_map(|(key, value)| {
+        (key == "xt")
+            .then(|| value.strip_prefix("urn:btih:").and_then(normalize_hash))
+            .flatten()
+    })
+}
+
+pub fn normalize_hash(value: &str) -> Option<String> {
+    let value = value.trim();
+    if matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Some(value.to_ascii_lowercase());
+    }
+    if value.len() != 32 {
+        return (!value.is_empty()).then(|| value.to_ascii_lowercase());
+    }
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u8;
+    let mut decoded = Vec::with_capacity(20);
+    for byte in value.bytes() {
+        let digit = match byte.to_ascii_uppercase() {
+            b'A'..=b'Z' => byte.to_ascii_uppercase() - b'A',
+            b'2'..=b'7' => byte - b'2' + 26,
+            _ => return None,
+        };
+        accumulator = (accumulator << 5) | u32::from(digit);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            decoded.push(((accumulator >> bits) & 0xff) as u8);
+            accumulator &= (1_u32 << bits) - 1;
+        }
+    }
+    (decoded.len() == 20).then(|| decoded.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[cfg(test)]
@@ -344,8 +374,13 @@ mod tests {
     #[test]
     fn extracts_hash_from_magnet() {
         assert_eq!(
-            magnet_hash("magnet:?xt=urn:btih:ABC123&dn=Example").as_deref(),
-            Some("ABC123")
+            magnet_hash("magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01&dn=Example")
+                .as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
+        assert_eq!(
+            normalize_hash("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").as_deref(),
+            Some("0000000000000000000000000000000000000000")
         );
     }
 
@@ -446,7 +481,7 @@ mod tests {
         let client = QBittorrentClient::new(&settings).unwrap();
         let hash = client
             .add_download_with_options(
-                "magnet:?xt=urn:btih:ABC123&dn=Example",
+                "magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01&dn=Example",
                 &["udp://tracker.example:80/announce".into()],
                 None,
                 None,
@@ -454,7 +489,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(hash.as_deref(), Some("ABC123"));
+        assert_eq!(
+            hash.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
         assert_eq!(downloads.load(Ordering::SeqCst), 1);
         assert_eq!(tracker_updates.load(Ordering::SeqCst), 3);
 

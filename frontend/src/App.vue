@@ -44,11 +44,13 @@ const services = computed(() => [
   { key: 'metatube', name: 'MetaTube', health: status.value?.metaTube },
   { key: 'qbittorrent', name: 'qBittorrent', health: status.value?.qbittorrent },
 ])
-const themeOverrides: GlobalThemeOverrides = {
-  common: { primaryColor: '#e15836', primaryColorHover: '#ee6948', primaryColorPressed: '#bd452a', primaryColorSuppl: '#e15836', infoColor: '#e15836', borderRadius: '9px', borderRadiusSmall: '7px', fontFamily: 'Inter, "PingFang SC", "Microsoft YaHei", sans-serif' },
+const themeOverrides = computed<GlobalThemeOverrides>(() => ({
+  common: { primaryColor: '#e15836', primaryColorHover: '#ee6948', primaryColorPressed: '#bd452a', primaryColorSuppl: '#e15836', infoColor: '#e15836', borderRadius: '9px', borderRadiusSmall: '7px', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif' },
   Button: { fontWeight: '650', borderRadiusMedium: '9px' }, Card: { borderRadius: '13px' },
-  Menu: { itemTextColor: '#aaaeb5', itemTextColorHover: '#f6f6f7', itemTextColorActive: '#ffffff', itemIconColor: '#80858d', itemIconColorHover: '#ffffff', itemIconColorActive: '#ffffff', itemColorHover: 'rgba(255,255,255,.06)', itemColorActive: 'rgba(225,88,54,.18)', itemColorActiveHover: 'rgba(225,88,54,.22)', itemBorderRadius: '8px' },
-}
+  Menu: isDark.value
+    ? { itemTextColor: '#aaaeb5', itemTextColorHover: '#f6f6f7', itemTextColorActive: '#ffffff', itemIconColor: '#80858d', itemIconColorHover: '#ffffff', itemIconColorActive: '#ffffff', itemColorHover: 'rgba(255,255,255,.06)', itemColorActive: 'rgba(225,88,54,.18)', itemColorActiveHover: 'rgba(225,88,54,.22)', itemBorderRadius: '8px' }
+    : { itemTextColor: '#555b64', itemTextColorHover: '#17191c', itemTextColorActive: '#b74428', itemIconColor: '#737983', itemIconColorHover: '#30343a', itemIconColorActive: '#d65333', itemColorHover: 'rgba(24,28,34,.05)', itemColorActive: 'rgba(225,88,54,.11)', itemColorActiveHover: 'rgba(225,88,54,.15)', itemBorderRadius: '8px' },
+}))
 
 function unavailable(message: string): ServiceHealth { return { connected: false, message, latencyMs: null } }
 async function refreshStatus() {

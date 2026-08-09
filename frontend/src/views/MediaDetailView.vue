@@ -12,6 +12,18 @@ const id = computed(() => Number(route.params.id))
 async function load() { loading.value = true; try { data.value = await api.mediaDetail(id.value) } catch (reason) { message.error(reason instanceof Error ? reason.message : '详情加载失败') } finally { loading.value = false } }
 async function acquire(resourceId: number) { acquiring.value = resourceId; try { const item = await api.acquireMedia(id.value, resourceId); message.success('获取请求已创建'); router.push(`/acquisitions/${item.id}`) } catch (reason) { message.error(reason instanceof Error ? reason.message : '无法创建获取') } finally { acquiring.value = null } }
 function size(value: number | null) { if (!value) return '大小未知'; return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB` }
+function qbitStateLabel(value: string) {
+  const state = value.toLocaleLowerCase()
+  if (state === 'missing') return 'qBittorrent 中已删除'
+  if (state.includes('error') || state.includes('missingfiles')) return 'qBittorrent 异常'
+  if (state.includes('paused')) return 'qBittorrent 已暂停'
+  if (state.includes('upload')) return 'qBittorrent 做种中'
+  if (state.includes('stalled')) return 'qBittorrent 等待数据'
+  if (state.includes('check')) return 'qBittorrent 校验中'
+  if (state.includes('queue')) return 'qBittorrent 排队中'
+  return 'qBittorrent 下载中'
+}
+function activeAcquisition(value: string | null) { return !!value && !['COMPLETED', 'CANCELLED'].includes(value) }
 onMounted(load)
 </script>
 <template><n-spin :show="loading"><div v-if="data" class="media-detail-page">
@@ -22,7 +34,7 @@ onMounted(load)
   </section>
   <section v-if="data.actors.length" class="detail-section"><header class="product-section-head"><div><span class="eyebrow">CAST</span><h2>演员</h2></div></header><div class="actor-pills"><RouterLink v-for="actor in data.actors" :key="actor.id" :to="`/actors/${actor.id}`"><IconUser :size="15" />{{ actor.name }}</RouterLink></div></section>
   <section class="detail-section"><header class="product-section-head"><div><span class="eyebrow">RANKED RESOURCES</span><h2>可获取资源</h2></div><span>排序由服务端统一计算</span></header>
-    <div v-if="data.resources.length" class="resource-stack"><article v-for="(resource, index) in data.resources" :key="resource.id" class="resource-card" :class="{ preferred: index === 0 }"><div class="resource-rank"><strong>{{ Math.round(resource.score) }}</strong><span>评分</span></div><div class="resource-main"><div><span v-if="index === 0" class="preferred-label">推荐</span><strong>{{ resource.title }}</strong></div><p><span>{{ resource.providerKey }}</span><span>{{ resource.resolution ?? '清晰度未知' }}</span><span>{{ size(resource.sizeBytes) }}</span><span v-if="resource.publishedAt">{{ formatDate(resource.publishedAt) }}</span></p><ul><li v-for="reason in resource.scoreReasons" :key="reason">{{ reason }}</li></ul></div><n-button type="primary" :loading="acquiring === resource.id" @click="acquire(resource.id)">获取</n-button></article></div>
+    <div v-if="data.resources.length" class="resource-stack"><article v-for="(resource, index) in data.resources" :key="resource.id" class="resource-card" :class="{ preferred: index === 0 }"><div class="resource-rank"><strong>{{ Math.round(resource.score) }}</strong><span>评分</span></div><div class="resource-main"><div><span v-if="index === 0" class="preferred-label">推荐</span><strong>{{ resource.title }}</strong></div><p><span>{{ resource.providerKey }}</span><span>{{ resource.resolution ?? '清晰度未知' }}</span><span>{{ size(resource.sizeBytes) }}</span><span v-if="resource.publishedAt">{{ formatDate(resource.publishedAt) }}</span></p><ul><li v-for="reason in resource.scoreReasons" :key="reason">{{ reason }}</li></ul></div><n-button v-if="resource.qbitState" secondary :type="resource.qbitState === 'missing' ? 'error' : 'success'" disabled :title="resource.qbitState">{{ qbitStateLabel(resource.qbitState) }}</n-button><n-button v-else-if="resource.qbitSyncStatus === 'unavailable'" secondary disabled>qBittorrent 状态不可用</n-button><n-button v-else-if="activeAcquisition(resource.acquisitionState)" secondary type="error" disabled>qBittorrent 中已删除</n-button><n-button v-else type="primary" :loading="acquiring === resource.id" @click="acquire(resource.id)">获取</n-button></article></div>
     <div v-else class="quiet-empty"><IconExternalLink :size="28" /><strong>来源未返回可获取资源</strong><span>部分来源可能需要 Cookie，或该作品暂时没有公开资源。请在设置中逐个测试并启用可用来源。</span><RouterLink to="/settings">检查 Provider</RouterLink></div>
   </section>
 </div></n-spin></template>
