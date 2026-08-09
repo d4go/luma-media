@@ -44,7 +44,7 @@ const sourceAdapterOptions = [
   { label: 'JavBus', value: 'javbus', name: 'JavBus', baseUrl: 'https://www.javbus.com', hint: '支持主站、反代和多个镜像；年龄验证站点需 Cookie。' },
   { label: 'JavLibrary', value: 'javlibrary', name: 'JavLibrary', baseUrl: 'https://www.javlibrary.com', hint: '适合作为补充元数据来源，官方站可能需要 Cloudflare Cookie。' },
 ]
-const newSource = reactive({ adapter: 'jav321', displayName: 'Jav321', baseUrl: 'https://www.jav321.com', secret: '' })
+const newSource = reactive({ adapter: 'jav321', displayName: 'Jav321', baseUrl: 'https://www.jav321.com', secret: '', config: { proxyUrl: '', userAgent: '' } })
 
 const legacy = reactive<Settings>({
   metatubeUrl: '',
@@ -84,6 +84,14 @@ function sourceAdapterName(provider: ProviderConfig) {
   return sourceAdapterOptions.find(item => item.value === adapter)?.name ?? adapter
 }
 
+function sourceConfigText(provider: ProviderConfig, key: 'proxyUrl' | 'userAgent') {
+  return typeof provider.config[key] === 'string' ? String(provider.config[key]) : ''
+}
+
+function updateSourceConfig(provider: ProviderConfig, key: 'proxyUrl' | 'userAgent', value: string) {
+  provider.config = { ...provider.config, [key]: value }
+}
+
 function selectSourceAdapter(value: string) {
   const adapter = sourceAdapterOptions.find(item => item.value === value)
   if (!adapter) return
@@ -91,6 +99,7 @@ function selectSourceAdapter(value: string) {
   newSource.displayName = adapter.name
   newSource.baseUrl = adapter.baseUrl
   newSource.secret = ''
+  newSource.config = { proxyUrl: '', userAgent: '' }
 }
 
 async function load() {
@@ -174,6 +183,16 @@ async function testProvider(key: string) {
   testing.value = key
   delete testMessages[key]
   try {
+    const provider = providers.value.find(item => item.key === key)
+    if (provider?.type === 'source') {
+      Object.assign(provider, await api.updateProvider(provider.key, {
+        displayName: provider.displayName,
+        baseUrl: provider.baseUrl,
+        secret: secrets[provider.key] ?? '',
+        config: provider.config,
+      }))
+      secrets[provider.key] = ''
+    }
     const result = await api.testProvider(key)
     testMessages[key] = { ok: result.connected, text: `${result.message} · ${result.latencyMs} ms` }
     await load()
@@ -258,6 +277,25 @@ onMounted(load)
                 :placeholder="provider.hasSecret ? '已保存，留空保持不变' : 'Cloudflare / 年龄验证站点可填写完整 Cookie'"
               />
             </n-form-item>
+            <n-form-item label="代理 URL（可选）">
+              <n-input
+                :value="sourceConfigText(provider, 'proxyUrl')"
+                placeholder="例如 http://192.168.5.1:7890；必须能从 Luma 容器访问"
+                @update:value="value => updateSourceConfig(provider, 'proxyUrl', value)"
+              />
+            </n-form-item>
+            <n-form-item label="浏览器 User-Agent（可选）">
+              <n-input
+                :value="sourceConfigText(provider, 'userAgent')"
+                type="textarea"
+                :autosize="{ minRows: 2, maxRows: 3 }"
+                placeholder="填写获取验证 Cookie 时浏览器的完整 User-Agent，二者必须一致"
+                @update:value="value => updateSourceConfig(provider, 'userAgent', value)"
+              />
+            </n-form-item>
+            <n-alert type="info" :show-icon="false">
+              403 代表站点已收到请求但拒绝访问，并非断网。Cloudflare Cookie、User-Agent 和出口 IP 必须保持一致；本机 127.0.0.1 代理不能直接给 Docker 容器使用。
+            </n-alert>
             <n-button secondary :loading="testing === provider.key" @click="testProvider(provider.key)">
               <template #icon><IconPlugConnected /></template>
               测试来源

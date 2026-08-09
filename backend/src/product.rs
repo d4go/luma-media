@@ -1650,6 +1650,8 @@ struct CreateProviderInput {
     secret: String,
     #[serde(default = "default_source_adapter")]
     adapter: String,
+    #[serde(default)]
+    config: Value,
 }
 
 fn default_source_adapter() -> String {
@@ -1681,6 +1683,9 @@ async fn create_provider(
         )));
     }
     validate_http_url(&input.base_url)?;
+    validate_source_transport_config(&input.config)?;
+    let mut config = input.config.as_object().cloned().unwrap_or_default();
+    config.insert("adapter".into(), Value::String(adapter.clone()));
     let mut suffix = 1_i64;
     let key = loop {
         let candidate = if suffix == 1 {
@@ -1704,7 +1709,7 @@ async fn create_provider(
         .bind(input.display_name.trim())
         .bind(input.base_url.trim())
         .bind(input.secret.trim())
-        .bind(json!({"adapter": adapter}).to_string())
+        .bind(Value::Object(config).to_string())
         .execute(&state.pool)
         .await?;
     provider_by_key(&state, &key).await
@@ -1716,6 +1721,7 @@ async fn update_provider(
     Json(input): Json<ProviderInput>,
 ) -> AppResult<Json<Value>> {
     validate_http_url(&input.base_url)?;
+    validate_source_transport_config(&input.config)?;
     let display_name = input.display_name.trim();
     let result = if input.secret.trim().is_empty() {
         sqlx::query("UPDATE provider_config SET display_name = CASE WHEN ? = '' THEN display_name ELSE ? END, base_url = ?, config_json = ?, updated_at = datetime('now') WHERE provider_key = ?").bind(display_name).bind(display_name).bind(input.base_url.trim()).bind(input.config.to_string()).bind(&key).execute(&state.pool).await?
@@ -1874,6 +1880,8 @@ struct SourceProviderConfig {
     base_url: String,
     secret: String,
     adapter: String,
+    proxy_url: String,
+    user_agent: String,
 }
 
 async fn enabled_source_providers(state: &AppState) -> AppResult<Vec<SourceProviderConfig>> {
@@ -1909,6 +1917,18 @@ fn source_provider_from_row(row: &sqlx::sqlite::SqliteRow) -> SourceProviderConf
             .get("adapter")
             .and_then(Value::as_str)
             .unwrap_or("javbus")
+            .to_owned(),
+        proxy_url: config
+            .get("proxyUrl")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+        user_agent: config
+            .get("userAgent")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
             .to_owned(),
     }
 }
@@ -1991,26 +2011,50 @@ async fn source_probe(provider: &SourceProviderConfig) -> anyhow::Result<()> {
     }
 }
 
-fn source_client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+const DEFAULT_SOURCE_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/127 Safari/537.36 Luma/1.0";
+
+fn source_client(provider: &SourceProviderConfig) -> anyhow::Result<reqwest::Client> {
+    let user_agent = if provider.user_agent.is_empty() {
+        DEFAULT_SOURCE_USER_AGENT
+    } else {
+        &provider.user_agent
+    };
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
-        .user_agent(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/127 Safari/537.36 Luma/1.0",
-        )
-        .build()?)
+        .user_agent(user_agent);
+    if !provider.proxy_url.is_empty() {
+        builder = builder.proxy(reqwest::Proxy::all(&provider.proxy_url)?);
+    }
+    Ok(builder.build()?)
 }
 
 async fn source_get_html(
     provider: &SourceProviderConfig,
     url: reqwest::Url,
 ) -> anyhow::Result<(reqwest::Url, String)> {
-    let mut request = source_client()?.get(url);
+    let mut request = source_client(provider)?.get(url);
     if !provider.secret.trim().is_empty() {
         request = request.header(reqwest::header::COOKIE, provider.secret.trim());
     }
-    let response = request.send().await?.error_for_status()?;
+    let response = request.send().await?;
+    reject_source_status(provider, &response)?;
     let final_url = response.url().clone();
     Ok((final_url, response.text().await?))
+}
+
+fn reject_source_status(
+    provider: &SourceProviderConfig,
+    response: &reqwest::Response,
+) -> anyhow::Result<()> {
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        anyhow::bail!(
+            "{} 返回 403：网络已经连通，但站点拒绝了自动请求。请配置容器可访问的代理 URL，并填写与获取 Cookie 时完全一致的浏览器 User-Agent 和完整 Cookie；也可以更换可用镜像。",
+            provider.display_name
+        );
+    }
+    response.error_for_status_ref()?;
+    Ok(())
 }
 
 fn reject_cloudflare(html: &str, name: &str) -> anyhow::Result<()> {
@@ -2050,7 +2094,7 @@ async fn jav321_search(
     url.set_path("/search");
     let mut encoded = reqwest::Url::parse("https://luma.invalid/")?;
     encoded.query_pairs_mut().append_pair("sn", query);
-    let mut request = source_client()?
+    let mut request = source_client(provider)?
         .post(url)
         .header(
             reqwest::header::CONTENT_TYPE,
@@ -2060,7 +2104,8 @@ async fn jav321_search(
     if !provider.secret.trim().is_empty() {
         request = request.header(reqwest::header::COOKIE, provider.secret.trim());
     }
-    let response = request.send().await?.error_for_status()?;
+    let response = request.send().await?;
+    reject_source_status(provider, &response)?;
     let final_url = response.url().clone();
     let html = response.text().await?;
     let items = parse_jav321_html(&html, query, &provider.base_url, &final_url);
@@ -2352,19 +2397,15 @@ async fn javbus_request_html(
     provider: &SourceProviderConfig,
     url: reqwest::Url,
 ) -> anyhow::Result<String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Luma/1.0")
-        .build()?;
+    let client = source_client(provider)?;
     let initial_cookie = javbus_cookie(provider, &[]);
-    let html = client
+    let response = client
         .get(url.clone())
         .header(reqwest::header::COOKIE, &initial_cookie)
         .send()
-        .await?
-        .error_for_status()?
-        .text()
         .await?;
+    reject_source_status(provider, &response)?;
+    let html = response.text().await?;
     if !is_javbus_age_page(&html) {
         return Ok(html);
     }
@@ -2383,8 +2424,8 @@ async fn javbus_request_html(
         )
         .body("Submit=confirm")
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    reject_source_status(provider, &verification)?;
     let session = verification
         .headers()
         .get_all(reqwest::header::SET_COOKIE)
@@ -2393,14 +2434,13 @@ async fn javbus_request_html(
         .filter_map(|value| value.split(';').next())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let retried = client
+    let retried_response = client
         .get(url)
         .header(reqwest::header::COOKIE, javbus_cookie(provider, &session))
         .send()
-        .await?
-        .error_for_status()?
-        .text()
         .await?;
+    reject_source_status(provider, &retried_response)?;
+    let retried = retried_response.text().await?;
     if is_javbus_age_page(&retried) {
         anyhow::bail!("JavBus 要求年龄验证，请在该来源中填写可用 Cookie 或更换镜像");
     }
@@ -2784,18 +2824,14 @@ async fn fetch_javbus_magnets(
         .append_pair("img", &img)
         .append_pair("uc", &uc)
         .append_pair("floor", "1");
-    let body = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Luma/1.0")
-        .build()?
+    let response = source_client(provider)?
         .get(ajax)
         .header(reqwest::header::COOKIE, javbus_cookie(provider, &[]))
         .header(reqwest::header::REFERER, detail_url.as_str())
         .send()
-        .await?
-        .error_for_status()?
-        .text()
         .await?;
+    reject_source_status(provider, &response)?;
+    let body = response.text().await?;
     Ok(parse_magnets(&body))
 }
 
@@ -3145,6 +3181,39 @@ fn validate_http_url(value: &str) -> AppResult<()> {
         return Err(AppError::BadRequest(
             "Provider 地址必须使用 http 或 https".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_source_transport_config(config: &Value) -> AppResult<()> {
+    let Some(config) = config.as_object() else {
+        return Ok(());
+    };
+    if let Some(proxy_url) = config
+        .get("proxyUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let url = reqwest::Url::parse(proxy_url)
+            .map_err(|_| AppError::BadRequest("代理 URL 无效".into()))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(AppError::BadRequest(
+                "代理 URL 必须使用 http 或 https".into(),
+            ));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(AppError::BadRequest(
+                "代理 URL 暂不允许包含账号密码，避免凭据随 Provider 配置返回".into(),
+            ));
+        }
+    }
+    if config
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.contains(['\r', '\n']))
+    {
+        return Err(AppError::BadRequest("User-Agent 不能包含换行".into()));
     }
     Ok(())
 }
@@ -3775,6 +3844,30 @@ mod tests {
         assert_eq!(detect_alias_locale("さくらまな"), "ja");
         assert_eq!(detect_alias_locale("纱仓真菜"), "zh");
         assert_eq!(detect_alias_locale("Mana Sakura"), "en");
+    }
+
+    #[test]
+    fn source_transport_config_validates_proxy_and_user_agent() {
+        assert!(
+            validate_source_transport_config(&json!({
+                "proxyUrl": "http://192.168.5.1:7890",
+                "userAgent": "Mozilla/5.0 test"
+            }))
+            .is_ok()
+        );
+        assert!(
+            validate_source_transport_config(&json!({"proxyUrl": "socks5://127.0.0.1:1080"}))
+                .is_err()
+        );
+        assert!(
+            validate_source_transport_config(
+                &json!({"proxyUrl": "http://user:password@192.168.5.1:7890"})
+            )
+            .is_err()
+        );
+        assert!(
+            validate_source_transport_config(&json!({"userAgent": "invalid\nheader"})).is_err()
+        );
     }
 
     #[test]
