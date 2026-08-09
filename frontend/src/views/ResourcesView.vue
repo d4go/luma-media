@@ -22,7 +22,7 @@ onMounted(loadRoute)
 </script>
 <template>
   <PageHeader title="资源" description="一个搜索入口聚合作品、演员和可获取资源。来源部分失败时，其余结果仍会保留。" />
-  <div class="search-stage"><IconSearch :size="20" /><n-input v-model:value="query" borderless clearable size="large" placeholder="输入番号、标题或演员姓名" @keyup.enter="runSearch" /><n-button type="primary" size="large" @click="runSearch">搜索</n-button></div>
+  <div class="search-stage"><IconSearch :size="20" /><n-input v-model:value="query" :bordered="false" clearable size="large" placeholder="输入番号、标题或演员姓名" @keyup.enter="runSearch" /><n-button type="primary" size="large" @click="runSearch">搜索</n-button></div>
   <n-spin :show="loading">
     <div v-if="result" class="search-results">
       <div v-if="result.providerReports.some(report => !report.ok)" class="provider-report-stack"><n-alert v-for="report in result.providerReports.filter(report => !report.ok)" :key="report.providerKey" type="warning" :title="`${report.providerKey} 暂时不可用`">{{ report.message }}。已显示其他可用结果。</n-alert></div>

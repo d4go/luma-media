@@ -523,6 +523,9 @@ async fn list_acquisitions(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> AppResult<Json<Vec<Acquisition>>> {
+    if let Err(error) = reconcile_active(&state).await {
+        tracing::warn!(%error, "acquisition list reconciliation failed");
+    }
     let rows = if query.status.trim().is_empty() {
         sqlx::query(&format!("{ACQUISITION_SELECT} ORDER BY a.id DESC"))
             .fetch_all(&state.pool)
@@ -542,6 +545,9 @@ async fn acquisition_detail(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
 ) -> AppResult<Json<Value>> {
+    if let Err(error) = reconcile_active(&state).await {
+        tracing::warn!(%error, acquisition_id = id, "acquisition detail reconciliation failed");
+    }
     let acquisition = acquisition_by_id(&state, id).await?;
     let event_rows =
         sqlx::query("SELECT * FROM acquisition_event WHERE acquisition_id = ? ORDER BY id")
@@ -639,7 +645,7 @@ async fn cancel_acquisition(
 }
 
 pub async fn reconcile_active(state: &AppState) -> anyhow::Result<()> {
-    let rows = sqlx::query(&format!("SELECT id, qbit_hash, state FROM acquisition WHERE state IN ({ACTIVE_STATES}) AND qbit_hash IS NOT NULL"))
+    let rows = sqlx::query("SELECT a.id, a.media_id, a.qbit_hash, a.state, r.info_hash AS resource_info_hash, r.download_url AS resource_download_url FROM acquisition a LEFT JOIN resource r ON r.id = a.resource_id ORDER BY a.id DESC")
         .fetch_all(&state.pool).await?;
     if rows.is_empty() {
         return Ok(());
@@ -654,41 +660,92 @@ pub async fn reconcile_active(state: &AppState) -> anyhow::Result<()> {
     };
     for row in rows {
         let id: i64 = row.get("id");
-        let hash: String = row.get("qbit_hash");
+        let media_id: i64 = row.get("media_id");
+        let qbit_hash: Option<String> = row.get("qbit_hash");
         let state_name: String = row.get("state");
-        let normalized_hash = normalize_hash(&hash);
-        if let Some(torrent) = torrents.iter().find(|item| {
-            normalized_hash.is_some()
-                && normalize_hash(&item.hash).as_ref() == normalized_hash.as_ref()
-        }) {
-            sqlx::query("UPDATE acquisition SET progress = ?, download_speed = ?, eta_seconds = ?, download_path = ?, qbit_state = ?, qbit_missing_since = NULL, updated_at = datetime('now') WHERE id = ?")
-                .bind(torrent.progress).bind(torrent.download_speed).bind(torrent.eta).bind(Path::new(&torrent.save_path).join(&torrent.name).to_string_lossy().to_string()).bind(&torrent.state).bind(id).execute(&state.pool).await?;
+        let resource_info_hash: Option<String> = row.get("resource_info_hash");
+        let resource_download_url: Option<String> = row.get("resource_download_url");
+        let candidate_hashes = [
+            qbit_hash.as_deref().and_then(normalize_hash),
+            resource_info_hash.as_deref().and_then(normalize_hash),
+            resource_download_url.as_deref().and_then(magnet_hash),
+        ];
+        let torrent = torrents.iter().find(|item| {
+            normalize_hash(&item.hash).is_some_and(|hash| {
+                candidate_hashes
+                    .iter()
+                    .flatten()
+                    .any(|candidate| candidate == &hash)
+            })
+        });
+        if let Some(torrent) = torrent {
+            let complete =
+                torrent_state_is_complete(torrent.progress, torrent.completion_on, &torrent.state);
+            let mut target_state = reconciled_acquisition_state(&state_name, complete);
+            if target_state.is_some() {
+                let conflict: Option<i64> = sqlx::query_scalar("SELECT id FROM acquisition WHERE media_id = ? AND id != ? AND state NOT IN ('COMPLETED','CANCELLED','NEEDS_ATTENTION') ORDER BY id DESC LIMIT 1")
+                    .bind(media_id).bind(id).fetch_optional(&state.pool).await?;
+                if conflict.is_some() {
+                    target_state = None;
+                }
+            }
+            let download_path = Path::new(&torrent.save_path)
+                .join(&torrent.name)
+                .to_string_lossy()
+                .to_string();
+            let mut tx = state.pool.begin().await?;
+            sqlx::query("UPDATE acquisition SET qbit_hash = ?, progress = ?, download_speed = ?, eta_seconds = ?, download_path = ?, qbit_state = ?, qbit_missing_since = NULL, updated_at = datetime('now') WHERE id = ?")
+                .bind(&torrent.hash).bind(torrent.progress).bind(torrent.download_speed).bind(torrent.eta).bind(download_path).bind(&torrent.state).bind(id).execute(&mut *tx).await?;
+            let mut changed_to = None;
+            if let Some(target) = target_state {
+                let message = if target == "DOWNLOADED" {
+                    "qBittorrent 下载已完成，准备整理".to_string()
+                } else {
+                    format!("已按 qBittorrent 状态恢复同步：{}", torrent.state)
+                };
+                let changed = sqlx::query("UPDATE acquisition SET state = ?, state_message = ?, last_error = NULL, updated_at = datetime('now') WHERE id = ? AND state = ?")
+                    .bind(target).bind(&message).bind(id).bind(&state_name).execute(&mut *tx).await?;
+                if changed.rows_affected() != 0 {
+                    sqlx::query("UPDATE attention_item SET status = 'resolved', resolved_at = datetime('now'), updated_at = datetime('now'), resolution_json = '{\"action\":\"qbit_reconciled\"}' WHERE acquisition_id = ? AND status = 'open' AND kind = 'qbit_task_missing'")
+                        .bind(id).execute(&mut *tx).await?;
+                    let key = format!(
+                        "qbit-reconciled-{}-{}",
+                        target.to_lowercase(),
+                        chrono_like_nonce()
+                    );
+                    insert_event(
+                        &mut tx,
+                        id,
+                        &key,
+                        Some(&state_name),
+                        target,
+                        &message,
+                        json!({"qbitHash": &torrent.hash, "qbitState": &torrent.state}),
+                    )
+                    .await?;
+                    changed_to = Some((target.to_string(), message));
+                }
+            }
+            tx.commit().await?;
             emit(
                 state,
                 "acquisition.progress",
-                json!({"acquisitionId": id, "progress": torrent.progress, "downloadSpeed": torrent.download_speed, "etaSeconds": torrent.eta}),
+                json!({"acquisitionId": id, "progress": torrent.progress, "downloadSpeed": torrent.download_speed, "etaSeconds": torrent.eta, "qbitState": torrent.state}),
             );
-            let complete = torrent.progress >= 0.9999
-                || torrent.completion_on > 0
-                || matches!(
-                    torrent.state.as_str(),
-                    "uploading" | "stalledUP" | "pausedUP" | "queuedUP" | "forcedUP"
-                );
-            if complete && state_name == "DOWNLOADING" {
-                transition(
+            if let Some((target, message)) = changed_to {
+                emit(
                     state,
-                    id,
-                    "DOWNLOADED",
-                    "下载完成，准备整理",
-                    json!({"qbitState": torrent.state}),
-                )
-                .await?;
-                let state = state.clone();
-                tokio::spawn(async move {
-                    process_acquisition(&state, id).await;
-                });
+                    "acquisition.state",
+                    json!({"acquisitionId": id, "from": state_name, "to": target, "message": message}),
+                );
+                if target == "DOWNLOADED" {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        process_acquisition(&state, id).await;
+                    });
+                }
             }
-        } else if state_name == "DOWNLOADING" {
+        } else if qbit_hash.is_some() && state_name != "COMPLETED" {
             sqlx::query("UPDATE acquisition SET qbit_state = 'missing', download_speed = 0, eta_seconds = NULL, qbit_missing_since = COALESCE(qbit_missing_since, datetime('now')), updated_at = datetime('now') WHERE id = ?")
                 .bind(id).execute(&state.pool).await?;
             emit(
@@ -696,22 +753,48 @@ pub async fn reconcile_active(state: &AppState) -> anyhow::Result<()> {
                 "acquisition.progress",
                 json!({"acquisitionId": id, "qbitState": "missing"}),
             );
-            let missing_too_long: i64 = sqlx::query_scalar("SELECT CASE WHEN (julianday('now') - julianday(qbit_missing_since)) * 86400 >= 90 THEN 1 ELSE 0 END FROM acquisition WHERE id = ?")
-                .bind(id).fetch_one(&state.pool).await?;
-            if missing_too_long != 0 {
-                let _ = needs_attention(
-                    state,
-                    id,
-                    "qbit_task_missing",
-                    "qBittorrent 中找不到任务",
-                    "下载任务已连续 90 秒不在 qBittorrent 列表中，请重试或取消。",
-                    vec!["retry", "cancel"],
-                )
-                .await;
+            if state_name == "DOWNLOADING" {
+                let missing_too_long: i64 = sqlx::query_scalar("SELECT CASE WHEN (julianday('now') - julianday(qbit_missing_since)) * 86400 >= 90 THEN 1 ELSE 0 END FROM acquisition WHERE id = ?")
+                    .bind(id).fetch_one(&state.pool).await?;
+                if missing_too_long != 0 {
+                    let _ = needs_attention(
+                        state,
+                        id,
+                        "qbit_task_missing",
+                        "qBittorrent 中找不到任务",
+                        "下载任务已连续 90 秒不在 qBittorrent 列表中，请重试或取消。",
+                        vec!["retry", "cancel"],
+                    )
+                    .await;
+                }
             }
         }
     }
     Ok(())
+}
+
+fn torrent_state_is_complete(progress: f64, completion_on: i64, state: &str) -> bool {
+    progress >= 0.9999
+        || completion_on > 0
+        || matches!(
+            state,
+            "uploading" | "stalledUP" | "pausedUP" | "queuedUP" | "forcedUP"
+        )
+}
+
+fn reconciled_acquisition_state(current: &str, complete: bool) -> Option<&'static str> {
+    if matches!(
+        current,
+        "COMPLETED" | "DOWNLOADED" | "PROCESSING" | "METADATA" | "LIBRARY_COMMIT"
+    ) {
+        return None;
+    }
+    let target = if complete {
+        "DOWNLOADED"
+    } else {
+        "DOWNLOADING"
+    };
+    (current != target).then_some(target)
 }
 
 pub async fn recover(state: &AppState) -> anyhow::Result<()> {
@@ -3162,6 +3245,32 @@ mod tests {
         assert!(legal_transition("DOWNLOADING", "NEEDS_ATTENTION"));
         assert!(!legal_transition("REQUESTED", "COMPLETED"));
         assert!(!legal_transition("COMPLETED", "CANCELLED"));
+    }
+
+    #[test]
+    fn qbit_reconciliation_revives_cancelled_or_attention_downloads() {
+        assert_eq!(
+            reconciled_acquisition_state("CANCELLED", false),
+            Some("DOWNLOADING")
+        );
+        assert_eq!(
+            reconciled_acquisition_state("NEEDS_ATTENTION", false),
+            Some("DOWNLOADING")
+        );
+        assert_eq!(
+            reconciled_acquisition_state("CANCELLED", true),
+            Some("DOWNLOADED")
+        );
+        assert_eq!(reconciled_acquisition_state("DOWNLOADING", false), None);
+        assert_eq!(reconciled_acquisition_state("PROCESSING", false), None);
+        assert_eq!(reconciled_acquisition_state("COMPLETED", false), None);
+    }
+
+    #[test]
+    fn qbit_completion_recognizes_seeding_states() {
+        assert!(torrent_state_is_complete(0.5, 0, "stalledUP"));
+        assert!(torrent_state_is_complete(1.0, 0, "pausedDL"));
+        assert!(!torrent_state_is_complete(0.5, 0, "stalledDL"));
     }
 
     #[test]

@@ -102,7 +102,7 @@ onUnmounted(() => { prefersDark.removeEventListener('change', onSystemTheme); wi
         <main class="main-panel">
           <header class="topbar">
             <n-button class="mobile-menu" quaternary circle aria-label="打开菜单" @click="mobileOpen = true"><template #icon><IconMenu2 /></template></n-button>
-            <div class="global-search"><IconSearch :size="17" /><n-input v-model:value="searchText" borderless clearable placeholder="搜索番号、标题或演员" aria-label="全局搜索" @keyup.enter="submitSearch" /></div>
+            <div class="global-search"><IconSearch :size="17" /><n-input v-model:value="searchText" :bordered="false" clearable placeholder="搜索番号、标题或演员" aria-label="全局搜索" @keyup.enter="submitSearch" /></div>
             <span class="topbar-service"><i class="status-dot" :class="{ online: status?.luma.connected }" />{{ status?.luma.connected ? '系统正常' : '连接异常' }}</span>
             <n-button quaternary circle :aria-label="isDark ? '切换到浅色模式' : '切换到深色模式'" @click="toggleTheme"><template #icon><IconSun v-if="isDark" /><IconMoon v-else /></template></n-button>
           </header>

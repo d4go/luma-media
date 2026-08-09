@@ -11,7 +11,7 @@ const message = useMessage()
 let events: EventSource | null = null
 async function load() { try { data.value = await api.home() } catch (reason) { message.error(reason instanceof Error ? reason.message : '首页加载失败') } finally { loading.value = false } }
 function stateLabel(value: string, qbitState?: string | null) {
-  if (value === 'DOWNLOADING' && qbitState) {
+  if (['DOWNLOADING', 'QUEUED', 'NEEDS_ATTENTION', 'CANCELLED'].includes(value) && qbitState) {
     const state = qbitState.toLocaleLowerCase()
     if (state === 'missing') return 'qB 中已删除'
     if (state.includes('paused')) return '已暂停'
