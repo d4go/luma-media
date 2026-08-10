@@ -68,17 +68,21 @@ pub fn parse_magnet_candidates(
     let mut raw = Vec::<(String, String)>::new();
     let document = scraper::Html::parse_document(html);
     if let Ok(selector) = scraper::Selector::parse(
-        "a[href^='magnet:'], [data-clipboard-text^='magnet:'], [data-magnet^='magnet:']",
+        "a[href*='magnet:?'], [data-clipboard-text*='magnet:?'], [data-magnet*='magnet:?'], [onclick*='magnet:?']",
     ) {
         for element in document.select(&selector) {
-            let url = element
+            let value = element
                 .value()
                 .attr("href")
                 .or_else(|| element.value().attr("data-clipboard-text"))
                 .or_else(|| element.value().attr("data-magnet"))
+                .or_else(|| element.value().attr("onclick"))
                 .unwrap_or_default();
+            let Some(url) = extract_magnet_value(value) else {
+                continue;
+            };
             let title = element.text().collect::<Vec<_>>().join(" ");
-            raw.push((url.to_owned(), title));
+            raw.push((url, title));
         }
     }
     let mut cursor = 0;
@@ -111,14 +115,21 @@ pub fn parse_magnet_candidates(
         let Some(info_hash) = magnet_hash(&url) else {
             continue;
         };
+        let title = clean_resource_label(&title, default_label);
         if let Some(existing) = resources
             .iter_mut()
             .find(|candidate: &&mut ResourceCandidate| {
                 candidate.info_hash.as_deref() == Some(&info_hash)
             })
         {
-            if title.trim().len() > existing.title.len() {
-                existing.title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+            if resource_label_score(&title, default_label)
+                > resource_label_score(&existing.title, default_label)
+            {
+                let size_bytes = parse_size_bytes(&title);
+                existing.title = title;
+                if size_bytes.is_some() {
+                    existing.size_bytes = size_bytes;
+                }
             }
             continue;
         }
@@ -134,11 +145,8 @@ pub fn parse_magnet_candidates(
         resources.push(ResourceCandidate {
             provider_resource_id: Some(format!("btih:{info_hash}")),
             download_url: url,
-            title: if title.trim().is_empty() {
-                default_label.to_owned()
-            } else {
-                title.split_whitespace().collect::<Vec<_>>().join(" ")
-            },
+            size_bytes: parse_size_bytes(&title),
+            title,
             info_hash: Some(info_hash),
             trackers,
             source_url: source_url.to_owned(),
@@ -147,6 +155,66 @@ pub fn parse_magnet_candidates(
         });
     }
     resources
+}
+
+fn extract_magnet_value(value: &str) -> Option<String> {
+    let value = html_unescape(value);
+    let start = value.find("magnet:?")?;
+    let tail = &value[start..];
+    let end = tail.find(['\'', '"', '<', ' ', ')']).unwrap_or(tail.len());
+    Some(tail[..end].to_owned())
+}
+
+fn clean_resource_label(value: &str, default_label: &str) -> String {
+    let label = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = label.to_ascii_lowercase();
+    if label.is_empty()
+        || label.len() > 160
+        || lower.contains("magnet:?")
+        || lower.contains("onclick=")
+        || lower.contains("text-align")
+        || label.contains(['<', '>'])
+    {
+        default_label.to_owned()
+    } else {
+        label
+    }
+}
+
+fn resource_label_score(label: &str, default_label: &str) -> usize {
+    if label == default_label {
+        return 0;
+    }
+    if ["download", "copy", "下载", "下載", "复制", "複製"]
+        .iter()
+        .any(|generic| label.eq_ignore_ascii_case(generic))
+    {
+        return 1;
+    }
+    10 + label.chars().take(100).count()
+}
+
+fn parse_size_bytes(label: &str) -> Option<i64> {
+    for token in label.split_whitespace() {
+        let token = token
+            .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '.')
+            .to_ascii_uppercase();
+        for (suffix, multiplier) in [
+            ("TB", 1024_f64.powi(4)),
+            ("GB", 1024_f64.powi(3)),
+            ("MB", 1024_f64.powi(2)),
+            ("KB", 1024_f64),
+        ] {
+            if let Some(number) = token.strip_suffix(suffix)
+                && let Ok(value) = number.parse::<f64>()
+                && value.is_finite()
+                && value >= 0.0
+            {
+                return Some((value * multiplier).round() as i64);
+            }
+        }
+    }
+    None
 }
 
 pub fn extract_js_value(html: &str, name: &str) -> Option<String> {
@@ -206,5 +274,19 @@ mod tests {
         assert_eq!(extract_js_value(html, "gid").as_deref(), Some("12345"));
         assert_eq!(extract_js_value(html, "uc").as_deref(), Some("0"));
         assert_eq!(extract_js_value(html, "img").as_deref(), Some("/cover.jpg"));
+    }
+
+    #[test]
+    fn extracts_javbus_onclick_magnet_without_html_in_title() {
+        let html = r#"<a style="text-align:center;white-space:nowrap" onclick="window.open('magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&amp;dn=ABC-123','_self')">4.57GB</a>"#;
+        let resources =
+            parse_magnet_candidates(html, "JavBus resource", "https://source.test/item");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].title, "4.57GB");
+        assert_eq!(resources[0].size_bytes, Some(4_907_000_136));
+        assert_eq!(
+            resources[0].download_url,
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=ABC-123"
+        );
     }
 }
