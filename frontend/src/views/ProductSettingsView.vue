@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
   NAlert,
   NButton,
@@ -13,6 +13,7 @@ import {
   useMessage,
 } from 'naive-ui'
 import {
+  IconArrowRight,
   IconBrandPython,
   IconCheck,
   IconDatabase,
@@ -48,6 +49,8 @@ const browserSessionBusy = ref('')
 const page = ref(1)
 const pageSize = ref(20)
 const providers = ref<Paged<ProviderConfig>>({ items: [], total: 0, page: 1, pageSize: 20, totalPages: 0 })
+const providerModalOpen = ref(false)
+const selectedProviderKey = ref('')
 const providerRuntimes = reactive<Record<string, ProviderRuntime>>({})
 const browserSessions = reactive<Record<string, BrowserSession>>({})
 const secrets = reactive<Record<string, string>>({})
@@ -89,6 +92,8 @@ const product = reactive<ProductSettings>({
 
 const providerMap = computed(() => Object.fromEntries(providers.value.items.map(item => [item.key, item])))
 const sourceProviders = computed(() => providers.value.items.filter(item => item.type === 'source'))
+const selectedProvider = computed(() => (selectedProviderKey.value ? providerMap.value[selectedProviderKey.value] ?? null : null))
+const providerModalTitle = computed(() => selectedProvider.value?.displayName ?? '来源详情')
 const selectedSourceAdapter = computed(() => sourceAdapterOptions.find(item => item.value === newSource.adapter) ?? sourceAdapterOptions[0])
 
 function sourceAdapter(provider: ProviderConfig) {
@@ -254,6 +259,10 @@ async function load() {
 
 function changePage(value: number) { page.value = value; load() }
 function changePageSize(value: number) { pageSize.value = value; page.value = 1; load() }
+function openProvider(key: string) { selectedProviderKey.value = key; providerModalOpen.value = true }
+watch(selectedProvider, value => {
+  if (providerModalOpen.value && !value) providerModalOpen.value = false
+})
 
 async function persistProvider(provider: ProviderConfig) {
   const updated = await api.updateProvider(provider.key, {
@@ -302,6 +311,7 @@ async function addSource() {
     const created = await api.createProvider({ ...newSource })
     providers.value.items.push(created)
     providers.value.total += 1
+    openProvider(created.key)
     selectSourceAdapter(newSource.adapter)
     showNewSource.value = false
     message.success('来源已添加')
@@ -322,6 +332,7 @@ function removeSource(provider: ProviderConfig) {
       await api.deleteProvider(provider.key)
       providers.value.items = providers.value.items.filter(item => item.key !== provider.key)
       providers.value.total = Math.max(0, providers.value.total - 1)
+      if (selectedProviderKey.value === provider.key) providerModalOpen.value = false
       message.success('来源已移除')
     },
   })
@@ -568,18 +579,34 @@ onUnmounted(() => {
           </div>
         </article>
 
-        <div class="provider-card-grid source-provider-grid">
-          <article v-for="provider in sourceProviders" :key="provider.key" class="provider-card">
-            <header>
-              <span class="provider-icon"><IconDatabase /></span>
-              <div><strong>{{ provider.displayName }}</strong><small>{{ sourceAdapterName(provider) }} · {{ provider.key }}</small></div>
-              <div class="provider-header-actions">
-                <n-switch :value="provider.enabled" @update:value="value => toggleProvider(provider, value)" />
-                <n-button quaternary circle type="error" title="移除来源" @click="removeSource(provider)">
-                  <template #icon><IconTrash /></template>
-                </n-button>
-              </div>
-            </header>
+        <div class="source-provider-list">
+          <button v-for="provider in sourceProviders" :key="provider.key" type="button" class="source-provider-row" @click="openProvider(provider.key)">
+            <span class="provider-icon"><IconDatabase /></span>
+            <span class="source-row-copy"><strong>{{ provider.displayName }}</strong><small>{{ sourceAdapterName(provider) }} · {{ provider.key }}</small></span>
+            <span class="source-row-status">
+              <span class="source-sync-status" :data-status="provider.syncStatus">{{ syncStatusLabel[provider.syncStatus] }}</span>
+              <span v-if="providerRuntimes[provider.key]" class="source-sync-status" :data-status="providerRuntimes[provider.key].state">{{ runtimeStateLabel[providerRuntimes[provider.key].state] }}</span>
+            </span>
+            <span class="source-row-meta">{{ sourceSyncEnabled(provider) ? `下次执行 ${syncDate(provider.syncNextRunAt, '等待安排')}` : '同步已关闭' }}</span>
+            <IconArrowRight :size="16" class="source-row-arrow" />
+          </button>
+          <div v-if="!sourceProviders.length" class="quiet-empty compact"><IconDatabase :size="24" /><strong>还没有内容来源</strong><span>点击右上角“添加来源”开始建立本地索引。</span></div>
+        </div>
+        <PaginationBar v-if="providers.total > 0" :page="page" :page-size="pageSize" :total="providers.total" @update:page="changePage" @update:page-size="changePageSize" />
+
+        <n-modal v-model:show="providerModalOpen" preset="card" class="provider-detail-modal" :title="providerModalTitle" :bordered="false" style="width:min(760px,calc(100vw - 32px))">
+          <template v-for="provider in [selectedProvider]" :key="provider?.key">
+            <div v-if="provider" class="provider-card provider-card-modal">
+              <header>
+                <span class="provider-icon"><IconDatabase /></span>
+                <div><strong>{{ provider.displayName }}</strong><small>{{ sourceAdapterName(provider) }} · {{ provider.key }}</small></div>
+                <div class="provider-header-actions">
+                  <n-switch :value="provider.enabled" @update:value="value => toggleProvider(provider, value)" />
+                  <n-button quaternary circle type="error" title="移除来源" @click="removeSource(provider)">
+                    <template #icon><IconTrash /></template>
+                  </n-button>
+                </div>
+              </header>
             <n-form-item label="来源名称"><n-input v-model:value="provider.displayName" /></n-form-item>
             <n-form-item label="服务地址"><n-input v-model:value="provider.baseUrl" /></n-form-item>
             <n-form-item label="访问方式">
@@ -785,9 +812,9 @@ onUnmounted(() => {
             <n-alert v-if="testMessages[provider.key]" :type="testMessages[provider.key].ok ? 'success' : 'error'">
               {{ testMessages[provider.key].text }}
             </n-alert>
-          </article>
-        </div>
-        <PaginationBar v-if="providers.total > 0" :page="page" :page-size="pageSize" :total="providers.total" @update:page="changePage" @update:page-size="changePageSize" />
+            </div>
+          </template>
+        </n-modal>
       </section>
 
       <section class="settings-group">
