@@ -155,10 +155,20 @@ async fn run_one_step(
     {
         Ok(Some(item)) => item,
         Ok(None) => {
-            let _ = state
+            let has_pending = state
                 .task_engine
-                .release_run(run_id, owner, JobStatus::Success)
-                .await;
+                .run_has_any_pending(run_id)
+                .await
+                .unwrap_or(false);
+            let to = if has_pending {
+                JobStatus::Pending
+            } else {
+                match state.task_engine.run_stats(run_id).await {
+                    Ok(stats) if stats.failed > 0 => JobStatus::Failed,
+                    _ => JobStatus::Success,
+                }
+            };
+            let _ = state.task_engine.release_run(run_id, owner, to).await;
             return StepOutcome::Stop;
         }
         Err(error) => {

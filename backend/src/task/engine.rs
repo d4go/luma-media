@@ -382,6 +382,19 @@ impl TaskEngine {
         Ok(pending != 0)
     }
 
+    /// Whether the run still has pending items, including items parked for a
+    /// future retry. Used by the runner to decide between "keep the run open"
+    /// and "the run is drained".
+    pub async fn run_has_any_pending(&self, run_id: i64) -> sqlx::Result<bool> {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM job_item WHERE run_id=? AND status='pending')",
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(pending != 0)
+    }
+
     /// Reset failed items of a run back to pending for a "retry failed only"
     /// pass. Returns the number of items requeued.
     pub async fn requeue_failed_items(&self, run_id: i64) -> anyhow::Result<i64> {
@@ -745,5 +758,29 @@ mod tests {
         let item = engine.item_by_id(item.id).await.unwrap();
         assert_eq!(item.status, JobItemStatus::Pending);
         assert_eq!(item.retry_count, 0);
+    }
+
+    #[tokio::test]
+    async fn retried_item_keeps_run_open() {
+        let engine = engine().await;
+        let run = engine.create_run(input("bootstrap:javdb:2027")).await.unwrap();
+        engine.create_item(run.id, "page-1", json!({})).await.unwrap();
+        let item = engine
+            .claim_next_item(run.id, "worker-a", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        engine
+            .retry_item(item.id, "worker-a", Duration::from_secs(60), Some("boom"))
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .claim_next_item(run.id, "worker-a", Duration::from_secs(60))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(engine.run_has_any_pending(run.id).await.unwrap());
     }
 }
