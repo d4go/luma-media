@@ -8,7 +8,10 @@ use serde::Serialize;
 use crate::{
     AppState,
     error::{AppError, AppResult},
-    fetch::{BrowserSessionView, FetchFailureKind, FetchMode, FetchRequest, PageKind},
+    fetch::{
+        BrowserSessionView, FetchError, FetchFailureKind, FetchMethod, FetchMode, FetchRequest,
+        FetchResponse, PageKind,
+    },
 };
 
 use super::{SourceProviderConfig, runtime};
@@ -237,15 +240,7 @@ async fn diagnose_mode(
     mode: FetchMode,
     url: reqwest::Url,
 ) -> DiagnoseAttempt {
-    match state
-        .fetch_manager
-        .fetch(
-            mode,
-            FetchRequest::get(&provider.key, url),
-            &provider.transport(),
-        )
-        .await
-    {
+    match fetch_for_diagnose(state, provider, mode, url).await {
         Ok(response) => {
             let page_kind = state
                 .provider_registry
@@ -282,6 +277,105 @@ async fn diagnose_mode(
                 failure_kind: Some(error.kind),
             }
         }
+    }
+}
+
+async fn fetch_for_diagnose(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    mode: FetchMode,
+    url: reqwest::Url,
+) -> Result<FetchResponse, FetchError> {
+    let mut transport = provider.transport();
+    if provider.adapter != "javbus" || mode != FetchMode::Http {
+        return state
+            .fetch_manager
+            .fetch(mode, FetchRequest::get(&provider.key, url), &transport)
+            .await;
+    }
+
+    transport.cookie = Some(javbus_cookie(transport.cookie.as_deref(), &[]));
+    let response = state
+        .fetch_manager
+        .fetch(
+            mode,
+            FetchRequest::get(&provider.key, url.clone()),
+            &transport,
+        )
+        .await?;
+    if state
+        .provider_registry
+        .classify(&provider.adapter, &response)
+        != PageKind::AgeGate
+    {
+        return Ok(response);
+    }
+
+    let mut verify_url =
+        reqwest::Url::parse(provider.base_url.trim_end_matches('/')).map_err(|error| {
+            FetchError::new(
+                &provider.key,
+                FetchFailureKind::InvalidContent,
+                error.to_string(),
+                None,
+            )
+        })?;
+    verify_url.set_path("/doc/driver-verify");
+    verify_url
+        .query_pairs_mut()
+        .append_pair("referer", url.path());
+    let verification = state
+        .fetch_manager
+        .fetch(
+            mode,
+            FetchRequest {
+                provider_key: provider.key.clone(),
+                url: verify_url,
+                method: FetchMethod::Post,
+                headers: reqwest::header::HeaderMap::new(),
+                referer: Some(url.clone()),
+                body: Some("Submit=confirm".into()),
+                timeout: std::time::Duration::from_secs(20),
+            },
+            &transport,
+        )
+        .await?;
+    let session = verification
+        .headers
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .collect::<Vec<_>>();
+    transport.cookie = Some(javbus_cookie(
+        provider.transport().cookie.as_deref(),
+        &session,
+    ));
+    state
+        .fetch_manager
+        .fetch(mode, FetchRequest::get(&provider.key, url), &transport)
+        .await
+}
+
+fn javbus_cookie(configured: Option<&str>, session: &[&str]) -> String {
+    let mut cookies = vec!["age=verified", "existmag=all"];
+    if let Some(configured) = configured.filter(|value| !value.trim().is_empty()) {
+        cookies.push(configured.trim());
+    }
+    cookies.extend(session.iter().copied());
+    cookies.join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::javbus_cookie;
+
+    #[test]
+    fn javbus_diagnose_keeps_age_and_session_cookies() {
+        assert_eq!(
+            javbus_cookie(Some("PHPSESSID=stored"), &["PHPSESSID=fresh"]),
+            "age=verified; existmag=all; PHPSESSID=stored; PHPSESSID=fresh"
+        );
     }
 }
 
