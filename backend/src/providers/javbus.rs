@@ -25,9 +25,6 @@ impl ProviderAdapter for JavBusAdapter {
         {
             return PageKind::AgeGate;
         }
-        if lower.contains("challenge-platform") || lower.contains("just a moment") {
-            return PageKind::InteractionRequired;
-        }
         if contains_selector(
             &response.body,
             &[
@@ -36,8 +33,11 @@ impl ProviderAdapter for JavBusAdapter {
                 "meta[property='og:title']",
                 "a[href*='/ajax/uncledatoolsbyajax.php']",
             ],
-        ) || lower.contains("javbus")
-        {
+        ) {
+            PageKind::ValidContent
+        } else if lower.contains("challenge-platform") || lower.contains("just a moment") {
+            PageKind::InteractionRequired
+        } else if lower.contains("javbus") {
             PageKind::ValidContent
         } else {
             PageKind::InvalidContent

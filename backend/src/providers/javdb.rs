@@ -20,9 +20,6 @@ impl ProviderAdapter for JavDbAdapter {
             return kind;
         }
         let lower = response.body.to_ascii_lowercase();
-        if lower.contains("challenge-platform") || lower.contains("just a moment") {
-            return PageKind::InteractionRequired;
-        }
         if lower.contains("age verification") || lower.contains("年齡確認") {
             return PageKind::AgeGate;
         }
@@ -31,6 +28,8 @@ impl ProviderAdapter for JavDbAdapter {
             &["a[href*='/v/']", ".video-title", ".movie-panel-info"],
         ) {
             PageKind::ValidContent
+        } else if lower.contains("challenge-platform") || lower.contains("just a moment") {
+            PageKind::InteractionRequired
         } else {
             PageKind::InvalidContent
         }

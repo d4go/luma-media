@@ -5,6 +5,7 @@ services:
         dockerfile: Dockerfile
       image: luma:latest
       container_name: luma
+      init: true
       restart: unless-stopped
 
       ports:

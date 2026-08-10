@@ -20,14 +20,14 @@ impl ProviderAdapter for JavLibraryAdapter {
             return kind;
         }
         let lower = response.body.to_ascii_lowercase();
-        if lower.contains("challenge-platform") || lower.contains("just a moment") {
-            return PageKind::InteractionRequired;
-        }
         if contains_selector(
             &response.body,
             &["#video_title", ".video", "a[href*='v=jav']"],
-        ) || lower.contains("javlibrary")
-        {
+        ) {
+            PageKind::ValidContent
+        } else if lower.contains("challenge-platform") || lower.contains("just a moment") {
+            PageKind::InteractionRequired
+        } else if lower.contains("javlibrary") {
             PageKind::ValidContent
         } else {
             PageKind::InvalidContent

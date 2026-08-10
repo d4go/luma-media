@@ -108,5 +108,14 @@ mod tests {
             registry.classify("javdb", &response("<html>generic success page</html>")),
             PageKind::InvalidContent
         );
+        assert_eq!(
+            registry.classify(
+                "javdb",
+                &response(
+                    "<script src='/challenge-platform/widget.js'></script><a href='/v/abc'>ABC-123</a>",
+                ),
+            ),
+            PageKind::ValidContent
+        );
     }
 }
