@@ -191,6 +191,8 @@ mod tests {
             asset_root: root.join("assets"),
             script_root: root.join("crawlers"),
             events: tokio::sync::broadcast::channel(32).0,
+            fetch_manager: Arc::new(crate::fetch::FetchManager::default()),
+            provider_registry: Arc::new(crate::providers::ProviderRegistry::default()),
         };
         let watcher = start(state);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

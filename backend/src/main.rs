@@ -2,10 +2,12 @@ mod api;
 mod asset;
 mod crawler;
 mod error;
+mod fetch;
 mod metadata;
 mod models;
 mod product;
 mod provider;
+mod providers;
 mod qbittorrent;
 mod scanner;
 mod scheduler;
@@ -31,6 +33,8 @@ pub struct AppState {
     pub asset_root: PathBuf,
     pub script_root: PathBuf,
     pub events: broadcast::Sender<String>,
+    pub fetch_manager: Arc<fetch::FetchManager>,
+    pub provider_registry: Arc<providers::ProviderRegistry>,
 }
 
 #[tokio::main]
@@ -62,6 +66,8 @@ async fn main() -> anyhow::Result<()> {
         asset_root,
         script_root,
         events,
+        fetch_manager: Arc::new(fetch::FetchManager::default()),
+        provider_registry: Arc::new(providers::ProviderRegistry::default()),
     };
     scheduler::start(state.clone());
     let _watcher = watcher::start(state.clone());

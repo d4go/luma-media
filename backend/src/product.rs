@@ -20,6 +20,8 @@ use walkdir::WalkDir;
 use crate::{
     AppState,
     error::{AppError, AppResult},
+    fetch::{FetchError, FetchMethod, FetchRequest, FetchResponse, PageKind},
+    providers::{SourceMedia, SourceProviderConfig},
     qbittorrent::{QBittorrentClient, magnet_hash, normalize_hash},
     storage,
 };
@@ -1619,16 +1621,6 @@ fn default_source_adapter() -> String {
     "jav321".into()
 }
 
-fn source_adapter_label(adapter: &str) -> Option<&'static str> {
-    match adapter {
-        "jav321" => Some("Jav321"),
-        "javdb" => Some("JavDB"),
-        "javbus" => Some("JavBus"),
-        "javlibrary" => Some("JavLibrary"),
-        _ => None,
-    }
-}
-
 async fn create_provider(
     State(state): State<AppState>,
     Json(input): Json<CreateProviderInput>,
@@ -1637,7 +1629,7 @@ async fn create_provider(
         return Err(AppError::BadRequest("来源名称不能为空".into()));
     }
     let adapter = input.adapter.trim().to_ascii_lowercase();
-    if source_adapter_label(&adapter).is_none() {
+    if !state.provider_registry.contains(&adapter) {
         return Err(AppError::BadRequest(format!(
             "不支持的来源适配器：{}",
             input.adapter
@@ -1735,7 +1727,7 @@ async fn test_provider(
     let started = std::time::Instant::now();
     let source = source_provider_by_key(&state, &key).await?;
     let outcome: anyhow::Result<String> = if let Some(provider) = source {
-        source_probe(&provider)
+        source_probe(&state, &provider)
             .await
             .map(|_| format!("{} 可访问", provider.display_name))
     } else {
@@ -1869,7 +1861,7 @@ async fn synchronize_source_catalogue(
     state: &AppState,
     provider: &SourceProviderConfig,
 ) -> anyhow::Result<SourceSyncStats> {
-    let items = fetch_source_catalogue_with_retry(provider).await?;
+    let items = fetch_source_catalogue_with_retry(state, provider).await?;
     anyhow::ensure!(
         !items.is_empty(),
         "{} 首页没有解析出作品，已保留旧索引并停止本轮同步",
@@ -1953,19 +1945,18 @@ async fn synchronize_source_catalogue(
 }
 
 async fn fetch_source_catalogue_with_retry(
+    state: &AppState,
     provider: &SourceProviderConfig,
 ) -> anyhow::Result<Vec<SourceMedia>> {
     let mut last_error = None;
     for attempt in 0..3 {
-        match fetch_source_catalogue(provider).await {
+        match fetch_source_catalogue(state, provider).await {
             Ok(items) => return Ok(items),
             Err(error) => {
-                let message = error.to_string();
-                if message.contains("403")
-                    || message.contains("Cloudflare")
-                    || message.contains("验证")
-                    || attempt == 2
-                {
+                let retryable = error
+                    .downcast_ref::<FetchError>()
+                    .is_some_and(|error| error.kind.retryable());
+                if !retryable || attempt == 2 {
                     return Err(error);
                 }
                 last_error = Some(error);
@@ -1977,31 +1968,47 @@ async fn fetch_source_catalogue_with_retry(
 }
 
 async fn fetch_source_catalogue(
+    state: &AppState,
     provider: &SourceProviderConfig,
 ) -> anyhow::Result<Vec<SourceMedia>> {
     let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
     match provider.adapter.as_str() {
         "javbus" => {
-            let html = javbus_request_html(provider, base).await?;
-            Ok(parse_javbus_search_html(&html, "", &provider.base_url))
-        }
-        "javdb" => {
-            let (_, html) = source_get_html(provider, base).await?;
-            reject_cloudflare(&html, "JavDB")?;
-            Ok(parse_javdb_search_html(&html, "", &provider.base_url))
-        }
-        "jav321" => {
-            let (final_url, html) = source_get_html(provider, base).await?;
-            Ok(parse_jav321_html(&html, "", &provider.base_url, &final_url))
-        }
-        "javlibrary" => {
-            let (final_url, html) = source_get_html(provider, base).await?;
-            reject_cloudflare(&html, "JavLibrary")?;
-            Ok(parse_javlibrary_html(
-                &html,
+            let response = javbus_request(state, provider, base).await?;
+            ensure_provider_content(state, provider, &response)?;
+            Ok(parse_javbus_search_html(
+                &response.body,
                 "",
                 &provider.base_url,
-                &final_url,
+            ))
+        }
+        "javdb" => {
+            let response = source_fetch(state, provider, base).await?;
+            ensure_provider_content(state, provider, &response)?;
+            Ok(parse_javdb_search_html(
+                &response.body,
+                "",
+                &provider.base_url,
+            ))
+        }
+        "jav321" => {
+            let response = source_fetch(state, provider, base).await?;
+            ensure_provider_content(state, provider, &response)?;
+            Ok(parse_jav321_html(
+                &response.body,
+                "",
+                &provider.base_url,
+                &response.final_url,
+            ))
+        }
+        "javlibrary" => {
+            let response = source_fetch(state, provider, base).await?;
+            ensure_provider_content(state, provider, &response)?;
+            Ok(parse_javlibrary_html(
+                &response.body,
+                "",
+                &provider.base_url,
+                &response.final_url,
             ))
         }
         adapter => anyhow::bail!("不支持的来源适配器：{adapter}"),
@@ -2170,20 +2177,6 @@ async fn load_product_settings(state: &AppState) -> AppResult<ProductSettings> {
     })
 }
 
-#[derive(Debug, Clone)]
-struct SourceProviderConfig {
-    key: String,
-    display_name: String,
-    base_url: String,
-    secret: String,
-    adapter: String,
-    proxy_url: String,
-    user_agent: String,
-    sync_enabled: bool,
-    sync_interval_minutes: i64,
-    sync_detail_limit: usize,
-}
-
 async fn source_provider_by_key(
     state: &AppState,
     key: &str,
@@ -2194,142 +2187,51 @@ async fn source_provider_by_key(
     .bind(key)
     .fetch_optional(&state.pool)
     .await?;
-    Ok(row.as_ref().map(source_provider_from_row))
+    Ok(row.as_ref().map(SourceProviderConfig::from_row))
 }
 
 fn source_provider_from_row(row: &sqlx::sqlite::SqliteRow) -> SourceProviderConfig {
-    let config = parse_json(&row.get::<String, _>("config_json"), json!({}));
-    SourceProviderConfig {
-        key: row.get("provider_key"),
-        display_name: row.get("display_name"),
-        base_url: row.get("base_url"),
-        secret: row.get("secret"),
-        adapter: config
-            .get("adapter")
-            .and_then(Value::as_str)
-            .unwrap_or("javbus")
-            .to_owned(),
-        proxy_url: config
-            .get("proxyUrl")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_owned(),
-        user_agent: config
-            .get("userAgent")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_owned(),
-        sync_enabled: config
-            .get("syncEnabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-        sync_interval_minutes: config
-            .get("syncIntervalMinutes")
-            .and_then(Value::as_i64)
-            .unwrap_or(1440)
-            .clamp(60, 10080),
-        sync_detail_limit: config
-            .get("syncDetailLimit")
-            .and_then(Value::as_u64)
-            .unwrap_or(8)
-            .min(40) as usize,
-    }
+    SourceProviderConfig::from_row(row)
 }
 
-async fn source_probe(provider: &SourceProviderConfig) -> anyhow::Result<()> {
-    match provider.adapter.as_str() {
-        "javbus" => {
-            let base = reqwest::Url::parse(&provider.base_url)?;
-            let html = javbus_request_html(provider, base).await?;
-            if !html.to_ascii_lowercase().contains("javbus") {
-                anyhow::bail!("响应内容不是 JavBus 页面");
-            }
-            Ok(())
-        }
-        "javdb" => {
-            let (_, html) =
-                source_get_html(provider, reqwest::Url::parse(&provider.base_url)?).await?;
-            reject_cloudflare(&html, "JavDB")?;
-            if !html.to_ascii_lowercase().contains("javdb") {
-                anyhow::bail!("响应内容不是 JavDB 页面");
-            }
-            Ok(())
-        }
-        "jav321" => {
-            let (_, html) =
-                source_get_html(provider, reqwest::Url::parse(&provider.base_url)?).await?;
-            if !html.to_ascii_lowercase().contains("jav321") {
-                anyhow::bail!("响应内容不是 Jav321 页面");
-            }
-            Ok(())
-        }
-        "javlibrary" => {
-            let (_, html) =
-                source_get_html(provider, reqwest::Url::parse(&provider.base_url)?).await?;
-            reject_cloudflare(&html, "JavLibrary")?;
-            if !html.to_ascii_lowercase().contains("javlibrary") {
-                anyhow::bail!("响应内容不是 JavLibrary 页面");
-            }
-            Ok(())
-        }
-        adapter => anyhow::bail!("不支持的来源适配器：{adapter}"),
-    }
-}
-
-const DEFAULT_SOURCE_USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/127 Safari/537.36 Luma/1.0";
-
-fn source_client(provider: &SourceProviderConfig) -> anyhow::Result<reqwest::Client> {
-    let user_agent = if provider.user_agent.is_empty() {
-        DEFAULT_SOURCE_USER_AGENT
+async fn source_probe(state: &AppState, provider: &SourceProviderConfig) -> anyhow::Result<()> {
+    let base = reqwest::Url::parse(&provider.base_url)?;
+    let response = if provider.adapter == "javbus" {
+        javbus_request(state, provider, base).await?
     } else {
-        &provider.user_agent
+        source_fetch(state, provider, base).await?
     };
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent(user_agent);
-    if !provider.proxy_url.is_empty() {
-        builder = builder.proxy(reqwest::Proxy::all(&provider.proxy_url)?);
-    }
-    Ok(builder.build()?)
+    ensure_provider_content(state, provider, &response)
 }
 
-async fn source_get_html(
+async fn source_fetch(
+    state: &AppState,
     provider: &SourceProviderConfig,
     url: reqwest::Url,
-) -> anyhow::Result<(reqwest::Url, String)> {
-    let mut request = source_client(provider)?.get(url);
-    if !provider.secret.trim().is_empty() {
-        request = request.header(reqwest::header::COOKIE, provider.secret.trim());
-    }
-    let response = request.send().await?;
-    reject_source_status(provider, &response)?;
-    let final_url = response.url().clone();
-    Ok((final_url, response.text().await?))
+) -> anyhow::Result<FetchResponse> {
+    Ok(state
+        .fetch_manager
+        .fetch(
+            provider.fetch_mode,
+            FetchRequest::get(&provider.key, url),
+            &provider.transport(),
+        )
+        .await?)
 }
 
-fn reject_source_status(
+fn ensure_provider_content(
+    state: &AppState,
     provider: &SourceProviderConfig,
-    response: &reqwest::Response,
+    response: &FetchResponse,
 ) -> anyhow::Result<()> {
-    if response.status() == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!(
-            "{} 返回 403：网络已经连通，但站点拒绝了自动请求。请配置容器可访问的代理 URL，并填写与获取 Cookie 时完全一致的浏览器 User-Agent 和完整 Cookie；也可以更换可用镜像。",
-            provider.display_name
-        );
-    }
-    response.error_for_status_ref()?;
-    Ok(())
-}
-
-fn reject_cloudflare(html: &str, name: &str) -> anyhow::Result<()> {
-    if html.contains("challenge-platform") || html.contains("Just a moment...") {
-        anyhow::bail!(
-            "{name} 触发 Cloudflare 验证，请填写浏览器中的 cf_clearance Cookie 或更换镜像"
-        );
-    }
+    let kind = state
+        .provider_registry
+        .classify(&provider.adapter, response);
+    anyhow::ensure!(
+        kind == PageKind::ValidContent,
+        "{} returned {kind:?} instead of valid provider content",
+        provider.display_name
+    );
     Ok(())
 }
 
@@ -2556,21 +2458,24 @@ fn javbus_cookie(provider: &SourceProviderConfig, session: &[String]) -> String 
     parts.join("; ")
 }
 
-async fn javbus_request_html(
+async fn javbus_request(
+    state: &AppState,
     provider: &SourceProviderConfig,
     url: reqwest::Url,
-) -> anyhow::Result<String> {
-    let client = source_client(provider)?;
+) -> anyhow::Result<FetchResponse> {
     let initial_cookie = javbus_cookie(provider, &[]);
-    let response = client
-        .get(url.clone())
-        .header(reqwest::header::COOKIE, &initial_cookie)
-        .send()
+    let mut transport = provider.transport();
+    transport.cookie = Some(initial_cookie.clone());
+    let response = state
+        .fetch_manager
+        .fetch(
+            provider.fetch_mode,
+            FetchRequest::get(&provider.key, url.clone()),
+            &transport,
+        )
         .await?;
-    reject_source_status(provider, &response)?;
-    let html = response.text().await?;
-    if !is_javbus_age_page(&html) {
-        return Ok(html);
+    if !is_javbus_age_page(&response.body) {
+        return Ok(response);
     }
 
     let mut verify_url = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
@@ -2578,33 +2483,40 @@ async fn javbus_request_html(
     verify_url
         .query_pairs_mut()
         .append_pair("referer", url.path());
-    let verification = client
-        .post(verify_url)
-        .header(reqwest::header::COOKIE, &initial_cookie)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
+    let verification = state
+        .fetch_manager
+        .fetch(
+            provider.fetch_mode,
+            FetchRequest {
+                provider_key: provider.key.clone(),
+                url: verify_url,
+                method: FetchMethod::Post,
+                headers: reqwest::header::HeaderMap::new(),
+                referer: Some(url.clone()),
+                body: Some("Submit=confirm".into()),
+                timeout: Duration::from_secs(20),
+            },
+            &transport,
         )
-        .body("Submit=confirm")
-        .send()
         .await?;
-    reject_source_status(provider, &verification)?;
     let session = verification
-        .headers()
+        .headers
         .get_all(reqwest::header::SET_COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .filter_map(|value| value.split(';').next())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let retried_response = client
-        .get(url)
-        .header(reqwest::header::COOKIE, javbus_cookie(provider, &session))
-        .send()
+    transport.cookie = Some(javbus_cookie(provider, &session));
+    let retried = state
+        .fetch_manager
+        .fetch(
+            provider.fetch_mode,
+            FetchRequest::get(&provider.key, url),
+            &transport,
+        )
         .await?;
-    reject_source_status(provider, &retried_response)?;
-    let retried = retried_response.text().await?;
-    if is_javbus_age_page(&retried) {
+    if is_javbus_age_page(&retried.body) {
         anyhow::bail!("JavBus 要求年龄验证，请在该来源中填写可用 Cookie 或更换镜像");
     }
     Ok(retried)
@@ -2613,15 +2525,6 @@ async fn javbus_request_html(
 fn is_javbus_age_page(html: &str) -> bool {
     html.contains("driver-verify")
         && (html.contains("Age Verification") || html.contains("你是否已經成年"))
-}
-
-#[derive(Debug)]
-struct SourceMedia {
-    provider_id: String,
-    code: String,
-    title: String,
-    poster_url: Option<String>,
-    source_url: String,
 }
 
 fn parse_javbus_search_html(html: &str, fallback: &str, base_url: &str) -> Vec<SourceMedia> {
@@ -3019,7 +2922,9 @@ async fn refresh_javbus_media(
     let url = reqwest::Url::parse(source_url)
         .or_else(|_| base.join(source_url))
         .or_else(|_| base.join(provider_id))?;
-    let html = javbus_request_html(provider, url.clone()).await?;
+    let response = javbus_request(state, provider, url.clone()).await?;
+    ensure_provider_content(state, provider, &response)?;
+    let html = response.body;
     let title = meta_content(&html, "og:title");
     let poster = meta_content(&html, "og:image");
     let summary = meta_content(&html, "og:description").unwrap_or_default();
@@ -3029,7 +2934,7 @@ async fn refresh_javbus_media(
         upsert_media_title_alias(state, media_id, title, None, &provider.key, true).await?;
     }
     persist_source_actors(state, media_id, &provider.key, &html, "/star/").await?;
-    let magnets = fetch_javbus_magnets(provider, &url, &html).await?;
+    let magnets = fetch_javbus_magnets(state, provider, &url, &html).await?;
     for (index, (url, label)) in magnets.iter().enumerate() {
         let info_hash = magnet_hash(url);
         let (score, reasons) = rank_resource(label, None, "", &provider.display_name);
@@ -3053,12 +2958,9 @@ async fn refresh_generic_source_media(
         "jav321" => base.join(&format!("/video/{provider_id}")),
         _ => base.join(source_url),
     })?;
-    let (_, html) = source_get_html(provider, url).await?;
-    if provider.adapter == "javdb" {
-        reject_cloudflare(&html, "JavDB")?;
-    } else if provider.adapter == "javlibrary" {
-        reject_cloudflare(&html, "JavLibrary")?;
-    }
+    let response = source_fetch(state, provider, url).await?;
+    ensure_provider_content(state, provider, &response)?;
+    let html = response.body;
     let actor_marker = if provider.adapter == "javdb" {
         "/actors/"
     } else {
@@ -3100,6 +3002,7 @@ async fn persist_source_detail_html(
 }
 
 async fn fetch_javbus_magnets(
+    state: &AppState,
     provider: &SourceProviderConfig,
     detail_url: &reqwest::Url,
     html: &str,
@@ -3121,15 +3024,15 @@ async fn fetch_javbus_magnets(
         .append_pair("img", &img)
         .append_pair("uc", &uc)
         .append_pair("floor", "1");
-    let response = source_client(provider)?
-        .get(ajax)
-        .header(reqwest::header::COOKIE, javbus_cookie(provider, &[]))
-        .header(reqwest::header::REFERER, detail_url.as_str())
-        .send()
+    let mut transport = provider.transport();
+    transport.cookie = Some(javbus_cookie(provider, &[]));
+    let mut request = FetchRequest::get(&provider.key, ajax);
+    request.referer = Some(detail_url.clone());
+    let response = state
+        .fetch_manager
+        .fetch(provider.fetch_mode, request, &transport)
         .await?;
-    reject_source_status(provider, &response)?;
-    let body = response.text().await?;
-    Ok(parse_magnets(&body))
+    Ok(parse_magnets(&response.body))
 }
 
 fn extract_js_value(html: &str, name: &str) -> Option<String> {
@@ -4218,6 +4121,8 @@ mod tests {
             asset_root: temp.join("assets"),
             script_root: temp.join("scripts"),
             events: tokio::sync::broadcast::channel(32).0,
+            fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
+            provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
         };
         let provider = source_provider_by_key(&state, "mock-javbus")
             .await
@@ -4366,6 +4271,8 @@ mod tests {
             asset_root: temp.join("assets"),
             script_root: temp.join("scripts"),
             events: tokio::sync::broadcast::channel(32).0,
+            fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
+            provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
         };
         sqlx::query("UPDATE provider_config SET base_url='http://127.0.0.1:9',enabled=1 WHERE provider_type='source'")
             .execute(&state.pool)
@@ -4469,6 +4376,8 @@ mod tests {
             asset_root: temp.join("assets"),
             script_root: temp.join("scripts"),
             events: tokio::sync::broadcast::channel(32).0,
+            fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
+            provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
         };
         let first = request_acquisition(
             &state,
