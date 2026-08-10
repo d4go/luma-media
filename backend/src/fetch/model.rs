@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use reqwest::{Url, header::HeaderMap};
 use serde::{Deserialize, Serialize};
 
+use super::classifier::{PageKind, classify_transport};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FetchMode {
@@ -85,6 +87,87 @@ pub enum FetchFailureKind {
     InvalidContent,
     BrowserUnavailable,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchDecision {
+    /// Return the current result to the caller unchanged.
+    Return,
+    /// Do not fall back; the caller should retry/backoff (network, timeout, plain 5xx).
+    Retry,
+    /// The HTTP result is unusable (blocked/challenge/invalid); retry through the browser.
+    FallbackToBrowser,
+    /// The provider is rate limited; the caller should cool down, never fall back.
+    Cooldown,
+    /// The browser path needs human interaction; do not retry automatically.
+    #[allow(dead_code)] // consumed by the circuit-breaker integration (master plan Phase 2)
+    InteractionRequired,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutoFetchPolicy {
+    /// How long a provider sticks to Browser after an HTTP failure + browser success.
+    pub sticky_ttl: Duration,
+}
+
+impl Default for AutoFetchPolicy {
+    fn default() -> Self {
+        Self {
+            sticky_ttl: Duration::from_secs(10 * 60),
+        }
+    }
+}
+
+impl AutoFetchPolicy {
+    /// Decide what an Auto fetch should do based on the HTTP attempt.
+    ///
+    /// `looks_like_challenge` lets the transport layer recognise access/challenge
+    /// pages that are served with a 2xx/5xx status without depending on a specific
+    /// provider parser.
+    pub fn decide(
+        &self,
+        http_result: Result<&FetchResponse, &FetchError>,
+        looks_like_challenge: impl Fn(&str) -> bool,
+    ) -> FetchDecision {
+        match http_result {
+            Ok(response) => match classify_transport(response) {
+                Some(PageKind::RateLimited) => FetchDecision::Cooldown,
+                Some(PageKind::TemporaryUnavailable) => {
+                    if looks_like_challenge(&response.body) {
+                        FetchDecision::FallbackToBrowser
+                    } else {
+                        FetchDecision::Retry
+                    }
+                }
+                Some(PageKind::AccessDenied)
+                | Some(PageKind::LoginRequired)
+                | Some(PageKind::AgeGate)
+                | Some(PageKind::InteractionRequired)
+                | Some(PageKind::InvalidContent) => FetchDecision::FallbackToBrowser,
+                Some(PageKind::ValidContent) | None => {
+                    // A 2xx/3xx body can still be a challenge or access-denied page.
+                    if looks_like_challenge(&response.body) {
+                        FetchDecision::FallbackToBrowser
+                    } else {
+                        FetchDecision::Return
+                    }
+                }
+            },
+            Err(error) => match error.kind {
+                FetchFailureKind::AccessDenied
+                | FetchFailureKind::InvalidContent
+                | FetchFailureKind::SessionExpired
+                | FetchFailureKind::InteractionRequired => FetchDecision::FallbackToBrowser,
+                FetchFailureKind::RateLimited => FetchDecision::Cooldown,
+                FetchFailureKind::Network
+                | FetchFailureKind::Timeout
+                | FetchFailureKind::TemporaryUnavailable => FetchDecision::Retry,
+                FetchFailureKind::BrowserUnavailable | FetchFailureKind::Unknown => {
+                    FetchDecision::Return
+                }
+            },
+        }
+    }
 }
 
 impl FetchFailureKind {

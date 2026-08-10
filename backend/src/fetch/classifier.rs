@@ -27,6 +27,34 @@ pub fn classify_transport(response: &FetchResponse) -> Option<PageKind> {
     }
 }
 
+/// Transport-level heuristic for access/challenge pages that are served with a
+/// 2xx/5xx status (CDN challenges, age gates, "verify you are human" pages).
+/// Provider parsers may still refine classification with their own DOM markers.
+pub fn looks_like_challenge(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    [
+        "cf-challenge",
+        "challenge-platform",
+        "captcha",
+        "verify you are human",
+        "are you a human",
+        "access denied",
+        "attention required",
+        "your request has been blocked",
+        "request blocked",
+        "enable javascript and cookies to continue",
+        "cf-error-details",
+        "incapsula",
+        "ddos-guard",
+        "age verification",
+        "age-gate",
+        "please confirm you are over 18",
+        "only for adults",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
