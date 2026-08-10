@@ -18,6 +18,8 @@ pub struct SourceProviderConfig {
     pub sync_interval_minutes: i64,
     pub sync_overlap_days: i64,
     pub sync_detail_limit: usize,
+    pub metadata_priority: i64,
+    pub resource_priority: i64,
     pub resource_cache_ttl_hours: i64,
     pub resource_hydration_recent_days: i64,
 }
@@ -72,6 +74,16 @@ impl SourceProviderConfig {
                 .and_then(Value::as_u64)
                 .unwrap_or(8)
                 .min(40) as usize,
+            metadata_priority: config
+                .get("metadataPriority")
+                .and_then(Value::as_i64)
+                .unwrap_or(100)
+                .clamp(-1000, 1000),
+            resource_priority: config
+                .get("resourcePriority")
+                .and_then(Value::as_i64)
+                .unwrap_or(100)
+                .clamp(-1000, 1000),
             resource_cache_ttl_hours: config
                 .get("resourceCacheTtlHours")
                 .and_then(Value::as_i64)

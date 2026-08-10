@@ -27,6 +27,7 @@ use crate::{
         PRIORITY_HISTORICAL_BOOTSTRAP, PRIORITY_USER_ON_DEMAND, ResourceRefreshJobPayload,
         SnapshotInput, SyncMode,
     },
+    metadata::{LocalizedAlias, MetadataSourceInput, SourceActor},
     providers::{
         ProviderContext, ProviderMediaRef, RawProviderDocument, ResourceCandidate, SourceMedia,
         SourceProviderConfig,
@@ -337,6 +338,7 @@ fn fts_phrase(value: &str) -> String {
     format!("\"{}\"", value.trim().replace('"', "\"\""))
 }
 
+#[cfg(test)]
 fn push_search_term(terms: &mut Vec<String>, value: &str) {
     let value = value.trim();
     let normalized = normalize_alias(value);
@@ -389,8 +391,57 @@ async fn media_detail(
     .fetch_optional(&state.pool)
     .await?
     .flatten();
+    let source_rows = sqlx::query("SELECT id,provider_key,provider_entity_id,source_url,record_kind,evidence_level,priority,title,original_title,summary,release_date,duration_minutes,poster_url,backdrop_url,actors_json,aliases_json,tags_json,first_seen_at,last_seen_at,updated_at FROM metadata_source_record WHERE media_id=? ORDER BY priority DESC,provider_key")
+        .bind(id)
+        .fetch_all(&state.pool)
+        .await?;
+    let metadata_sources = source_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<i64, _>("id"),
+                "providerKey": row.get::<String, _>("provider_key"),
+                "providerEntityId": row.get::<String, _>("provider_entity_id"),
+                "sourceUrl": row.get::<Option<String>, _>("source_url"),
+                "recordKind": row.get::<String, _>("record_kind"),
+                "evidenceLevel": row.get::<i64, _>("evidence_level"),
+                "priority": row.get::<i64, _>("priority"),
+                "title": row.get::<Option<String>, _>("title"),
+                "originalTitle": row.get::<Option<String>, _>("original_title"),
+                "summary": row.get::<Option<String>, _>("summary"),
+                "releaseDate": row.get::<Option<String>, _>("release_date"),
+                "durationMinutes": row.get::<Option<i64>, _>("duration_minutes"),
+                "posterUrl": row.get::<Option<String>, _>("poster_url"),
+                "backdropUrl": row.get::<Option<String>, _>("backdrop_url"),
+                "actors": parse_json(&row.get::<String, _>("actors_json"), json!([])),
+                "aliases": parse_json(&row.get::<String, _>("aliases_json"), json!([])),
+                "tags": parse_json(&row.get::<String, _>("tags_json"), json!([])),
+                "firstSeenAt": row.get::<String, _>("first_seen_at"),
+                "lastSeenAt": row.get::<String, _>("last_seen_at"),
+                "updatedAt": row.get::<String, _>("updated_at"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let provenance_rows = sqlx::query("SELECT field_name,provider_key,source_record_id,priority,value_json,source_updated_at,selected_at FROM metadata_field_provenance WHERE media_id=? ORDER BY field_name")
+        .bind(id)
+        .fetch_all(&state.pool)
+        .await?;
+    let field_provenance = provenance_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "field": row.get::<String, _>("field_name"),
+                "providerKey": row.get::<String, _>("provider_key"),
+                "sourceRecordId": row.get::<i64, _>("source_record_id"),
+                "priority": row.get::<i64, _>("priority"),
+                "value": parse_json(&row.get::<String, _>("value_json"), Value::Null),
+                "sourceUpdatedAt": row.get::<String, _>("source_updated_at"),
+                "selectedAt": row.get::<String, _>("selected_at"),
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(Json(
-        json!({"media": media, "actors": actors, "resources": resources, "latestAcquisitionId": acquisition_id, "libraryItemId": library_id}),
+        json!({"media": media, "actors": actors, "resources": resources, "metadataSources": metadata_sources, "fieldProvenance": field_provenance, "latestAcquisitionId": acquisition_id, "libraryItemId": library_id}),
     ))
 }
 
@@ -1194,26 +1245,28 @@ async fn enrich_with_metatube(
     let release_date = first_json_string(&remote, &["release_date", "premiered"]);
     let poster_url = first_json_string(&remote, &["big_cover_url", "cover_url", "poster_url"]);
     let backdrop_url = first_json_string(&remote, &["big_thumb_url", "thumb_url", "backdrop_url"]);
-    sqlx::query("UPDATE media SET title=?, original_title=COALESCE(?,original_title), summary=CASE WHEN ?='' THEN summary ELSE ? END, release_date=COALESCE(?,release_date), poster_url=COALESCE(?,poster_url), backdrop_url=COALESCE(?,backdrop_url), updated_at=datetime('now') WHERE id=?")
-        .bind(title).bind(original_title).bind(summary).bind(summary).bind(release_date).bind(poster_url).bind(backdrop_url).bind(media_id).execute(&state.pool).await?;
-    upsert_media_title_alias(state, media_id, title, None, "metatube", true).await?;
-    if let Some(original_title) = original_title {
-        upsert_media_title_alias(state, media_id, original_title, None, "metatube", false).await?;
-    }
-    for (alias, locale) in localized_media_titles(&remote) {
-        upsert_media_title_alias(
-            state,
-            media_id,
-            &alias,
-            Some(locale),
-            "metatube",
-            alias == title,
-        )
-        .await?;
-    }
+    let provider_entity_id = format!("{}:{}", match_item.provider, match_item.id);
+    let mut source =
+        MetadataSourceInput::catalogue(media_id, "metatube", &provider_entity_id, code);
+    source.record_kind = "detail".into();
+    source.evidence_level = 2;
+    source.priority = 25;
+    source.title = Some(title.to_owned());
+    source.original_title = original_title.map(str::to_owned);
+    source.summary = (!summary.trim().is_empty()).then(|| summary.to_owned());
+    source.release_date = release_date.map(str::to_owned);
+    source.poster_url = poster_url.map(str::to_owned);
+    source.backdrop_url = backdrop_url.map(str::to_owned);
+    source.aliases = localized_media_titles(&remote)
+        .into_iter()
+        .map(|(alias, locale)| LocalizedAlias::new(alias, locale))
+        .collect();
+    source.actors = source_actors_from_json(&remote);
+    source.tags = json_string_array(remote.get("genres"));
+    source.raw_json = remote.clone();
+    crate::metadata::record_and_resolve(&state.pool, &source).await?;
     sqlx::query("INSERT INTO provider_entity_mapping(provider_key,entity_type,provider_entity_id,media_id,raw_json) VALUES ('metatube','media',?,?,?) ON CONFLICT(provider_key,entity_type,provider_entity_id) DO UPDATE SET media_id=excluded.media_id,raw_json=excluded.raw_json,last_seen_at=datetime('now')")
-        .bind(format!("{}:{}", match_item.provider, match_item.id)).bind(media_id).bind(remote.to_string()).execute(&state.pool).await?;
-    persist_remote_actors(state, media_id, &remote, "metatube").await?;
+        .bind(&provider_entity_id).bind(media_id).bind(remote.to_string()).execute(&state.pool).await?;
     let poster_path = if let Some(url) = poster_url {
         match client.download_image(url).await {
             Ok(image) => {
@@ -1235,56 +1288,63 @@ async fn enrich_with_metatube(
     Ok((remote, "metatube".into(), poster_path))
 }
 
-async fn persist_remote_actors(
-    state: &AppState,
-    media_id: i64,
-    remote: &Value,
-    source_key: &str,
-) -> anyhow::Result<()> {
-    for (order, item) in remote
+fn source_actors_from_json(remote: &Value) -> Vec<SourceActor> {
+    remote
         .get("actors")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .enumerate()
-    {
-        let (name, avatar) = match item {
-            Value::String(name) => (name.as_str(), None),
-            Value::Object(map) => (
-                map.get("name").and_then(Value::as_str).unwrap_or_default(),
-                map.get("image_url")
-                    .or_else(|| map.get("thumb_url"))
-                    .and_then(Value::as_str),
-            ),
-            _ => ("", None),
-        };
-        if name.is_empty() {
-            continue;
-        }
-        let aliases = actor_alias_strings(item);
-        let actor_id = upsert_actor_with_aliases(state, name, &aliases, avatar, source_key).await?;
-        for (alias, locale) in localized_actor_names(item) {
-            upsert_actor_name_alias(
-                state,
-                actor_id,
-                &alias,
-                Some(locale),
-                source_key,
-                alias == name,
-            )
-            .await?;
-        }
-        sqlx::query(
-            "INSERT OR IGNORE INTO media_actor(media_id,actor_id,billing_order) VALUES (?,?,?)",
-        )
-        .bind(media_id)
-        .bind(actor_id)
-        .bind(order as i64)
-        .execute(&state.pool)
-        .await?;
-    }
-    refresh_media_search_document(state, media_id).await?;
-    Ok(())
+        .filter_map(|item| {
+            let (name, avatar) = match item {
+                Value::String(name) => (name.as_str(), None),
+                Value::Object(map) => (
+                    map.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    map.get("image_url")
+                        .or_else(|| map.get("thumb_url"))
+                        .and_then(Value::as_str),
+                ),
+                _ => ("", None),
+            };
+            if name.is_empty() {
+                return None;
+            }
+            let provider_actor_id = item
+                .get("id")
+                .or_else(|| item.get("actor_id"))
+                .or_else(|| item.get("provider_actor_id"))
+                .and_then(json_value_string);
+            let mut aliases = localized_actor_names(item)
+                .into_iter()
+                .map(|(alias, locale)| LocalizedAlias::new(alias, locale))
+                .collect::<Vec<_>>();
+            aliases.extend(
+                item.get("aliases")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|alias| LocalizedAlias::new(alias, "und")),
+            );
+            Some(SourceActor {
+                provider_actor_id,
+                name: name.to_owned(),
+                aliases,
+                avatar_url: avatar.map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+fn json_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 async fn transition(
@@ -2553,7 +2613,7 @@ pub(crate) async fn execute_hydration_job(
             source_url: item.source_url.clone(),
             release_date: item.release_date.clone(),
         };
-        let media_id = persist_source_media(state, &provider.key, &source).await?;
+        let media_id = persist_source_media(state, &provider, &source).await?;
         let allow_resource_endpoint = payload.mode != SyncMode::Bootstrap
             || item.release_date.as_deref().is_some_and(|release_date| {
                 resource_date_is_recent(release_date, provider.resource_hydration_recent_days)
@@ -2728,7 +2788,7 @@ async fn synchronize_source_catalogue(
             .bind(&item.provider_id)
             .fetch_one(&state.pool)
             .await?;
-        match persist_source_media(state, &provider.key, &item).await {
+        match persist_source_media(state, provider, &item).await {
             Ok(media_id) => {
                 stats.item_count += 1;
                 if existed == 0 {
@@ -3517,7 +3577,7 @@ fn extract_iso_date(text: &str) -> Option<String> {
 
 async fn persist_source_media(
     state: &AppState,
-    provider_key: &str,
+    provider: &SourceProviderConfig,
     item: &SourceMedia,
 ) -> anyhow::Result<i64> {
     let code = extract_media_code(&item.code)
@@ -3526,7 +3586,7 @@ async fn persist_source_media(
         .map(|code| normalize_code(&code))
         .filter(|code| !code.is_empty())
         .ok_or_else(|| anyhow::anyhow!("无法从来源条目提取真实番号"))?;
-    let row = sqlx::query("INSERT INTO media(normalized_code,title,poster_url,release_date) VALUES (?,?,?,?) ON CONFLICT(normalized_code) DO UPDATE SET title=CASE WHEN length(excluded.title)>length(media.title) THEN excluded.title ELSE media.title END,poster_url=COALESCE(excluded.poster_url,media.poster_url),release_date=COALESCE(excluded.release_date,media.release_date),updated_at=datetime('now') RETURNING id")
+    let row = sqlx::query("INSERT INTO media(normalized_code,title,poster_url,release_date) VALUES (?,?,?,?) ON CONFLICT(normalized_code) DO UPDATE SET normalized_code=excluded.normalized_code RETURNING id")
         .bind(&code)
         .bind(&item.title)
         .bind(&item.poster_url)
@@ -3534,9 +3594,22 @@ async fn persist_source_media(
         .fetch_one(&state.pool)
         .await?;
     let id: i64 = row.get("id");
-    upsert_media_title_alias(state, id, &item.title, None, provider_key, true).await?;
     sqlx::query("INSERT INTO provider_entity_mapping(provider_key, entity_type, provider_entity_id, media_id, source_url) VALUES (?, 'media', ?, ?, ?) ON CONFLICT(provider_key, entity_type, provider_entity_id) DO UPDATE SET media_id = excluded.media_id, source_url = excluded.source_url, last_seen_at = datetime('now')")
-        .bind(provider_key).bind(&item.provider_id).bind(id).bind(&item.source_url).execute(&state.pool).await?;
+        .bind(&provider.key).bind(&item.provider_id).bind(id).bind(&item.source_url).execute(&state.pool).await?;
+    let mut source = MetadataSourceInput::catalogue(id, &provider.key, &item.provider_id, &code);
+    source.source_url = Some(item.source_url.clone());
+    source.priority = provider.metadata_priority;
+    source.title = Some(item.title.clone());
+    source.release_date = item.release_date.clone();
+    source.poster_url = item.poster_url.clone();
+    source.aliases = vec![LocalizedAlias::new(&item.title, "und")];
+    source.raw_json = json!({
+        "code": code,
+        "title": item.title,
+        "posterUrl": item.poster_url,
+        "releaseDate": item.release_date,
+    });
+    crate::metadata::record_and_resolve(&state.pool, &source).await?;
     Ok(id)
 }
 
@@ -3576,48 +3649,80 @@ pub async fn ingest_crawler_result(state: &AppState, result_id: i64) -> AppResul
         .into_iter()
         .find_map(|key| result.raw.get(key))
         .and_then(json_value_string);
-    let media_id: i64 = sqlx::query("INSERT INTO media(normalized_code,title,original_title,poster_url) VALUES (?,?,?,?) ON CONFLICT(normalized_code) DO UPDATE SET title=CASE WHEN media.title='' OR media.title=media.normalized_code THEN excluded.title ELSE media.title END,original_title=COALESCE(media.original_title,excluded.original_title),poster_url=COALESCE(media.poster_url,excluded.poster_url),updated_at=datetime('now') RETURNING id")
+    let media_id: i64 = sqlx::query("INSERT INTO media(normalized_code,title,original_title,poster_url) VALUES (?,?,?,?) ON CONFLICT(normalized_code) DO UPDATE SET normalized_code=excluded.normalized_code RETURNING id")
         .bind(&code).bind(&media_title).bind(&original_title).bind(&poster_url).fetch_one(&state.pool).await?.get("id");
-    upsert_media_title_alias(
-        state,
-        media_id,
-        &media_title,
-        None,
-        &format!("crawler:{}", result.script_id),
-        true,
-    )
-    .await?;
-    if let Some(original_title) = original_title.as_deref() {
-        upsert_media_title_alias(
-            state,
-            media_id,
-            original_title,
-            Some("ja"),
-            &format!("crawler:{}", result.script_id),
-            false,
-        )
-        .await?;
-    }
-    for (alias, locale) in localized_media_titles(&result.raw) {
-        upsert_media_title_alias(
-            state,
-            media_id,
-            &alias,
-            Some(locale),
-            &format!("crawler:{}", result.script_id),
-            alias == media_title,
-        )
-        .await?;
-    }
-    persist_remote_actors(
-        state,
-        media_id,
-        &result.raw,
-        &format!("crawler:{}", result.script_id),
-    )
-    .await?;
     let info_hash = magnet_hash(&result.download_url);
     let provider_key = format!("crawler:{}", result.script_id);
+    let provider_entity_id = [
+        "mediaId",
+        "media_id",
+        "videoId",
+        "video_id",
+        "externalMediaId",
+        "external_media_id",
+    ]
+    .into_iter()
+    .find_map(|key| result.raw.get(key))
+    .and_then(json_value_string)
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or_else(|| code.clone());
+    let mut aliases = vec![LocalizedAlias::new(&media_title, "und")];
+    if let Some(original_title) = original_title.as_deref() {
+        aliases.push(LocalizedAlias::new(original_title, "ja"));
+    }
+    aliases.extend(
+        localized_media_titles(&result.raw)
+            .into_iter()
+            .map(|(alias, locale)| LocalizedAlias::new(alias, locale)),
+    );
+    let mut source =
+        MetadataSourceInput::catalogue(media_id, &provider_key, &provider_entity_id, &code);
+    source.source_url = Some(result.source.clone());
+    source.record_kind = "crawler".into();
+    source.evidence_level = 2;
+    source.priority = result
+        .raw
+        .get("metadataPriority")
+        .and_then(Value::as_i64)
+        .unwrap_or(50)
+        .clamp(-1000, 1000);
+    source.title = Some(media_title.clone());
+    source.original_title = original_title.clone();
+    source.summary =
+        first_json_string(&result.raw, &["summary", "plot", "description"]).map(str::to_owned);
+    source.release_date =
+        first_json_string(&result.raw, &["releaseDate", "release_date", "premiered"])
+            .map(str::to_owned);
+    source.duration_minutes = result
+        .raw
+        .get("durationMinutes")
+        .or_else(|| result.raw.get("duration_minutes"))
+        .or_else(|| result.raw.get("runtime"))
+        .and_then(Value::as_i64);
+    source.poster_url = poster_url.clone();
+    source.backdrop_url = first_json_string(
+        &result.raw,
+        &["backdropUrl", "backdrop_url", "thumbUrl", "thumb_url"],
+    )
+    .map(str::to_owned);
+    source.actors = source_actors_from_json(&result.raw);
+    source.aliases = aliases;
+    source.tags = result
+        .raw
+        .get("tags")
+        .or_else(|| result.raw.get("genres"))
+        .map(|value| json_string_array(Some(value)))
+        .unwrap_or_default();
+    source.raw_json = result.raw.clone();
+    crate::metadata::record_and_resolve(&state.pool, &source).await?;
+    sqlx::query("INSERT INTO provider_entity_mapping(provider_key,entity_type,provider_entity_id,media_id,source_url,raw_json) VALUES (?,'media',?,?,?,?) ON CONFLICT(provider_key,entity_type,provider_entity_id) DO UPDATE SET media_id=excluded.media_id,source_url=excluded.source_url,raw_json=excluded.raw_json,last_seen_at=datetime('now')")
+        .bind(&provider_key)
+        .bind(&provider_entity_id)
+        .bind(media_id)
+        .bind(&result.source)
+        .bind(result.raw.to_string())
+        .execute(&state.pool)
+        .await?;
     let provider_resource_id = [
         "resourceId",
         "resource_id",
@@ -3886,12 +3991,21 @@ async fn refresh_javbus_media(
     let title = meta_content(&html, "og:title");
     let poster = meta_content(&html, "og:image");
     let summary = meta_content(&html, "og:description").unwrap_or_default();
-    sqlx::query("UPDATE media SET title=COALESCE(?,title), poster_url=COALESCE(?,poster_url), summary=CASE WHEN ?='' THEN summary ELSE ? END, updated_at=datetime('now') WHERE id=?")
-        .bind(title.as_deref()).bind(poster).bind(&summary).bind(&summary).bind(media_id).execute(&state.pool).await?;
-    if let Some(title) = title.as_deref() {
-        upsert_media_title_alias(state, media_id, title, None, &provider.key, true).await?;
-    }
-    persist_source_actors(state, media_id, &provider.key, &html, "/star/").await?;
+    let release_date = extract_iso_date(&html);
+    let actors = extract_source_actors(&html, "/star/");
+    persist_metadata_detail(
+        state,
+        media_id,
+        provider,
+        provider_id,
+        &final_url,
+        title,
+        poster,
+        summary,
+        release_date,
+        actors,
+    )
+    .await?;
     let resource_count = if include_resources {
         fetch_and_persist_resources(
             state,
@@ -3945,7 +4059,16 @@ async fn refresh_generic_source_media(
     } else {
         "/star/"
     };
-    persist_source_detail_html(state, media_id, provider, &html, actor_marker).await?;
+    persist_source_detail_html(
+        state,
+        media_id,
+        provider,
+        provider_id,
+        &final_url,
+        &html,
+        actor_marker,
+    )
+    .await?;
     if include_resources
         && state
             .provider_registry
@@ -3975,6 +4098,8 @@ async fn persist_source_detail_html(
     state: &AppState,
     media_id: i64,
     provider: &SourceProviderConfig,
+    provider_id: &str,
+    source_url: &str,
     html: &str,
     actor_marker: &str,
 ) -> anyhow::Result<()> {
@@ -3985,25 +4110,69 @@ async fn persist_source_detail_html(
         .or_else(|| extract_attribute(html, "poster="))
         .map(|value| value.replace("http://pics.dmm.co.jp", "https://pics.dmm.co.jp"));
     let summary = meta_content(html, "og:description").unwrap_or_default();
-    sqlx::query("UPDATE media SET title=COALESCE(?,title), poster_url=COALESCE(?,poster_url), summary=CASE WHEN ?='' THEN summary ELSE ? END, updated_at=datetime('now') WHERE id=?")
-        .bind(title.as_deref()).bind(poster).bind(&summary).bind(&summary).bind(media_id).execute(&state.pool).await?;
-    if let Some(title) = title.as_deref() {
-        upsert_media_title_alias(state, media_id, title, None, &provider.key, true).await?;
-    }
-    persist_source_actors(state, media_id, &provider.key, html, actor_marker).await?;
-    refresh_media_search_document(state, media_id).await?;
+    persist_metadata_detail(
+        state,
+        media_id,
+        provider,
+        provider_id,
+        source_url,
+        title,
+        poster,
+        summary,
+        extract_iso_date(html),
+        extract_source_actors(html, actor_marker),
+    )
+    .await?;
     Ok(())
 }
 
-async fn persist_source_actors(
+async fn persist_metadata_detail(
     state: &AppState,
     media_id: i64,
-    provider_key: &str,
-    html: &str,
-    marker: &str,
+    provider: &SourceProviderConfig,
+    provider_id: &str,
+    source_url: &str,
+    title: Option<String>,
+    poster_url: Option<String>,
+    summary: String,
+    release_date: Option<String>,
+    actors: Vec<SourceActor>,
 ) -> anyhow::Result<()> {
+    let normalized_code: String =
+        sqlx::query_scalar("SELECT normalized_code FROM media WHERE id=?")
+            .bind(media_id)
+            .fetch_one(&state.pool)
+            .await?;
+    let aliases = title
+        .iter()
+        .map(|title| LocalizedAlias::new(title, "und"))
+        .collect::<Vec<_>>();
+    let mut source =
+        MetadataSourceInput::catalogue(media_id, &provider.key, provider_id, &normalized_code);
+    source.source_url = Some(source_url.to_owned());
+    source.record_kind = "detail".into();
+    source.evidence_level = 2;
+    source.priority = provider.metadata_priority;
+    source.title = title;
+    source.summary = (!summary.trim().is_empty()).then_some(summary);
+    source.release_date = release_date;
+    source.poster_url = poster_url;
+    source.actors = actors;
+    source.aliases = aliases;
+    source.raw_json = json!({
+        "title": source.title,
+        "summary": source.summary,
+        "releaseDate": source.release_date,
+        "posterUrl": source.poster_url,
+        "actors": source.actors,
+    });
+    crate::metadata::record_and_resolve(&state.pool, &source).await?;
+    Ok(())
+}
+
+fn extract_source_actors(html: &str, marker: &str) -> Vec<SourceActor> {
+    let mut actors = Vec::new();
     let mut cursor = 0;
-    let mut order = 0;
     while let Some(offset) = html[cursor..].find(marker) {
         let start = cursor + offset;
         let id_end = html[start..].find(['\"', '\'', '?']).unwrap_or(64).min(64);
@@ -4016,23 +4185,23 @@ async fn persist_source_actors(
         if provider_id.is_empty() || name.is_empty() {
             continue;
         }
-        let actor_id = upsert_actor_with_aliases(state, &name, &[], None, provider_key).await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO media_actor(media_id,actor_id,billing_order) VALUES (?,?,?)",
-        )
-        .bind(media_id)
-        .bind(actor_id)
-        .bind(order)
-        .execute(&state.pool)
-        .await?;
-        sqlx::query("INSERT INTO provider_entity_mapping(provider_key,entity_type,provider_entity_id,actor_id) VALUES (?,'actor',?,?) ON CONFLICT(provider_key,entity_type,provider_entity_id) DO UPDATE SET actor_id=excluded.actor_id,last_seen_at=datetime('now')").bind(provider_key).bind(provider_id).bind(actor_id).execute(&state.pool).await?;
-        order += 1;
-        if order >= 40 {
+        if actors
+            .iter()
+            .any(|actor: &SourceActor| actor.provider_actor_id.as_deref() == Some(provider_id))
+        {
+            continue;
+        }
+        actors.push(SourceActor {
+            provider_actor_id: Some(provider_id.to_owned()),
+            name,
+            aliases: Vec::new(),
+            avatar_url: None,
+        });
+        if actors.len() >= 40 {
             break;
         }
     }
-    refresh_media_search_document(state, media_id).await?;
-    Ok(())
+    actors
 }
 
 fn parse_magnets(html: &str) -> Vec<(String, String)> {
@@ -4454,6 +4623,7 @@ fn normalize_alias(value: &str) -> String {
         .filter(|character| !character.is_whitespace())
         .collect()
 }
+#[cfg(test)]
 fn detect_alias_locale(value: &str) -> &'static str {
     let has_kana = value
         .chars()
@@ -4473,6 +4643,7 @@ fn detect_alias_locale(value: &str) -> &'static str {
     "und"
 }
 
+#[cfg(test)]
 fn alias_locale<'a>(value: &str, explicit: Option<&'a str>) -> &'a str {
     explicit
         .filter(|locale| matches!(*locale, "ja" | "zh" | "en" | "und"))
@@ -4533,23 +4704,7 @@ fn localized_actor_names(value: &Value) -> Vec<(String, &'static str)> {
     aliases
 }
 
-fn actor_alias_strings(value: &Value) -> Vec<String> {
-    let mut aliases = localized_actor_names(value)
-        .into_iter()
-        .map(|(alias, _)| alias)
-        .collect::<Vec<_>>();
-    for alias in value
-        .get("aliases")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
-        push_search_term(&mut aliases, alias);
-    }
-    aliases
-}
-
+#[cfg(test)]
 async fn upsert_media_title_alias(
     state: &AppState,
     media_id: i64,
@@ -4568,6 +4723,7 @@ async fn upsert_media_title_alias(
     refresh_media_search_document(state, media_id).await?;
     Ok(())
 }
+#[cfg(test)]
 async fn upsert_actor_name_alias(
     state: &AppState,
     actor_id: i64,
@@ -4603,6 +4759,7 @@ async fn refresh_media_search_document(state: &AppState, media_id: i64) -> anyho
     Ok(())
 }
 
+#[cfg(test)]
 async fn refresh_actor_search_document(state: &AppState, actor_id: i64) -> anyhow::Result<()> {
     sqlx::query("INSERT INTO actor_search_document(actor_id,name,aliases,updated_at) SELECT a.id,a.name,COALESCE((SELECT group_concat(alias,' ') FROM actor_name_alias WHERE actor_id=a.id),''),datetime('now') FROM actor a WHERE a.id=? ON CONFLICT(actor_id) DO UPDATE SET name=excluded.name,aliases=excluded.aliases,updated_at=datetime('now')")
         .bind(actor_id)
@@ -4611,6 +4768,7 @@ async fn refresh_actor_search_document(state: &AppState, actor_id: i64) -> anyho
     Ok(())
 }
 
+#[cfg(test)]
 async fn refresh_media_documents_for_actor(state: &AppState, actor_id: i64) -> anyhow::Result<()> {
     let media_ids = sqlx::query_scalar::<_, i64>(
         "SELECT media_id FROM media_actor WHERE actor_id=? ORDER BY media_id",
@@ -4623,6 +4781,7 @@ async fn refresh_media_documents_for_actor(state: &AppState, actor_id: i64) -> a
     }
     Ok(())
 }
+#[cfg(test)]
 async fn upsert_actor_with_aliases(
     state: &AppState,
     primary_name: &str,

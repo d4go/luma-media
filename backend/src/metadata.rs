@@ -5,8 +5,36 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use serde_json::{Value, json};
+use sqlx::SqlitePool;
 
 use crate::{asset::CachedAsset, models::MediaItem, provider::MetaTubeClient};
+
+mod model;
+mod provenance;
+mod repository;
+mod resolver;
+
+pub use model::{LocalizedAlias, MetadataSourceInput, ResolutionResult, SourceActor};
+
+pub async fn record_and_resolve(
+    pool: &SqlitePool,
+    input: &MetadataSourceInput,
+) -> anyhow::Result<ResolutionResult> {
+    anyhow::ensure!(
+        !input.provider_key.trim().is_empty(),
+        "provider key is required"
+    );
+    anyhow::ensure!(
+        !input.provider_entity_id.trim().is_empty(),
+        "provider entity id is required"
+    );
+    anyhow::ensure!(
+        !input.normalized_code.trim().is_empty(),
+        "normalized media code is required"
+    );
+    let source_record_id = repository::upsert_source_record(pool, input).await?;
+    resolver::resolve_media(pool, input.media_id, source_record_id).await
+}
 
 pub struct WriteReport {
     pub written: Vec<PathBuf>,
