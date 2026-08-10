@@ -83,7 +83,8 @@ impl JobItemStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JobRun {
     pub id: i64,
     pub job_definition_id: Option<i64>,
@@ -92,6 +93,7 @@ pub struct JobRun {
     pub status: JobStatus,
     pub idempotency_key: String,
     pub priority: i64,
+    pub config: Value,
     pub progress_current: i64,
     pub progress_total: Option<i64>,
     pub checkpoint: Value,
@@ -108,7 +110,8 @@ impl JobRun {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct JobItem {
     pub id: i64,
     pub run_id: i64,
@@ -121,6 +124,28 @@ pub struct JobItem {
     pub finished_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobEvent {
+    pub id: i64,
+    pub run_id: i64,
+    pub event_key: String,
+    pub message: String,
+    pub payload: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobRunStats {
+    pub success: i64,
+    pub failed: i64,
+    pub skipped: i64,
+    pub pending: i64,
+    pub running: i64,
+    pub cancelled: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +167,7 @@ pub(crate) fn job_run_from_row(row: &SqliteRow) -> JobRun {
         status: JobStatus::parse(&row.get::<String, _>("status")),
         idempotency_key: row.get("idempotency_key"),
         priority: row.get("priority"),
+        config: parse_json(&row.get::<String, _>("config_json")),
         progress_current: row.get("progress_current"),
         progress_total: row.get("progress_total"),
         checkpoint: parse_json(&row.get::<String, _>("checkpoint_json")),
@@ -166,6 +192,17 @@ pub(crate) fn job_item_from_row(row: &SqliteRow) -> JobItem {
         finished_at: row.get("finished_at"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+    }
+}
+
+pub(crate) fn job_event_from_row(row: &SqliteRow) -> JobEvent {
+    JobEvent {
+        id: row.get("id"),
+        run_id: row.get("run_id"),
+        event_key: row.get("event_key"),
+        message: row.get("message"),
+        payload: parse_json(&row.get::<String, _>("payload_json")),
+        created_at: row.get("created_at"),
     }
 }
 

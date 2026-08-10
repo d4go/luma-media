@@ -1,5 +1,5 @@
-#![allow(dead_code)] // Task engine foundation; consumed by TaskRunner in the next phase.
-
+pub mod api;
+pub mod bootstrap;
 mod engine;
 pub mod handler;
 mod model;

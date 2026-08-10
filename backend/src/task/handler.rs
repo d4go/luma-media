@@ -31,6 +31,14 @@ impl JobContext<'_> {
         ))
     }
 
+    pub async fn run_config(&self) -> anyhow::Result<Value> {
+        Ok(self.engine.run_by_id(self.run_id).await?.config)
+    }
+
+    pub async fn item_checkpoint(&self) -> anyhow::Result<Value> {
+        Ok(self.engine.item_by_id(self.item_id).await?.checkpoint)
+    }
+
     pub async fn report_progress(
         &self,
         current: i64,

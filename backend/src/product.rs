@@ -2918,60 +2918,15 @@ pub(crate) async fn execute_discovery_job(
             .collect(),
     )
     .await?;
-    let priority = match payload.mode {
-        SyncMode::Bootstrap => PRIORITY_HISTORICAL_BOOTSTRAP,
-        SyncMode::Incremental => PRIORITY_DAILY_INCREMENTAL,
-        SyncMode::OnDemand => PRIORITY_USER_ON_DEMAND,
-    };
-    let mut pending_count = 0_i64;
-    for candidate in &candidates {
-        if !candidate.should_hydrate {
-            if payload.mode == SyncMode::Incremental
-                && let Some(media_id) = candidate.media_id
-                && state
-                    .provider_registry
-                    .resource_provider(&provider.adapter)
-                    .is_some()
-                && crate::resource::cache_needs_refresh(&state.pool, media_id, &provider.key)
-                    .await?
-            {
-                enqueue_resource_refresh_job(
-                    state,
-                    ResourceRefreshJobPayload {
-                        media_id,
-                        provider_key: provider.key.clone(),
-                        force: false,
-                    },
-                    PRIORITY_DAILY_INCREMENTAL,
-                )
-                .await?;
-            }
-            continue;
-        }
-        let hydration = HydrationJobPayload {
-            run_id: payload.run_id,
-            discovery_item_id: candidate.id,
-            content_hash: candidate.content_hash.clone(),
-            mode: payload.mode,
-            include_resources: payload.include_resources,
-        };
-        let dedupe_key = format!(
-            "hydrate:{}:{}:{}",
-            provider.key, candidate.id, candidate.content_hash
-        );
-        state
-            .ingestion_queue
-            .enqueue(EnqueueJob {
-                provider_key: &provider.key,
-                job_type: "hydrate",
-                priority,
-                payload: serde_json::to_value(hydration)?,
-                max_attempts: 3,
-                dedupe_key: Some(&dedupe_key),
-            })
-            .await?;
-        pending_count += 1;
-    }
+    let pending_count = enqueue_candidate_hydrations(
+        state,
+        &provider,
+        &candidates,
+        payload.mode,
+        payload.include_resources,
+        payload.run_id,
+    )
+    .await?;
     let inserted_count = candidates.iter().filter(|item| item.inserted).count() as i64;
     let updated_count = candidates.len() as i64 - inserted_count;
     let actual_next = if !reached_start { page.next_url } else { None };
@@ -3056,6 +3011,74 @@ pub(crate) async fn execute_discovery_job(
         .await?;
     transaction.commit().await?;
     Ok(())
+}
+
+/// Enqueue hydration (and incremental resource refresh) jobs for the
+/// candidates discovered on one catalogue page. Shared by the legacy
+/// discovery queue and the unified task engine bootstrap handler.
+pub(crate) async fn enqueue_candidate_hydrations(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    candidates: &[crate::ingestion::DiscoveredCandidate],
+    mode: SyncMode,
+    include_resources: bool,
+    run_id: i64,
+) -> anyhow::Result<i64> {
+    let priority = match mode {
+        SyncMode::Bootstrap => PRIORITY_HISTORICAL_BOOTSTRAP,
+        SyncMode::Incremental => PRIORITY_DAILY_INCREMENTAL,
+        SyncMode::OnDemand => PRIORITY_USER_ON_DEMAND,
+    };
+    let mut pending_count = 0_i64;
+    for candidate in candidates {
+        if !candidate.should_hydrate {
+            if mode == SyncMode::Incremental
+                && let Some(media_id) = candidate.media_id
+                && state
+                    .provider_registry
+                    .resource_provider(&provider.adapter)
+                    .is_some()
+                && crate::resource::cache_needs_refresh(&state.pool, media_id, &provider.key)
+                    .await?
+            {
+                enqueue_resource_refresh_job(
+                    state,
+                    ResourceRefreshJobPayload {
+                        media_id,
+                        provider_key: provider.key.clone(),
+                        force: false,
+                    },
+                    PRIORITY_DAILY_INCREMENTAL,
+                )
+                .await?;
+            }
+            continue;
+        }
+        let hydration = HydrationJobPayload {
+            run_id,
+            discovery_item_id: candidate.id,
+            content_hash: candidate.content_hash.clone(),
+            mode,
+            include_resources,
+        };
+        let dedupe_key = format!(
+            "hydrate:{}:{}:{}",
+            provider.key, candidate.id, candidate.content_hash
+        );
+        state
+            .ingestion_queue
+            .enqueue(EnqueueJob {
+                provider_key: &provider.key,
+                job_type: "hydrate",
+                priority,
+                payload: serde_json::to_value(hydration)?,
+                max_attempts: 3,
+                dedupe_key: Some(&dedupe_key),
+            })
+            .await?;
+        pending_count += 1;
+    }
+    Ok(pending_count)
 }
 
 pub(crate) async fn execute_hydration_job(
@@ -3551,12 +3574,12 @@ async fn fetch_source_catalogue(
     )
 }
 
-struct SourceCataloguePage {
-    items: Vec<SourceMedia>,
-    next_url: Option<String>,
+pub(crate) struct SourceCataloguePage {
+    pub(crate) items: Vec<SourceMedia>,
+    pub(crate) next_url: Option<String>,
 }
 
-async fn fetch_source_catalogue_page(
+pub(crate) async fn fetch_source_catalogue_page(
     state: &AppState,
     provider: &SourceProviderConfig,
     page_url: &str,
@@ -3783,7 +3806,7 @@ async fn load_product_settings(state: &AppState) -> AppResult<ProductSettings> {
     })
 }
 
-async fn source_provider_by_key(
+pub(crate) async fn source_provider_by_key(
     state: &AppState,
     key: &str,
 ) -> AppResult<Option<SourceProviderConfig>> {

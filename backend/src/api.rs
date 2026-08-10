@@ -28,6 +28,7 @@ use crate::{
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .merge(crate::task::api::router())
         .merge(crate::product::router())
         .merge(crate::providers::router())
         .route("/dashboard", get(dashboard))

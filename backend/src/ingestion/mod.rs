@@ -6,7 +6,8 @@ mod snapshot;
 mod worker;
 
 pub use discovery::{
-    DiscoveryJobPayload, SyncMode, reached_window_start, upsert_candidates, within_window,
+    DiscoveredCandidate, DiscoveryJobPayload, SyncMode, reached_window_start, upsert_candidates,
+    within_window,
 };
 pub use hydration::{
     HydrationJobPayload, fail as fail_hydration, finish as finish_hydration,

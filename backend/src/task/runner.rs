@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::AppState;
+use crate::providers::runtime::{GateBlocked, GateDecision};
 
 use super::handler::JobHandler;
 use super::model::{JobItem, JobStatus};
@@ -194,6 +195,22 @@ async fn execute_item(
         Err(error) => {
             let message = error.to_string();
             tracing::warn!(%error, run_id, item_id = item.id, "task item failed");
+            if let Some(blocked) = error.downcast_ref::<GateBlocked>() {
+                let delay = gate_defer_delay(blocked.decision);
+                tracing::info!(
+                    run_id,
+                    item_id = item.id,
+                    decision = ?blocked.decision,
+                    defer_seconds = delay.as_secs(),
+                    "task item deferred by provider runtime gate"
+                );
+                if let Err(persist_error) =
+                    ctx.engine.defer_item(item.id, owner, delay, &message).await
+                {
+                    tracing::error!(%persist_error, run_id, item_id = item.id, "could not defer task item");
+                }
+                return;
+            }
             if item.retry_count < ITEM_MAX_RETRIES {
                 if let Err(persist_error) =
                     ctx.retry_item(&message, ITEM_RETRY_DELAY).await
@@ -206,5 +223,14 @@ async fn execute_item(
                 tracing::error!(%persist_error, run_id, item_id = item.id, "could not persist item failure");
             }
         }
+    }
+}
+
+fn gate_defer_delay(decision: GateDecision) -> Duration {
+    match decision {
+        GateDecision::Cooldown => Duration::from_secs(2 * 60),
+        GateDecision::InteractionRequired => Duration::from_secs(15 * 60),
+        GateDecision::Unavailable => Duration::from_secs(5 * 60),
+        GateDecision::Allow | GateDecision::AllowDegraded => Duration::from_secs(60),
     }
 }

@@ -5,7 +5,8 @@ use sqlx::{Row, SqlitePool};
 use tokio::sync::Notify;
 
 use super::model::{
-    CreateJobRun, JobItem, JobItemStatus, JobRun, JobStatus, job_item_from_row, job_run_from_row,
+    CreateJobRun, JobEvent, JobItem, JobItemStatus, JobRun, JobRunStats, JobStatus,
+    job_event_from_row, job_item_from_row, job_run_from_row,
 };
 
 #[derive(Debug, Clone)]
@@ -45,7 +46,7 @@ impl TaskEngine {
         }
         let config = input.config.to_string();
         let id = sqlx::query(
-            "INSERT INTO job_run(job_definition_id,job_type,provider_key,status,idempotency_key,priority,checkpoint_json) VALUES (?,?,?,'pending',?,?,?) RETURNING id",
+            "INSERT INTO job_run(job_definition_id,job_type,provider_key,status,idempotency_key,priority,config_json) VALUES (?,?,?,'pending',?,?,?) RETURNING id",
         )
         .bind(input.job_definition_id)
         .bind(input.job_type)
@@ -105,6 +106,98 @@ impl TaskEngine {
                 .await?
         };
         Ok((rows.iter().map(job_run_from_row).collect(), total))
+    }
+
+    pub async fn list_items(
+        &self,
+        run_id: i64,
+        status: Option<JobItemStatus>,
+        page: i64,
+        page_size: i64,
+    ) -> anyhow::Result<(Vec<JobItem>, i64)> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 200);
+        let offset = (page - 1) * page_size;
+        let total: i64 = if let Some(status) = status {
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_item WHERE run_id=? AND status=?")
+                .bind(run_id)
+                .bind(status.as_str())
+                .fetch_one(&self.pool)
+                .await?
+        } else {
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_item WHERE run_id=?")
+                .bind(run_id)
+                .fetch_one(&self.pool)
+                .await?
+        };
+        let rows = if let Some(status) = status {
+            sqlx::query(
+                "SELECT * FROM job_item WHERE run_id=? AND status=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(run_id)
+            .bind(status.as_str())
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query("SELECT * FROM job_item WHERE run_id=? ORDER BY id DESC LIMIT ? OFFSET ?")
+                .bind(run_id)
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+        };
+        Ok((rows.iter().map(job_item_from_row).collect(), total))
+    }
+
+    pub async fn list_events(
+        &self,
+        run_id: i64,
+        page: i64,
+        page_size: i64,
+    ) -> anyhow::Result<(Vec<JobEvent>, i64)> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 200);
+        let offset = (page - 1) * page_size;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_event WHERE run_id=?")
+                .bind(run_id)
+                .fetch_one(&self.pool)
+                .await?;
+        let rows = sqlx::query(
+            "SELECT * FROM job_event WHERE run_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(run_id)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok((rows.iter().map(job_event_from_row).collect(), total))
+    }
+
+    pub async fn run_stats(&self, run_id: i64) -> anyhow::Result<JobRunStats> {
+        let row = sqlx::query(
+            "SELECT \
+                COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0) AS success, \
+                COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0) AS failed, \
+                COALESCE(SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END),0) AS skipped, \
+                COALESCE(SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),0) AS pending, \
+                COALESCE(SUM(CASE WHEN status='running' THEN 1 ELSE 0 END),0) AS running, \
+                COALESCE(SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END),0) AS cancelled \
+             FROM job_item WHERE run_id=?",
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(JobRunStats {
+            success: row.get("success"),
+            failed: row.get("failed"),
+            skipped: row.get("skipped"),
+            pending: row.get("pending"),
+            running: row.get("running"),
+            cancelled: row.get("cancelled"),
+        })
     }
 
     pub async fn create_item(
@@ -254,6 +347,31 @@ impl TaskEngine {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Park an item for a provider-gate wait (cooldown / interaction / outage)
+    /// without consuming a retry attempt.
+    pub async fn defer_item(
+        &self,
+        item_id: i64,
+        owner: &str,
+        delay: Duration,
+        reason: &str,
+    ) -> sqlx::Result<bool> {
+        let modifier = format!("+{} seconds", delay.as_secs());
+        let result = sqlx::query(
+            "UPDATE job_item SET status='pending',available_at=datetime('now',?),lease_owner=NULL,lease_expires_at=NULL,error_message=?,retry_count=CASE WHEN retry_count>0 THEN retry_count-1 ELSE 0 END,finished_at=NULL,updated_at=datetime('now') WHERE id=? AND lease_owner=?",
+        )
+        .bind(modifier)
+        .bind(reason)
+        .bind(item_id)
+        .bind(owner)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            self.notify.notify_one();
+        }
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn run_has_pending_work(&self, run_id: i64) -> sqlx::Result<bool> {
         let pending: i64 = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM job_item WHERE run_id=? AND status='pending' AND (available_at IS NULL OR available_at<=datetime('now')))",
@@ -262,6 +380,21 @@ impl TaskEngine {
         .fetch_one(&self.pool)
         .await?;
         Ok(pending != 0)
+    }
+
+    /// Reset failed items of a run back to pending for a "retry failed only"
+    /// pass. Returns the number of items requeued.
+    pub async fn requeue_failed_items(&self, run_id: i64) -> anyhow::Result<i64> {
+        let result = sqlx::query(
+            "UPDATE job_item SET status='pending',available_at=datetime('now'),error_message=NULL,retry_count=0,finished_at=NULL,updated_at=datetime('now') WHERE run_id=? AND status='failed'",
+        )
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() > 0 {
+            self.notify.notify_waiters();
+        }
+        Ok(result.rows_affected() as i64)
     }
 
     pub async fn recover_expired(&self) -> sqlx::Result<u64> {
@@ -567,5 +700,50 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_item_keeps_retry_budget() {
+        let engine = engine().await;
+        let run = engine.create_run(input("bootstrap:javdb:2025")).await.unwrap();
+        engine.create_item(run.id, "page-1", json!({})).await.unwrap();
+        let item = engine
+            .claim_next_item(run.id, "worker-a", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.retry_count, 1);
+        assert!(
+            engine
+                .defer_item(item.id, "worker-a", Duration::ZERO, "gate:cooldown")
+                .await
+                .unwrap()
+        );
+        let resumed = engine
+            .claim_next_item(run.id, "worker-a", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.retry_count, 1);
+    }
+
+    #[tokio::test]
+    async fn requeue_failed_items_resets_them_to_pending() {
+        let engine = engine().await;
+        let run = engine.create_run(input("bootstrap:javdb:2026")).await.unwrap();
+        engine.create_item(run.id, "page-1", json!({})).await.unwrap();
+        let item = engine
+            .claim_next_item(run.id, "worker-a", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        engine
+            .finish_item(item.id, "worker-a", JobItemStatus::Failed, Some("boom"), json!({}))
+            .await
+            .unwrap();
+        assert_eq!(engine.requeue_failed_items(run.id).await.unwrap(), 1);
+        let item = engine.item_by_id(item.id).await.unwrap();
+        assert_eq!(item.status, JobItemStatus::Pending);
+        assert_eq!(item.retry_count, 0);
     }
 }

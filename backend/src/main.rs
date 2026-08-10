@@ -70,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&source_cache_root).await?;
     let pool = storage::connect(&database_url).await?;
     let (events, _) = broadcast::channel(512);
+    let mut handler_registry = task::handler::HandlerRegistry::new();
+    handler_registry.register(std::sync::Arc::new(task::bootstrap::BootstrapHandler));
     let state = AppState {
         pool: pool.clone(),
         scrape_limiter: Arc::new(Semaphore::new(8)),
@@ -85,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         )),
         ingestion_queue: ingestion::IngestionQueue::new(pool.clone()),
         task_engine: task::TaskEngine::new(pool.clone()),
-        handler_registry: Arc::new(task::handler::HandlerRegistry::new()),
+        handler_registry: Arc::new(handler_registry),
     };
     task::runner::start(state.clone()).await?;
     ingestion::start_workers(state.clone()).await?;
