@@ -19,6 +19,7 @@
   --sidebar-muted: #717781;
   --sidebar-border: #dfe1e5;
   --success: #23845b;
+  --warning: #a96618;
   --danger: #cf4335;
   --shadow: 0 1px 1px rgba(16, 18, 20, .03), 0 10px 28px rgba(16, 18, 20, .045);
 }
@@ -42,6 +43,7 @@ body.luma-dark {
   --sidebar-muted: #858b94;
   --sidebar-border: rgba(255, 255, 255, .09);
   --success: #45b984;
+  --warning: #e0a34c;
   --danger: #f07163;
   --shadow: 0 10px 30px rgba(0, 0, 0, .18);
 }
@@ -781,4 +783,76 @@ body.luma-dark .state-chip { color:#b8bdc5; background:#282c31; }
   .automation-list article > .n-button { grid-column:2; justify-self:end; }
   .advanced-links { grid-template-columns:1fr; }
   .form-grid,.inline-fields { grid-template-columns:1fr; }
+}
+
+/* Product workflow surfaces share the same semantic tokens in both themes. */
+.product-section-head > div { min-width:0; display:grid; gap:4px; }
+.product-section-head > div > span { color:var(--text-secondary); font-size:10px; line-height:1.5; }
+.resolve-empty .n-button { margin-top:16px; }
+.resolve-status { margin-top:10px; color:var(--text-secondary); font-size:10px; }
+.quiet-empty.compact { min-height:170px; }
+.media-type-label { color:var(--accent); font-size:10px; font-weight:760; letter-spacing:.1em; text-transform:uppercase; }
+.work-information-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); overflow:hidden; background:var(--surface); border:1px solid var(--hairline); border-radius:12px; }
+.work-information-grid > div { min-height:86px; padding:17px; display:grid; align-content:center; gap:7px; border-right:1px solid var(--hairline); }
+.work-information-grid > div:last-child { border-right:0; }
+.work-information-grid span,.metadata-source-row span { color:var(--text-secondary); font-size:9px; }
+.work-information-grid strong { overflow:hidden; font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+.detail-information .actor-pills { margin-top:13px; }
+.metadata-source-list { overflow:hidden; background:var(--surface); border:1px solid var(--hairline); border-radius:12px; }
+.metadata-source-row { min-height:78px; padding:14px 16px; display:grid; grid-template-columns:minmax(160px,.8fr) minmax(240px,1.4fr) minmax(125px,.6fr) 24px; align-items:center; gap:18px; border-bottom:1px solid var(--hairline); }
+.metadata-source-row:last-child { border-bottom:0; }
+.metadata-source-identity { min-width:0; display:flex; align-items:center; gap:10px; }
+.metadata-source-identity > svg { flex:0 0 auto; color:var(--accent); }
+.metadata-source-identity > div,.metadata-source-fields,.metadata-source-time { min-width:0; display:grid; gap:4px; }
+.metadata-source-row strong { overflow:hidden; font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
+.metadata-source-row > a { display:grid; place-items:center; color:var(--text-secondary); }
+.metadata-source-row > a:hover { color:var(--accent); }
+.resource-section-head { align-items:center; }
+.resource-card-detailed { min-height:132px; }
+.resource-card-detailed .resource-main p { flex-wrap:wrap; line-height:1.55; }
+.resource-technical { margin-top:8px; color:var(--text-secondary); font-size:9px; }
+.resource-technical summary { width:max-content; cursor:pointer; }
+.resource-technical code { margin-top:7px; display:block; overflow-wrap:anywhere; color:var(--text); font-family:"IBM Plex Mono",Consolas,monospace; font-size:9px; }
+.resource-technical > span { margin-top:4px; display:block; }
+.local-file-callout { min-height:86px; padding:16px 18px; display:grid; grid-template-columns:30px minmax(0,1fr) auto; align-items:center; gap:13px; background:var(--surface); border:1px solid var(--hairline); border-radius:12px; }
+.local-file-callout > svg { color:var(--accent); }
+.local-file-callout > div { min-width:0; display:grid; gap:4px; }
+.local-file-callout strong { font-size:11px; }
+.local-file-callout span { color:var(--text-secondary); font-size:9px; }
+.library-export-actions { margin-top:18px; display:flex; flex-wrap:wrap; gap:8px; }
+.library-rematch-panel { max-width:920px; margin-top:14px; padding:20px 22px; display:grid; grid-template-columns:minmax(0,1fr) minmax(300px,.8fr); align-items:center; gap:24px; }
+.library-rematch-copy { min-width:0; display:flex; align-items:center; gap:12px; }
+.library-rematch-copy > svg { flex:0 0 auto; color:var(--accent); }
+.library-rematch-copy > div { display:grid; gap:4px; }
+.library-rematch-copy strong { font-size:11px; }
+.library-rematch-copy span { color:var(--text-secondary); font-size:9px; line-height:1.5; }
+.library-rematch-form { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; }
+.source-priority-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
+.source-bootstrap-control { margin-top:10px; padding:12px; background:var(--surface-muted); border:1px solid var(--hairline); border-radius:9px; }
+.source-bootstrap-range { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.source-bootstrap-range .n-form-item { margin-bottom:8px; }
+.source-sync-actions { display:flex; flex-wrap:wrap; gap:7px; }
+
+@media (max-width:900px) {
+  .work-information-grid { grid-template-columns:1fr 1fr; }
+  .work-information-grid > div:nth-child(2) { border-right:0; }
+  .work-information-grid > div:nth-child(-n+2) { border-bottom:1px solid var(--hairline); }
+  .metadata-source-row { grid-template-columns:minmax(150px,.8fr) minmax(200px,1.2fr) 24px; }
+  .metadata-source-time { display:none; }
+  .library-rematch-panel { grid-template-columns:1fr; }
+}
+
+@media (max-width:640px) {
+  .search-stage { height:auto; min-height:54px; margin-bottom:25px; padding:7px 7px 7px 13px; }
+  .search-stage > svg { display:none; }
+  .work-information-grid { grid-template-columns:1fr; }
+  .work-information-grid > div { border-right:0; border-bottom:1px solid var(--hairline); }
+  .work-information-grid > div:last-child { border-bottom:0; }
+  .metadata-source-row { grid-template-columns:minmax(0,1fr) 22px; gap:10px; }
+  .metadata-source-fields { grid-column:1/-1; }
+  .local-file-callout { grid-template-columns:26px minmax(0,1fr); }
+  .local-file-callout .n-button { grid-column:2; justify-self:start; }
+  .library-export-actions { align-items:stretch; flex-direction:column; }
+  .library-rematch-form,.source-priority-grid,.source-bootstrap-range { grid-template-columns:1fr; }
+  .resource-section-head { align-items:flex-start; flex-direction:column; }
 }

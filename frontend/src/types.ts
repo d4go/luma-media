@@ -235,12 +235,14 @@ export interface CrawlerForm {
 
 export interface ProductMedia { id: number; code: string; title: string; originalTitle: string | null; summary: string; releaseDate: string | null; durationMinutes: number | null; posterUrl: string | null; backdropUrl: string | null; mediaType: string; metadataStatus: string; createdAt: string; updatedAt: string }
 export interface Actor { id: number; name: string; aliases: string[]; avatarUrl: string | null; followed: boolean; mediaCount: number }
-export interface Resource { id: number; mediaId: number; providerKey: string; title: string; downloadUrl: string; infoHash: string | null; sizeBytes: number | null; resolution: string | null; subtitleLanguages: string[]; trackers: string[]; publishedAt: string | null; score: number; scoreReasons: string[]; available: boolean; qbitHash: string | null; qbitState: string | null; qbitSyncStatus: 'synced' | 'unavailable' | 'unknown'; acquisitionId: number | null; acquisitionState: string | null }
+export interface Resource { id: number; mediaId: number; providerKey: string; title: string; downloadUrl: string; infoHash: string | null; sizeBytes: number | null; resolution: string | null; subtitleLanguages: string[]; trackers: string[]; publishedAt: string | null; score: number; scoreReasons: string[]; available: boolean; availabilityStatus: string; codec: string | null; sourceCount: number; firstSeenAt: string | null; lastSeenAt: string | null; lastVerifiedAt: string | null; qbitHash: string | null; qbitState: string | null; qbitSyncStatus: 'synced' | 'unavailable' | 'unknown'; acquisitionId: number | null; acquisitionState: string | null }
 export interface Acquisition { id: number; mediaId: number; resourceId: number | null; requestedBy: string; state: string; stateMessage: string; qbitHash: string | null; qbitState: string | null; progress: number; downloadSpeed: number; etaSeconds: number | null; downloadPath: string | null; libraryItemId: number | null; lastError: string | null; retryCount: number; createdAt: string; updatedAt: string; completedAt: string | null; media: ProductMedia; resource: Resource | null }
 export interface ProviderReport { providerKey: string; ok: boolean; message: string; resultCount: number }
 export interface SearchResponse { query: string; media: ProductMedia[]; actors: Actor[]; providerReports: ProviderReport[] }
 export interface HomeData { activeAcquisitions: number; libraryCount: number; attentionCount: number; followedActors: number; recentAcquisitions: Acquisition[]; quickStarts: { title: string; description: string; to: string }[] }
-export interface MediaDetail { media: ProductMedia; actors: Actor[]; resources: Resource[]; latestAcquisitionId: number | null; libraryItemId: number | null }
+export interface MetadataSourceRecord { id: number; providerKey: string; providerEntityId: string; sourceUrl: string | null; recordKind: string; evidenceLevel: number; priority: number; title: string | null; originalTitle: string | null; summary: string | null; releaseDate: string | null; durationMinutes: number | null; posterUrl: string | null; backdropUrl: string | null; actors: unknown[]; aliases: unknown[]; tags: string[]; firstSeenAt: string; lastSeenAt: string; updatedAt: string }
+export interface FieldProvenance { field: string; providerKey: string; sourceRecordId: number; priority: number; value: unknown; sourceUpdatedAt: string; selectedAt: string }
+export interface MediaDetail { media: ProductMedia; actors: Actor[]; resources: Resource[]; metadataSources: MetadataSourceRecord[]; fieldProvenance: FieldProvenance[]; latestAcquisitionId: number | null; libraryItemId: number | null }
 export interface AcquisitionEvent { id: number; eventKey: string; fromState: string | null; toState: string; message: string; payload: unknown; createdAt: string }
 export interface AcquisitionDetail { acquisition: Acquisition; events: AcquisitionEvent[] }
 export interface AttentionItem { id: number; kind: string; severity: string; title: string; message: string; acquisitionId: number | null; mediaId: number | null; mediaTitle: string | null; mediaCode: string | null; actions: string[]; createdAt: string }
@@ -257,6 +259,11 @@ export interface ProviderConfig {
   lastMessage: string
   lastCheckedAt: string | null
   syncStatus: 'idle' | 'running' | 'success' | 'failed'
+  syncActiveMode: 'incremental' | 'bootstrap'
+  syncBootstrapPaused: boolean
+  syncBootstrapFrom: string | null
+  syncBootstrapTo: string | null
+  syncCursor: Record<string, unknown>
   syncLastStartedAt: string | null
   syncLastFinishedAt: string | null
   syncLastSuccessAt: string | null
@@ -266,6 +273,10 @@ export interface ProviderConfig {
   syncItemCount: number
   syncInsertedCount: number
   syncUpdatedCount: number
+  syncDiscoveryCount: number
+  syncHydratedCount: number
+  syncHydrationFailedCount: number
+  syncPendingCount: number
 }
 export type ProviderFetchMode = 'auto' | 'http' | 'browser'
 export type ProviderRuntimeState = 'ready' | 'degraded' | 'cooldown' | 'interaction_required' | 'unavailable'
@@ -309,5 +320,12 @@ export interface BrowserSession {
   startedAt: string
   expiresAt: string
 }
+export interface SyncRunResponse { runId: number; mode: 'incremental' | 'bootstrap'; status: string }
+export interface CatalogResolveResponse { code: string; mediaId: number | null; status: string; jobIds: number[] }
+export interface ResourceRefreshResponse { mediaId: number; status: string; jobIds: number[] }
+export interface LibraryExportReport { mediaId: number; libraryItemId: number | null; nfoPath: string; posterPath: string | null; metadataUpdatedAt: string }
+export interface LibraryExportResponse { export: LibraryExportReport; message: string }
+export interface LibraryRematchResponse { item: LibraryItem; message: string }
+export interface ProviderReparseResponse { provider: string; parserVersion: string; scanned: number; valid: number; invalid: number; failed: number; networkRequests: number }
 export interface ProductSettings { downloadRoot: string; mediaRoot: string; qbittorrentSavePath: string; qbittorrentCategory: string; qbittorrentTags: string; organizerMode: 'hardlink' | 'copy'; organizerMovieTemplate: string; organizerConflictPolicy: string }
 export interface AutomationRule { id: number; name: string; enabled: boolean; triggerType: string; triggerConfig: Record<string, unknown>; conditions: Record<string, unknown>; actionType: string; actionConfig: Record<string, unknown>; mode: 'AUTO' | 'CONFIRM' | 'NOTIFY'; lastRunAt: string | null; nextRunAt: string | null; lastStatus: string | null; lastExplanation: string | null; createdAt: string }

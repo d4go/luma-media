@@ -19,6 +19,9 @@ import {
   IconDeviceFloppy,
   IconDownload,
   IconFolder,
+  IconHistory,
+  IconPlayerPause,
+  IconPlayerPlay,
   IconPlus,
   IconPlugConnected,
   IconRefresh,
@@ -38,6 +41,7 @@ const creatingSource = ref(false)
 const showNewSource = ref(false)
 const testing = ref('')
 const syncing = ref('')
+const reparsing = ref('')
 const diagnosing = ref('')
 const browserSessionBusy = ref('')
 const providers = ref<ProviderConfig[]>([])
@@ -45,6 +49,7 @@ const providerRuntimes = reactive<Record<string, ProviderRuntime>>({})
 const browserSessions = reactive<Record<string, BrowserSession>>({})
 const secrets = reactive<Record<string, string>>({})
 const testMessages = reactive<Record<string, { ok: boolean; text: string }>>({})
+const bootstrapWindows = reactive<Record<string, { from: string; to: string }>>({})
 const sourceAdapterOptions = [
   { label: 'Jav321（当前可直连）', value: 'jav321', name: 'Jav321', baseUrl: 'https://www.jav321.com', hint: '搜索番号时可直接返回作品信息和磁力资源。' },
   { label: 'JavDB', value: 'javdb', name: 'JavDB', baseUrl: 'https://javdb.com', hint: '默认通过 Chromium 持久会话访问；需要正常站点交互时会明确提示。' },
@@ -149,6 +154,15 @@ function updateSourceSyncDetailLimit(provider: ProviderConfig, value: number | n
   provider.config = { ...provider.config, syncDetailLimit: value ?? 8 }
 }
 
+function sourceConfigNumber(provider: ProviderConfig, key: 'metadataPriority' | 'resourcePriority' | 'resourceCacheTtlHours', fallback: number) {
+  const value = Number(provider.config[key])
+  return Number.isFinite(value) ? value : fallback
+}
+
+function updateSourceConfigNumber(provider: ProviderConfig, key: 'metadataPriority' | 'resourcePriority' | 'resourceCacheTtlHours', value: number | null, fallback: number) {
+  provider.config = { ...provider.config, [key]: value ?? fallback }
+}
+
 const syncStatusLabel: Record<ProviderConfig['syncStatus'], string> = {
   idle: '等待同步',
   running: '同步中',
@@ -158,6 +172,31 @@ const syncStatusLabel: Record<ProviderConfig['syncStatus'], string> = {
 
 function syncDate(value: string | null, fallback: string) {
   return value ? formatDate(value) : fallback
+}
+
+function defaultBootstrapWindow() {
+  const to = new Date()
+  const from = new Date(to)
+  from.setFullYear(from.getFullYear() - 2)
+  return { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) }
+}
+
+function bootstrapWindow(provider: ProviderConfig) {
+  if (!bootstrapWindows[provider.key]) {
+    const fallback = defaultBootstrapWindow()
+    bootstrapWindows[provider.key] = {
+      from: provider.syncBootstrapFrom ?? fallback.from,
+      to: provider.syncBootstrapTo ?? fallback.to,
+    }
+  }
+  return bootstrapWindows[provider.key]
+}
+
+function syncCursor(provider: ProviderConfig) {
+  const page = Number(provider.syncCursor.page)
+  if (Number.isFinite(page) && page > 0) return `第 ${page} 页`
+  const cursor = provider.syncCursor.nextUrl ?? provider.syncCursor.cursor
+  return typeof cursor === 'string' && cursor ? cursor : '尚无 checkpoint'
 }
 
 function selectSourceAdapter(value: string) {
@@ -193,6 +232,7 @@ async function load() {
       api.productSettings(),
     ])
     providers.value = providerData
+    providerData.filter(provider => provider.type === 'source').forEach(bootstrapWindow)
     const runtimeResults = await Promise.allSettled(
       providerData.filter(provider => provider.type === 'source').map(provider => api.providerRuntime(provider.key)),
     )
@@ -395,17 +435,73 @@ function clearBrowserProfile(provider: ProviderConfig) {
   })
 }
 
-async function syncProvider(provider: ProviderConfig) {
-  syncing.value = provider.key
+async function startIncremental(provider: ProviderConfig) {
+  syncing.value = `${provider.key}:incremental`
   try {
     await persistProvider(provider)
-    Object.assign(provider, await api.syncProvider(provider.key))
-    message.success(`${provider.displayName} 已开始后台同步`)
+    const result = await api.syncProviderIncremental(provider.key)
+    message.success(`${provider.displayName} 增量同步已开始，任务 #${result.runId}`)
+    await load()
     scheduleSyncPoll()
   } catch (reason) {
-    message.error(reason instanceof Error ? reason.message : '来源同步启动失败')
+    message.error(reason instanceof Error ? reason.message : '增量同步启动失败')
   } finally {
     syncing.value = ''
+  }
+}
+
+async function startBootstrap(provider: ProviderConfig) {
+  syncing.value = `${provider.key}:bootstrap`
+  try {
+    await persistProvider(provider)
+    const range = bootstrapWindow(provider)
+    const result = await api.bootstrapProvider(provider.key, range.from, range.to, true)
+    message.success(`${provider.displayName} 历史回填已开始，任务 #${result.runId}`)
+    await load()
+    scheduleSyncPoll()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '历史回填启动失败')
+  } finally {
+    syncing.value = ''
+  }
+}
+
+async function pauseBootstrap(provider: ProviderConfig) {
+  syncing.value = `${provider.key}:pause`
+  try {
+    await api.pauseProviderBootstrap(provider.key)
+    message.success('历史回填会在当前批次结束后暂停')
+    await load()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '暂停历史回填失败')
+  } finally {
+    syncing.value = ''
+  }
+}
+
+async function resumeBootstrap(provider: ProviderConfig) {
+  syncing.value = `${provider.key}:resume`
+  try {
+    await api.resumeProviderBootstrap(provider.key)
+    message.success('历史回填已从 checkpoint 继续')
+    await load()
+    scheduleSyncPoll()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '继续历史回填失败')
+  } finally {
+    syncing.value = ''
+  }
+}
+
+async function reparseProvider(provider: ProviderConfig) {
+  reparsing.value = provider.key
+  try {
+    const result = await api.reparseProvider(provider.key)
+    message.success(`已从本地快照重解析 ${result.scanned} 项，未发起网络请求`)
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '本地快照重解析失败')
+  } finally {
+    reparsing.value = ''
   }
 }
 
@@ -537,22 +633,76 @@ onUnmounted(() => {
                   @update:value="value => updateSourceSyncDetailLimit(provider, value)"
                 />
               </n-form-item>
+              <div class="source-priority-grid">
+                <n-form-item label="元数据优先级">
+                  <n-input-number
+                    :value="sourceConfigNumber(provider, 'metadataPriority', 100)"
+                    :min="-1000"
+                    :max="1000"
+                    style="width: 100%"
+                    @update:value="value => updateSourceConfigNumber(provider, 'metadataPriority', value, 100)"
+                  />
+                </n-form-item>
+                <n-form-item label="资源优先级">
+                  <n-input-number
+                    :value="sourceConfigNumber(provider, 'resourcePriority', 100)"
+                    :min="-1000"
+                    :max="1000"
+                    style="width: 100%"
+                    @update:value="value => updateSourceConfigNumber(provider, 'resourcePriority', value, 100)"
+                  />
+                </n-form-item>
+                <n-form-item label="资源缓存（小时）">
+                  <n-input-number
+                    :value="sourceConfigNumber(provider, 'resourceCacheTtlHours', 72)"
+                    :min="1"
+                    :max="720"
+                    style="width: 100%"
+                    @update:value="value => updateSourceConfigNumber(provider, 'resourceCacheTtlHours', value, 72)"
+                  />
+                </n-form-item>
+              </div>
               <div class="source-sync-summary">
                 <header>
                   <div><strong>本地索引同步</strong><small>{{ provider.syncLastMessage || '等待第一次同步' }}</small></div>
                   <span class="source-sync-status" :data-status="provider.syncStatus">{{ syncStatusLabel[provider.syncStatus] }}</span>
                 </header>
                 <dl>
+                  <div><dt>当前模式</dt><dd>{{ provider.syncActiveMode === 'bootstrap' ? '历史回填' : '增量同步' }}{{ provider.syncBootstrapPaused ? '，已暂停' : '' }}</dd></div>
+                  <div><dt>当前位置</dt><dd :title="syncCursor(provider)">{{ syncCursor(provider) }}</dd></div>
                   <div><dt>最近成功</dt><dd>{{ syncDate(provider.syncLastSuccessAt, '尚未成功') }}</dd></div>
                   <div><dt>下次执行</dt><dd>{{ sourceSyncEnabled(provider) ? syncDate(provider.syncNextRunAt, '等待安排') : '已关闭' }}</dd></div>
-                  <div><dt>本轮收录</dt><dd>{{ provider.syncItemCount }} 项</dd></div>
-                  <div><dt>数据变化</dt><dd>新增 {{ provider.syncInsertedCount }} · 更新 {{ provider.syncUpdatedCount }}</dd></div>
+                  <div><dt>发现</dt><dd>{{ provider.syncDiscoveryCount }} 项</dd></div>
+                  <div><dt>已补全</dt><dd>{{ provider.syncHydratedCount }} 项</dd></div>
+                  <div><dt>待处理</dt><dd>{{ provider.syncPendingCount }} 项</dd></div>
+                  <div><dt>补全失败</dt><dd>{{ provider.syncHydrationFailedCount }} 项</dd></div>
+                  <div><dt>数据变化</dt><dd>新增 {{ provider.syncInsertedCount }}，更新 {{ provider.syncUpdatedCount }}</dd></div>
                   <div><dt>连续失败</dt><dd>{{ provider.syncFailureCount }} 次</dd></div>
-                  <div><dt>最近完成</dt><dd>{{ syncDate(provider.syncLastFinishedAt, '尚未执行') }}</dd></div>
                 </dl>
                 <n-alert v-if="provider.syncStatus === 'failed' && provider.syncLastMessage" type="error" title="最近一次同步失败">
                   {{ provider.syncLastMessage }}
                 </n-alert>
+              </div>
+              <div class="source-bootstrap-control">
+                <div class="source-bootstrap-range">
+                  <n-form-item label="历史开始日期"><n-input v-model:value="bootstrapWindow(provider).from" placeholder="2024-01-01" /></n-form-item>
+                  <n-form-item label="历史结束日期"><n-input v-model:value="bootstrapWindow(provider).to" placeholder="2026-08-10" /></n-form-item>
+                </div>
+                <div class="source-sync-actions">
+                  <n-button type="primary" :loading="syncing === `${provider.key}:incremental`" :disabled="!provider.enabled || provider.syncStatus === 'running'" @click="startIncremental(provider)">
+                    <template #icon><IconRefresh /></template>立即增量同步
+                  </n-button>
+                  <n-button secondary :loading="syncing === `${provider.key}:bootstrap`" :disabled="!provider.enabled || provider.syncStatus === 'running'" @click="startBootstrap(provider)">
+                    <template #icon><IconHistory /></template>历史回填
+                  </n-button>
+                  <n-button v-if="provider.syncActiveMode === 'bootstrap' && provider.syncStatus === 'running' && !provider.syncBootstrapPaused" secondary :loading="syncing === `${provider.key}:pause`" @click="pauseBootstrap(provider)">
+                    <template #icon><IconPlayerPause /></template>暂停回填
+                  </n-button>
+                  <n-button v-if="provider.syncBootstrapPaused" secondary :loading="syncing === `${provider.key}:resume`" @click="resumeBootstrap(provider)">
+                    <template #icon><IconPlayerPlay /></template>继续回填
+                  </n-button>
+                  <n-button quaternary :loading="reparsing === provider.key" @click="reparseProvider(provider)">重解析本地快照</n-button>
+                </div>
               </div>
             </div>
             <div v-if="providerRuntimes[provider.key]" class="source-runtime-summary">
@@ -615,15 +765,6 @@ onUnmounted(() => {
                   关闭会话
                 </n-button>
               </template>
-              <n-button
-                type="primary"
-                :loading="syncing === provider.key || provider.syncStatus === 'running'"
-                :disabled="!provider.enabled"
-                @click="syncProvider(provider)"
-              >
-                <template #icon><IconRefresh /></template>
-                立即同步
-              </n-button>
               <n-button
                 quaternary
                 type="error"

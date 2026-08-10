@@ -45,11 +45,16 @@ pub fn router() -> Router<AppState> {
         .route("/home", get(home))
         .route("/events", get(events))
         .route("/search", get(search))
+        .route("/catalog/resolve", post(resolve_catalog_code))
         .route("/catalog/media", get(list_media))
         .route("/catalog/media/{id}", get(media_detail))
         .route(
             "/catalog/media/{id}/resources",
             get(media_resources).post(refresh_media_resources),
+        )
+        .route(
+            "/catalog/media/{id}/resources/refresh",
+            post(refresh_media_resources),
         )
         .route("/catalog/media/{id}/acquire", post(acquire_media))
         .route("/actors", get(list_actors))
@@ -72,6 +77,7 @@ pub fn router() -> Router<AppState> {
         .route("/library/{id}/reorganize", post(reorganize_library))
         .route("/library/{id}/nfo", post(regenerate_library_nfo))
         .route("/library/{id}/artwork", post(sync_library_artwork))
+        .route("/library/{id}/rematch", post(rematch_library_item))
         .route("/attention", get(list_attention))
         .route("/attention/{id}", get(attention_detail))
         .route("/attention/{id}/action", post(attention_action))
@@ -252,6 +258,30 @@ struct ProviderReport {
     result_count: usize,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CatalogResolveJobPayload {
+    pub code: String,
+    pub include_resources: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogResolveInput {
+    code: String,
+    #[serde(default = "default_true")]
+    include_resources: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogResolveResponse {
+    code: String,
+    media_id: Option<i64>,
+    status: String,
+    job_ids: Vec<i64>,
+}
+
 async fn home(State(state): State<AppState>) -> AppResult<Json<Value>> {
     let active: i64 = sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM acquisition WHERE state IN ({ACTIVE_STATES})"
@@ -333,6 +363,64 @@ async fn search(
         media: media_rows.iter().map(media_from_row).collect(),
         actors: actor_rows.iter().map(actor_from_row).collect(),
         provider_reports: Vec::new(),
+    }))
+}
+
+async fn resolve_catalog_code(
+    State(state): State<AppState>,
+    Json(input): Json<CatalogResolveInput>,
+) -> AppResult<Json<CatalogResolveResponse>> {
+    let code = extract_media_code(&input.code)
+        .map(|value| normalize_code(&value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("请输入完整番号，例如 ABC-123".into()))?;
+    let media_id = sqlx::query_scalar::<_, i64>("SELECT id FROM media WHERE normalized_code=?")
+        .bind(&code)
+        .fetch_optional(&state.pool)
+        .await?;
+    let rows = sqlx::query("SELECT * FROM provider_config WHERE provider_type='source' AND enabled=1 ORDER BY COALESCE(json_extract(config_json,'$.metadataPriority'),100) DESC,provider_key")
+        .fetch_all(&state.pool)
+        .await?;
+    let providers = rows
+        .iter()
+        .map(source_provider_from_row)
+        .filter(|provider| state.provider_registry.contains(&provider.adapter))
+        .collect::<Vec<_>>();
+    if providers.is_empty() {
+        return Err(AppError::BadRequest(
+            "没有已启用且支持按番号查找的数据源".into(),
+        ));
+    }
+    let mut job_ids = Vec::with_capacity(providers.len());
+    for provider in providers {
+        let dedupe_key = format!("catalog-resolve:{}:{code}", provider.key);
+        let job = state
+            .ingestion_queue
+            .enqueue(EnqueueJob {
+                provider_key: &provider.key,
+                job_type: "catalog_resolve",
+                priority: PRIORITY_USER_ON_DEMAND,
+                payload: serde_json::to_value(CatalogResolveJobPayload {
+                    code: code.clone(),
+                    include_resources: input.include_resources,
+                })
+                .map_err(anyhow::Error::from)?,
+                max_attempts: 2,
+                dedupe_key: Some(&dedupe_key),
+            })
+            .await?;
+        job_ids.push(job.id);
+    }
+    emit(
+        &state,
+        "catalog-resolve",
+        json!({"code":code,"status":"queued","jobIds":job_ids}),
+    );
+    Ok(Json(CatalogResolveResponse {
+        code,
+        media_id,
+        status: "queued".into(),
+        job_ids,
     }))
 }
 
@@ -1572,6 +1660,82 @@ async fn sync_library_artwork(
     Ok(Json(json!({"export": report, "message": message})))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct LibraryRematchInput {
+    code: Option<String>,
+}
+
+async fn rematch_library_item(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+    input: Option<Json<LibraryRematchInput>>,
+) -> AppResult<Json<Value>> {
+    let row = sqlx::query("SELECT video_path,legacy_media_item_id FROM library_item WHERE id=?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let video_path: String = row.get("video_path");
+    let requested = input
+        .and_then(|Json(value)| value.code)
+        .and_then(|value| extract_media_code(&value))
+        .or_else(|| {
+            Path::new(&video_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .and_then(extract_media_code)
+        })
+        .or_else(|| extract_media_code(&video_path))
+        .map(|value| normalize_code(&value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("无法从文件名识别番号，请手动填写番号".into()))?;
+    let media_id = sqlx::query_scalar::<_, i64>("SELECT id FROM media WHERE normalized_code=?")
+        .bind(&requested)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "本地数据库尚未收录 {}，请先从数据源查找该番号",
+                requested.to_ascii_uppercase()
+            ))
+        })?;
+    let legacy_media_item_id: Option<i64> = row.get("legacy_media_item_id");
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query(
+        "UPDATE library_item SET media_id=?,status='ready',updated_at=datetime('now') WHERE id=?",
+    )
+    .bind(media_id)
+    .bind(id)
+    .execute(&mut *transaction)
+    .await?;
+    if let Some(legacy_media_item_id) = legacy_media_item_id {
+        sqlx::query("UPDATE media_item SET provider_id=?,title=(SELECT title FROM media WHERE id=?),status='ready',updated_at=datetime('now') WHERE id=?")
+            .bind(format!("luma:{}", requested.to_ascii_uppercase()))
+            .bind(media_id)
+            .bind(legacy_media_item_id)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    crate::export::regenerate_library_item(
+        &state.pool,
+        id,
+        crate::export::ExportOptions {
+            overwrite_nfo: true,
+            overwrite_artwork: false,
+        },
+    )
+    .await?;
+    let item = sqlx::query("SELECT li.*, m.normalized_code, m.title, m.poster_url, m.release_date, m.metadata_status, mi.filename AS legacy_filename, mi.provider_id AS legacy_provider_id FROM library_item li JOIN media m ON m.id = li.media_id LEFT JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.id = ?")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await?;
+    Ok(Json(json!({
+        "item": library_json(&item),
+        "message": format!("已按 {} 重新匹配并生成 NFO", requested.to_ascii_uppercase()),
+    })))
+}
+
 async fn list_attention(State(state): State<AppState>) -> AppResult<Json<Vec<Value>>> {
     if let Err(error) = reconcile_active(&state).await {
         tracing::warn!(%error, "attention list reconciliation failed");
@@ -1764,7 +1928,7 @@ async fn automation_by_id(state: &AppState, id: i64) -> AppResult<Json<Value>> {
 }
 
 async fn list_providers(State(state): State<AppState>) -> AppResult<Json<Vec<Value>>> {
-    let rows = sqlx::query("SELECT pc.*,ss.status AS sync_status,ss.last_started_at AS sync_last_started_at,ss.last_finished_at AS sync_last_finished_at,ss.last_success_at AS sync_last_success_at,ss.next_run_at AS sync_next_run_at,ss.last_message AS sync_last_message,ss.failure_count AS sync_failure_count,ss.item_count AS sync_item_count,ss.inserted_count AS sync_inserted_count,ss.updated_count AS sync_updated_count FROM provider_config pc LEFT JOIN source_sync_state ss ON ss.provider_key=pc.provider_key ORDER BY pc.provider_type,pc.provider_key")
+    let rows = sqlx::query("SELECT pc.*,ss.status AS sync_status,ss.active_mode AS sync_active_mode,ss.bootstrap_paused AS sync_bootstrap_paused,ss.bootstrap_from AS sync_bootstrap_from,ss.bootstrap_to AS sync_bootstrap_to,ss.cursor_json AS sync_cursor_json,ss.last_started_at AS sync_last_started_at,ss.last_finished_at AS sync_last_finished_at,ss.last_success_at AS sync_last_success_at,ss.next_run_at AS sync_next_run_at,ss.last_message AS sync_last_message,ss.failure_count AS sync_failure_count,ss.item_count AS sync_item_count,ss.inserted_count AS sync_inserted_count,ss.updated_count AS sync_updated_count,ss.discovery_count AS sync_discovery_count,ss.hydrated_count AS sync_hydrated_count,ss.hydration_failed_count AS sync_hydration_failed_count,ss.pending_count AS sync_pending_count FROM provider_config pc LEFT JOIN source_sync_state ss ON ss.provider_key=pc.provider_key ORDER BY pc.provider_type,pc.provider_key")
         .fetch_all(&state.pool)
         .await?;
     Ok(Json(rows.iter().map(provider_json).collect()))
@@ -2722,6 +2886,199 @@ pub(crate) async fn execute_hydration_job(
     outcome
 }
 
+pub(crate) async fn execute_catalog_resolve_job(
+    state: &AppState,
+    provider_key: &str,
+    payload: &CatalogResolveJobPayload,
+) -> anyhow::Result<()> {
+    let outcome = async {
+        let provider = source_provider_by_key(state, provider_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("source provider {provider_key} no longer exists"))?;
+        let (source, cached_detail) =
+            fetch_provider_code_candidate(state, &provider, &payload.code).await?;
+        let discovered =
+            crate::ingestion::upsert_candidates(&state.pool, &provider.key, vec![source.clone()])
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("provider returned no exact code candidate"))?;
+        let media_id = persist_source_media(state, &provider, &source).await?;
+        if let Some(detail) = cached_detail {
+            let detail_source_url = detail.source_url.clone();
+            persist_source_detail_html(
+                state,
+                media_id,
+                &provider,
+                &source.provider_id,
+                &detail_source_url,
+                &detail.body,
+                "/star/",
+            )
+            .await?;
+            if payload.include_resources {
+                fetch_and_persist_resources(
+                    state,
+                    media_id,
+                    &provider,
+                    &source.provider_id,
+                    &detail_source_url,
+                    Some(detail),
+                    true,
+                )
+                .await?;
+            }
+        } else {
+            match provider.adapter.as_str() {
+                "javbus" => {
+                    refresh_javbus_media(
+                        state,
+                        media_id,
+                        &provider,
+                        &source.provider_id,
+                        &source.source_url,
+                        payload.include_resources,
+                        true,
+                    )
+                    .await?;
+                }
+                "javdb" | "jav321" | "javlibrary" => {
+                    refresh_generic_source_media(
+                        state,
+                        media_id,
+                        &provider,
+                        &source.provider_id,
+                        &source.source_url,
+                        payload.include_resources,
+                        true,
+                    )
+                    .await?;
+                }
+                adapter => anyhow::bail!("unsupported source adapter: {adapter}"),
+            }
+        }
+        crate::ingestion::finish_hydration(
+            &state.pool,
+            discovered.id,
+            media_id,
+            &discovered.content_hash,
+        )
+        .await?;
+        refresh_media_search_document(state, media_id).await?;
+        anyhow::Ok(media_id)
+    }
+    .await;
+    match outcome {
+        Ok(media_id) => {
+            emit(
+                state,
+                "catalog-resolve",
+                json!({"code":payload.code,"providerKey":provider_key,"mediaId":media_id,"status":"success"}),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            emit(
+                state,
+                "catalog-resolve",
+                json!({"code":payload.code,"providerKey":provider_key,"status":"failed","message":error.to_string()}),
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn fetch_provider_code_candidate(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    code: &str,
+) -> anyhow::Result<(SourceMedia, Option<RawProviderDocument>)> {
+    let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    if provider.adapter == "javbus" {
+        let url = base.join(&format!("/{code}"))?;
+        let response = javbus_request(state, provider, url).await?;
+        ensure_provider_content(state, provider, &response, "resolve", Some(code), None).await?;
+        let source_url = response.final_url.to_string();
+        let provider_id = response
+            .final_url
+            .path_segments()
+            .and_then(Iterator::last)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(code)
+            .to_owned();
+        let source = SourceMedia {
+            provider_id,
+            code: code.to_owned(),
+            title: meta_content(&response.body, "og:title").unwrap_or_else(|| code.to_owned()),
+            poster_url: meta_content(&response.body, "og:image"),
+            source_url: source_url.clone(),
+            release_date: extract_iso_date(&response.body),
+        };
+        return Ok((
+            source,
+            Some(RawProviderDocument {
+                source_url,
+                body: response.body,
+            }),
+        ));
+    }
+
+    let mut url = match provider.adapter.as_str() {
+        "javdb" => base.join("/search")?,
+        "jav321" => base.join("/search")?,
+        "javlibrary" => base.join("/cn/vl_searchbyword.php")?,
+        adapter => anyhow::bail!("unsupported source adapter: {adapter}"),
+    };
+    match provider.adapter.as_str() {
+        "javdb" => {
+            url.query_pairs_mut()
+                .append_pair("q", code)
+                .append_pair("f", "all");
+        }
+        "jav321" => {
+            url.query_pairs_mut().append_pair("sn", code);
+        }
+        "javlibrary" => {
+            url.query_pairs_mut().append_pair("keyword", code);
+        }
+        _ => {}
+    }
+    let response = source_fetch(state, provider, url).await?;
+    ensure_provider_content(state, provider, &response, "resolve", Some(code), None).await?;
+    let candidates = match provider.adapter.as_str() {
+        "javdb" => parse_javdb_search_html(&response.body, code, &provider.base_url),
+        "jav321" => parse_jav321_html(
+            &response.body,
+            code,
+            &provider.base_url,
+            &response.final_url,
+        ),
+        "javlibrary" => parse_javlibrary_html(
+            &response.body,
+            code,
+            &provider.base_url,
+            &response.final_url,
+        ),
+        _ => Vec::new(),
+    };
+    let requested = normalize_code(code);
+    let candidate = candidates
+        .into_iter()
+        .find(|candidate| {
+            normalize_code(&candidate.code) == requested
+                || extract_media_code(&candidate.title)
+                    .map(|value| normalize_code(&value) == requested)
+                    .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} did not return an exact match for {code}",
+                provider.display_name
+            )
+        })?;
+    Ok((candidate, None))
+}
+
 pub(crate) async fn settle_ingestion_job(
     state: &AppState,
     job: &crate::ingestion::IngestionJob,
@@ -3104,7 +3461,7 @@ async fn finish_source_sync_failure(
 }
 
 async fn provider_by_key(state: &AppState, key: &str) -> AppResult<Json<Value>> {
-    let row = sqlx::query("SELECT pc.*,ss.status AS sync_status,ss.last_started_at AS sync_last_started_at,ss.last_finished_at AS sync_last_finished_at,ss.last_success_at AS sync_last_success_at,ss.next_run_at AS sync_next_run_at,ss.last_message AS sync_last_message,ss.failure_count AS sync_failure_count,ss.item_count AS sync_item_count,ss.inserted_count AS sync_inserted_count,ss.updated_count AS sync_updated_count FROM provider_config pc LEFT JOIN source_sync_state ss ON ss.provider_key=pc.provider_key WHERE pc.provider_key=?")
+    let row = sqlx::query("SELECT pc.*,ss.status AS sync_status,ss.active_mode AS sync_active_mode,ss.bootstrap_paused AS sync_bootstrap_paused,ss.bootstrap_from AS sync_bootstrap_from,ss.bootstrap_to AS sync_bootstrap_to,ss.cursor_json AS sync_cursor_json,ss.last_started_at AS sync_last_started_at,ss.last_finished_at AS sync_last_finished_at,ss.last_success_at AS sync_last_success_at,ss.next_run_at AS sync_next_run_at,ss.last_message AS sync_last_message,ss.failure_count AS sync_failure_count,ss.item_count AS sync_item_count,ss.inserted_count AS sync_inserted_count,ss.updated_count AS sync_updated_count,ss.discovery_count AS sync_discovery_count,ss.hydrated_count AS sync_hydrated_count,ss.hydration_failed_count AS sync_hydration_failed_count,ss.pending_count AS sync_pending_count FROM provider_config pc LEFT JOIN source_sync_state ss ON ss.provider_key=pc.provider_key WHERE pc.provider_key=?")
         .bind(key)
         .fetch_optional(&state.pool)
         .await?
@@ -3962,7 +4319,14 @@ pub(crate) async fn execute_resource_refresh_job(
     )
     .await
     {
-        Ok(_) => Ok(()),
+        Ok(resource_count) => {
+            emit(
+                state,
+                "resource-refresh",
+                json!({"mediaId":payload.media_id,"providerKey":payload.provider_key,"status":"success","resourceCount":resource_count}),
+            );
+            Ok(())
+        }
         Err(error) => {
             crate::resource::record_refresh_failure(
                 &state.pool,
@@ -3971,6 +4335,11 @@ pub(crate) async fn execute_resource_refresh_job(
                 &error.to_string(),
             )
             .await?;
+            emit(
+                state,
+                "resource-refresh",
+                json!({"mediaId":payload.media_id,"providerKey":payload.provider_key,"status":"failed","message":error.to_string()}),
+            );
             Err(error)
         }
     }
@@ -4527,7 +4896,43 @@ fn automation_json(row: &sqlx::sqlite::SqliteRow) -> Value {
 }
 fn provider_json(row: &sqlx::sqlite::SqliteRow) -> Value {
     let secret: String = row.get("secret");
-    json!({"key":row.get::<String,_>("provider_key"),"type":row.get::<String,_>("provider_type"),"displayName":row.get::<String,_>("display_name"),"enabled":row.get::<i64,_>("enabled") != 0,"baseUrl":row.get::<String,_>("base_url"),"hasSecret":!secret.is_empty(),"config":parse_json(&row.get::<String,_>("config_json"),json!({})),"lastStatus":row.get::<String,_>("last_status"),"lastMessage":row.get::<String,_>("last_message"),"lastCheckedAt":row.get::<Option<String>,_>("last_checked_at"),"syncStatus":row.try_get::<Option<String>,_>("sync_status").unwrap_or(None),"syncLastStartedAt":row.try_get::<Option<String>,_>("sync_last_started_at").unwrap_or(None),"syncLastFinishedAt":row.try_get::<Option<String>,_>("sync_last_finished_at").unwrap_or(None),"syncLastSuccessAt":row.try_get::<Option<String>,_>("sync_last_success_at").unwrap_or(None),"syncNextRunAt":row.try_get::<Option<String>,_>("sync_next_run_at").unwrap_or(None),"syncLastMessage":row.try_get::<Option<String>,_>("sync_last_message").unwrap_or(None),"syncFailureCount":row.try_get::<Option<i64>,_>("sync_failure_count").unwrap_or(None),"syncItemCount":row.try_get::<Option<i64>,_>("sync_item_count").unwrap_or(None),"syncInsertedCount":row.try_get::<Option<i64>,_>("sync_inserted_count").unwrap_or(None),"syncUpdatedCount":row.try_get::<Option<i64>,_>("sync_updated_count").unwrap_or(None)})
+    let sync_cursor = row
+        .try_get::<Option<String>, _>("sync_cursor_json")
+        .ok()
+        .flatten()
+        .map(|value| parse_json(&value, json!({})))
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "key":row.get::<String,_>("provider_key"),
+        "type":row.get::<String,_>("provider_type"),
+        "displayName":row.get::<String,_>("display_name"),
+        "enabled":row.get::<i64,_>("enabled") != 0,
+        "baseUrl":row.get::<String,_>("base_url"),
+        "hasSecret":!secret.is_empty(),
+        "config":parse_json(&row.get::<String,_>("config_json"),json!({})),
+        "lastStatus":row.get::<String,_>("last_status"),
+        "lastMessage":row.get::<String,_>("last_message"),
+        "lastCheckedAt":row.get::<Option<String>,_>("last_checked_at"),
+        "syncStatus":row.try_get::<Option<String>,_>("sync_status").ok().flatten().unwrap_or_else(|| "idle".into()),
+        "syncActiveMode":row.try_get::<Option<String>,_>("sync_active_mode").ok().flatten().unwrap_or_else(|| "incremental".into()),
+        "syncBootstrapPaused":row.try_get::<Option<i64>,_>("sync_bootstrap_paused").ok().flatten().unwrap_or(0) != 0,
+        "syncBootstrapFrom":row.try_get::<Option<String>,_>("sync_bootstrap_from").ok().flatten(),
+        "syncBootstrapTo":row.try_get::<Option<String>,_>("sync_bootstrap_to").ok().flatten(),
+        "syncCursor":sync_cursor,
+        "syncLastStartedAt":row.try_get::<Option<String>,_>("sync_last_started_at").ok().flatten(),
+        "syncLastFinishedAt":row.try_get::<Option<String>,_>("sync_last_finished_at").ok().flatten(),
+        "syncLastSuccessAt":row.try_get::<Option<String>,_>("sync_last_success_at").ok().flatten(),
+        "syncNextRunAt":row.try_get::<Option<String>,_>("sync_next_run_at").ok().flatten(),
+        "syncLastMessage":row.try_get::<Option<String>,_>("sync_last_message").ok().flatten().unwrap_or_default(),
+        "syncFailureCount":row.try_get::<Option<i64>,_>("sync_failure_count").ok().flatten().unwrap_or(0),
+        "syncItemCount":row.try_get::<Option<i64>,_>("sync_item_count").ok().flatten().unwrap_or(0),
+        "syncInsertedCount":row.try_get::<Option<i64>,_>("sync_inserted_count").ok().flatten().unwrap_or(0),
+        "syncUpdatedCount":row.try_get::<Option<i64>,_>("sync_updated_count").ok().flatten().unwrap_or(0),
+        "syncDiscoveryCount":row.try_get::<Option<i64>,_>("sync_discovery_count").ok().flatten().unwrap_or(0),
+        "syncHydratedCount":row.try_get::<Option<i64>,_>("sync_hydrated_count").ok().flatten().unwrap_or(0),
+        "syncHydrationFailedCount":row.try_get::<Option<i64>,_>("sync_hydration_failed_count").ok().flatten().unwrap_or(0),
+        "syncPendingCount":row.try_get::<Option<i64>,_>("sync_pending_count").ok().flatten().unwrap_or(0),
+    })
 }
 
 async fn provider_enabled(state: &AppState, key: &str) -> AppResult<bool> {
@@ -5285,6 +5690,75 @@ mod tests {
         assert!(is_javbus_age_page(
             "<title>Age Verification JavBus</title><a href='/doc/driver-verify'>verify</a>"
         ));
+    }
+
+    #[tokio::test]
+    async fn on_demand_resolve_queues_one_high_priority_deduplicated_job() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE provider_config SET enabled=CASE WHEN provider_key='javbus' THEN 1 ELSE 0 END WHERE provider_type='source'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let temp =
+            std::env::temp_dir().join(format!("luma-catalog-resolve-{}", chrono_like_nonce()));
+        let state = AppState {
+            pool: pool.clone(),
+            scrape_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            crawler_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            asset_root: temp.join("assets"),
+            script_root: temp.join("scripts"),
+            events: tokio::sync::broadcast::channel(32).0,
+            fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
+            provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
+            snapshot_repository: std::sync::Arc::new(crate::ingestion::SnapshotRepository::new(
+                pool.clone(),
+                temp.join("source-cache"),
+            )),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool),
+        };
+
+        let first = resolve_catalog_code(
+            State(state.clone()),
+            Json(CatalogResolveInput {
+                code: "ABC 123".into(),
+                include_resources: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let second = resolve_catalog_code(
+            State(state.clone()),
+            Json(CatalogResolveInput {
+                code: "abc-123".into(),
+                include_resources: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(first.code, "abc-123");
+        assert_eq!(first.status, "queued");
+        assert_eq!(first.job_ids.len(), 1);
+        assert_eq!(second.job_ids, first.job_ids);
+        let row = sqlx::query(
+            "SELECT provider_key,job_type,priority,status,payload_json,max_attempts FROM ingestion_job",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("provider_key"), "javbus");
+        assert_eq!(row.get::<String, _>("job_type"), "catalog_resolve");
+        assert_eq!(row.get::<i64, _>("priority"), PRIORITY_USER_ON_DEMAND);
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(row.get::<i64, _>("max_attempts"), 2);
+        let payload: Value = serde_json::from_str(&row.get::<String, _>("payload_json")).unwrap();
+        assert_eq!(payload["code"], "abc-123");
+        assert_eq!(payload["includeResources"], true);
     }
 
     #[test]

@@ -2,13 +2,14 @@ import type {
   BatchScrapeResponse, BatchTaskResponse, CrawlerForm, CrawlerResult, CrawlerRun, CrawlerScript,
   DashboardStats, DownloadItem, Folder, FolderInput, MediaItem, MetaTubeConnection, QBittorrentConnection,
   ScrapeOptions, ServiceStatus, Settings, Task, TaskDetail,
-  Acquisition, AcquisitionDetail, Actor, AttentionItem, AutomationRule, BrowserSession, HomeData, LibraryItem, MediaDetail, ProductMedia, ProductSettings, ProviderConfig, ProviderDiagnoseResponse, ProviderRuntime, SearchResponse,
+  Acquisition, AcquisitionDetail, Actor, AttentionItem, AutomationRule, BrowserSession, CatalogResolveResponse, HomeData, LibraryExportResponse, LibraryItem, LibraryRematchResponse, MediaDetail, ProductMedia, ProductSettings, ProviderConfig, ProviderDiagnoseResponse, ProviderReparseResponse, ProviderRuntime, ResourceRefreshResponse, SearchResponse, SyncRunResponse,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
 const ASSET_BASE = API_BASE.replace(/\/api\/v1\/?$/, '')
 
 export const coverAssetUrl = (mediaId: number) => `${ASSET_BASE}/asset/cover/${mediaId}`
+export const productEventUrl = `${API_BASE}/events`
 
 export class ApiError extends Error {
   constructor(message: string, public readonly status: number) {
@@ -47,8 +48,10 @@ function crawlerForm(input: CrawlerForm) {
 export const api = {
   home: () => request<HomeData>('/home'),
   search: (q: string) => request<SearchResponse>(`/search?q=${encodeURIComponent(q)}`),
+  resolveCatalog: (code: string, includeResources = true) => request<CatalogResolveResponse>('/catalog/resolve', { method: 'POST', body: JSON.stringify({ code, includeResources }) }),
   catalogMedia: (q = '') => request<ProductMedia[]>(`/catalog/media${q ? `?q=${encodeURIComponent(q)}` : ''}`),
   mediaDetail: (id: number) => request<MediaDetail>(`/catalog/media/${id}`),
+  refreshMediaResources: (id: number) => request<ResourceRefreshResponse>(`/catalog/media/${id}/resources/refresh`, { method: 'POST' }),
   acquireMedia: (mediaId: number, resourceId?: number) => request<Acquisition>(`/catalog/media/${mediaId}/acquire`, { method: 'POST', body: JSON.stringify({ resourceId, requestedBy: 'manual' }) }),
   actorDetail: (id: number) => request<{ actor: Actor; media: ProductMedia[] }>(`/actors/${id}`),
   followActor: (id: number, followed: boolean) => request<Actor>(`/actors/${id}/follow`, { method: followed ? 'POST' : 'DELETE' }),
@@ -60,6 +63,9 @@ export const api = {
   library: (q = '') => request<{ items: LibraryItem[]; total: number }>(`/library${q ? `?q=${encodeURIComponent(q)}` : ''}`),
   libraryItem: (id: number) => request<LibraryItem>(`/library/${id}`),
   reorganizeLibrary: (id: number) => request<{ item: LibraryItem; message: string }>(`/library/${id}/reorganize`, { method: 'POST' }),
+  regenerateLibraryNfo: (id: number) => request<LibraryExportResponse>(`/library/${id}/nfo`, { method: 'POST' }),
+  syncLibraryArtwork: (id: number) => request<LibraryExportResponse>(`/library/${id}/artwork`, { method: 'POST' }),
+  rematchLibrary: (id: number, code?: string) => request<LibraryRematchResponse>(`/library/${id}/rematch`, { method: 'POST', body: JSON.stringify(code ? { code } : {}) }),
   automations: () => request<AutomationRule[]>('/automations'),
   createAutomation: (input: Omit<AutomationRule, 'id' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastExplanation' | 'createdAt'>) => request<AutomationRule>('/automations', { method: 'POST', body: JSON.stringify(input) }),
   updateAutomation: (id: number, input: Partial<AutomationRule>) => request<AutomationRule>(`/automations/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
@@ -72,6 +78,11 @@ export const api = {
   setProviderEnabled: (key: string, enabled: boolean) => request<ProviderConfig>(`/providers/${key}/enabled`, { method: 'POST', body: JSON.stringify({ enabled }) }),
   testProvider: (key: string) => request<{ connected: boolean; message: string; latencyMs: number }>(`/providers/${key}/test`, { method: 'POST' }),
   syncProvider: (key: string) => request<ProviderConfig>(`/providers/${key}/sync`, { method: 'POST' }),
+  syncProviderIncremental: (key: string) => request<SyncRunResponse>(`/providers/${key}/sync/incremental`, { method: 'POST' }),
+  bootstrapProvider: (key: string, from: string, to: string, includeResources = true) => request<SyncRunResponse>(`/providers/${key}/bootstrap`, { method: 'POST', body: JSON.stringify({ from, to, includeResources }) }),
+  pauseProviderBootstrap: (key: string) => request<SyncRunResponse>(`/providers/${key}/bootstrap/pause`, { method: 'POST' }),
+  resumeProviderBootstrap: (key: string) => request<SyncRunResponse>(`/providers/${key}/bootstrap/resume`, { method: 'POST' }),
+  reparseProvider: (key: string, parserVersion = '1', limit = 200) => request<ProviderReparseResponse>(`/providers/${key}/reparse`, { method: 'POST', body: JSON.stringify({ parserVersion, limit }) }),
   providerRuntime: (key: string) => request<ProviderRuntime>(`/providers/${key}/runtime`),
   diagnoseProvider: (key: string) => request<ProviderDiagnoseResponse>(`/providers/${key}/diagnose`, { method: 'POST' }),
   startBrowserSession: (key: string) => request<BrowserSession>(`/providers/${key}/browser-session`, { method: 'POST' }),

@@ -1,33 +1,166 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { NButton, NInput, NSpin, useMessage } from 'naive-ui'
-import { IconArrowRight, IconSearch, IconUser } from '@tabler/icons-vue'
+import { IconArrowRight, IconCloudDownload, IconSearch, IconUser } from '@tabler/icons-vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api } from '../api'
+import { api, productEventUrl } from '../api'
 import type { ProductMedia, SearchResponse } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 import PosterCard from '../components/PosterCard.vue'
 
-const route = useRoute(); const router = useRouter(); const message = useMessage()
-const query = ref(''); const loading = ref(false); const result = ref<SearchResponse | null>(null); const recent = ref<ProductMedia[]>([])
+const route = useRoute()
+const router = useRouter()
+const message = useMessage()
+const query = ref('')
+const loading = ref(false)
+const resolving = ref(false)
+const resolveStatus = ref('')
+const result = ref<SearchResponse | null>(null)
+const recent = ref<ProductMedia[]>([])
+let eventSource: EventSource | undefined
+
+const requestedCode = computed(() => {
+  const match = query.value.trim().toUpperCase().match(/(?:FC2[-_ ]?PPV[-_ ]?\d{4,8}|[A-Z]{2,12}[-_ ]?\d{2,7})/)
+  return match?.[0].replace(/[ _]+/g, '-').replace(/^(FC2)-?(PPV)-?/, '$1-$2-') ?? ''
+})
+const databaseMiss = computed(() => Boolean(result.value && !result.value.media.length && !result.value.actors.length))
+
 async function runSearch() {
-  const q = query.value.trim(); router.replace({ query: q ? { q } : {} })
-  if (!q) { result.value = null; recent.value = await api.catalogMedia(); return }
+  const q = query.value.trim()
+  await router.replace({ query: q ? { q } : {} })
+  if (!q) {
+    result.value = null
+    recent.value = await api.catalogMedia()
+    return
+  }
   loading.value = true
-  try { result.value = await api.search(q) } catch (reason) { message.error(reason instanceof Error ? reason.message : '搜索失败') } finally { loading.value = false }
+  try {
+    result.value = await api.search(q)
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '搜索失败')
+  } finally {
+    loading.value = false
+  }
 }
-async function loadRoute() { query.value = String(route.query.q ?? ''); await runSearch() }
-watch(() => route.query.q, value => { if (String(value ?? '') !== query.value) loadRoute() })
-onMounted(loadRoute)
+
+async function resolveFromSources() {
+  if (!requestedCode.value) return
+  resolving.value = true
+  try {
+    const response = await api.resolveCatalog(requestedCode.value, true)
+    resolveStatus.value = `已创建 ${response.jobIds.length} 个按需查找任务，完成后会自动刷新。`
+    message.success(`正在从已启用的数据源查找 ${requestedCode.value}`)
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '无法创建按需查找任务')
+  } finally {
+    resolving.value = false
+  }
+}
+
+async function loadRoute() {
+  query.value = String(route.query.q ?? '')
+  await runSearch()
+}
+
+function startEvents() {
+  eventSource = new EventSource(productEventUrl)
+  eventSource.onmessage = async event => {
+    try {
+      const payload = JSON.parse(event.data) as { event?: string; data?: { code?: string; status?: string } }
+      if (payload.event !== 'catalog-resolve' || payload.data?.code?.toUpperCase() !== requestedCode.value.toUpperCase()) return
+      if (payload.data.status === 'success') {
+        resolveStatus.value = '数据源查找完成，本地索引已更新。'
+        await runSearch()
+      }
+    } catch {
+      // Ignore keep-alive or events from older server versions.
+    }
+  }
+}
+
+watch(() => route.query.q, value => {
+  if (String(value ?? '') !== query.value) loadRoute()
+})
+onMounted(() => {
+  startEvents()
+  loadRoute()
+})
+onUnmounted(() => eventSource?.close())
 </script>
+
 <template>
-  <PageHeader title="资源" description="搜索本地索引中的作品、演员和可获取资源；内容来源由后台定时更新，搜索过程无需等待外部网站。" />
-  <div class="search-stage"><IconSearch :size="20" /><n-input v-model:value="query" :bordered="false" clearable size="large" placeholder="输入番号、标题或演员姓名" @keyup.enter="runSearch" /><n-button type="primary" size="large" @click="runSearch">搜索</n-button></div>
+  <PageHeader title="资源搜索" description="即时查询 Luma 本地索引。只有你明确点击按需查找时，后台才会访问已启用的数据源。" />
+
+  <div class="search-stage">
+    <IconSearch :size="20" />
+    <n-input
+      v-model:value="query"
+      :bordered="false"
+      clearable
+      size="large"
+      placeholder="输入番号、标题或演员姓名"
+      @keyup.enter="runSearch"
+    />
+    <n-button type="primary" size="large" @click="runSearch">搜索</n-button>
+  </div>
+
   <n-spin :show="loading">
     <div v-if="result" class="search-results">
-      <section v-if="result.actors.length" class="result-section"><header class="product-section-head"><div><span class="eyebrow">PEOPLE</span><h2>演员</h2></div><span>{{ result.actors.length }} 项</span></header><div class="actor-grid"><RouterLink v-for="actor in result.actors" :key="actor.id" :to="`/actors/${actor.id}`" class="actor-card"><span class="actor-avatar"><img v-if="actor.avatarUrl" :src="actor.avatarUrl" :alt="actor.name"><IconUser v-else /></span><span><strong>{{ actor.name }}</strong><small>{{ actor.mediaCount }} 部作品{{ actor.followed ? ' · 已关注' : '' }}</small></span><IconArrowRight :size="16" /></RouterLink></div></section>
-      <section class="result-section"><header class="product-section-head"><div><span class="eyebrow">MEDIA</span><h2>作品</h2></div><span>{{ result.media.length }} 项</span></header><div v-if="result.media.length" class="poster-grid"><PosterCard v-for="media in result.media" :key="media.id" :title="media.title" :code="media.code" :poster-url="media.posterUrl" :subtitle="media.releaseDate ?? '等待补全日期'" :to="`/media/${media.id}`" /></div><div v-else class="quiet-empty"><IconSearch :size="28" /><strong>本地索引中没有匹配的作品</strong><span>尝试完整番号或其他拼写；后台来源同步完成后，新内容会自动出现在这里。</span></div></section>
+      <section v-if="result.actors.length" class="result-section">
+        <header class="product-section-head">
+          <div><h2>演员</h2><span>别名会一起参与本地匹配</span></div>
+          <span>{{ result.actors.length }} 项</span>
+        </header>
+        <div class="actor-grid">
+          <RouterLink v-for="actor in result.actors" :key="actor.id" :to="`/actors/${actor.id}`" class="actor-card">
+            <span class="actor-avatar"><img v-if="actor.avatarUrl" :src="actor.avatarUrl" :alt="actor.name"><IconUser v-else /></span>
+            <span><strong>{{ actor.name }}</strong><small>{{ actor.mediaCount }} 部作品{{ actor.followed ? '，已关注' : '' }}</small></span>
+            <IconArrowRight :size="16" />
+          </RouterLink>
+        </div>
+      </section>
+
+      <section class="result-section">
+        <header class="product-section-head">
+          <div><h2>作品</h2><span>标题、原始标题、番号和演员均来自本地数据库</span></div>
+          <span>{{ result.media.length }} 项</span>
+        </header>
+        <div v-if="result.media.length" class="poster-grid">
+          <PosterCard
+            v-for="media in result.media"
+            :key="media.id"
+            :title="media.title"
+            :code="media.code"
+            :poster-url="media.posterUrl"
+            :subtitle="media.releaseDate ?? '日期待补全'"
+            :to="`/media/${media.id}`"
+          />
+        </div>
+        <div v-else class="quiet-empty resolve-empty">
+          <IconSearch :size="28" />
+          <strong>本地数据库暂无结果</strong>
+          <span v-if="requestedCode">可以创建高优先级后台任务，从所有已启用的数据源查找这个番号。</span>
+          <span v-else>请尝试完整番号、其他标题写法或演员别名。</span>
+          <n-button v-if="databaseMiss && requestedCode" type="primary" :loading="resolving" @click="resolveFromSources">
+            <template #icon><IconCloudDownload /></template>
+            从数据源查找 {{ requestedCode }}
+          </n-button>
+          <small v-if="resolveStatus" class="resolve-status">{{ resolveStatus }}</small>
+        </div>
+      </section>
     </div>
-    <section v-else class="result-section"><header class="product-section-head"><div><span class="eyebrow">RECENTLY INDEXED</span><h2>最近收录</h2></div></header><div v-if="recent.length" class="poster-grid"><PosterCard v-for="media in recent" :key="media.id" :title="media.title" :code="media.code" :poster-url="media.posterUrl" :to="`/media/${media.id}`" /></div><div v-else class="quiet-empty"><IconSearch :size="28" /><strong>本地索引正在等待内容</strong><span>来源会在后台定时同步；也可以前往设置立即执行一次同步。</span><RouterLink to="/settings">管理来源同步</RouterLink></div></section>
+
+    <section v-else class="result-section">
+      <header class="product-section-head"><div><h2>最近收录</h2><span>后台同步写入本地索引的新内容</span></div></header>
+      <div v-if="recent.length" class="poster-grid">
+        <PosterCard v-for="media in recent" :key="media.id" :title="media.title" :code="media.code" :poster-url="media.posterUrl" :to="`/media/${media.id}`" />
+      </div>
+      <div v-else class="quiet-empty">
+        <IconSearch :size="28" />
+        <strong>本地索引正在等待内容</strong>
+        <span>来源会在后台定时同步，也可以在设置中立即执行一次增量同步。</span>
+        <RouterLink to="/settings">管理数据源</RouterLink>
+      </div>
+    </section>
   </n-spin>
 </template>
