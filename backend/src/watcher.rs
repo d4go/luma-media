@@ -198,6 +198,8 @@ mod tests {
                 root.join("source-cache"),
             )),
             ingestion_queue: crate::ingestion::IngestionQueue::new(pool.clone()),
+            task_engine: crate::task::TaskEngine::new(pool.clone()),
+            handler_registry: Arc::new(crate::task::handler::HandlerRegistry::new()),
         };
         let watcher = start(state);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

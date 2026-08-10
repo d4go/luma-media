@@ -6048,7 +6048,9 @@ mod tests {
                 pool.clone(),
                 temp.join("source-cache"),
             )),
-            ingestion_queue: crate::ingestion::IngestionQueue::new(pool),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool.clone()),
+            task_engine: crate::task::TaskEngine::new(pool.clone()),
+            handler_registry: std::sync::Arc::new(crate::task::handler::HandlerRegistry::new()),
         };
 
         let first = resolve_catalog_code(
@@ -6136,7 +6138,9 @@ mod tests {
                 pool.clone(),
                 temp.join("source-cache"),
             )),
-            ingestion_queue: crate::ingestion::IngestionQueue::new(pool),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool.clone()),
+            task_engine: crate::task::TaskEngine::new(pool.clone()),
+            handler_registry: std::sync::Arc::new(crate::task::handler::HandlerRegistry::new()),
         };
 
         let started = bootstrap_provider(
@@ -6281,7 +6285,9 @@ mod tests {
                 pool.clone(),
                 temp.join("source-cache"),
             )),
-            ingestion_queue: crate::ingestion::IngestionQueue::new(pool),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool.clone()),
+            task_engine: crate::task::TaskEngine::new(pool.clone()),
+            handler_registry: std::sync::Arc::new(crate::task::handler::HandlerRegistry::new()),
         };
         crate::ingestion::start_workers(state.clone())
             .await
@@ -6495,7 +6501,9 @@ mod tests {
                 pool.clone(),
                 temp.join("source-cache"),
             )),
-            ingestion_queue: crate::ingestion::IngestionQueue::new(pool),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool.clone()),
+            task_engine: crate::task::TaskEngine::new(pool.clone()),
+            handler_registry: std::sync::Arc::new(crate::task::handler::HandlerRegistry::new()),
         };
         sqlx::query("UPDATE provider_config SET base_url='http://127.0.0.1:9',enabled=1 WHERE provider_type='source'")
             .execute(&state.pool)
@@ -6609,7 +6617,9 @@ mod tests {
                 pool.clone(),
                 temp.join("source-cache"),
             )),
-            ingestion_queue: crate::ingestion::IngestionQueue::new(pool),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool.clone()),
+            task_engine: crate::task::TaskEngine::new(pool.clone()),
+            handler_registry: std::sync::Arc::new(crate::task::handler::HandlerRegistry::new()),
         };
         let first = request_acquisition(
             &state,

@@ -42,6 +42,8 @@ pub struct AppState {
     pub provider_registry: Arc<providers::ProviderRegistry>,
     pub snapshot_repository: Arc<ingestion::SnapshotRepository>,
     pub ingestion_queue: ingestion::IngestionQueue,
+    pub task_engine: task::TaskEngine,
+    pub handler_registry: Arc<task::handler::HandlerRegistry>,
 }
 
 #[tokio::main]
@@ -82,7 +84,10 @@ async fn main() -> anyhow::Result<()> {
             source_cache_root,
         )),
         ingestion_queue: ingestion::IngestionQueue::new(pool.clone()),
+        task_engine: task::TaskEngine::new(pool.clone()),
+        handler_registry: Arc::new(task::handler::HandlerRegistry::new()),
     };
+    task::runner::start(state.clone()).await?;
     ingestion::start_workers(state.clone()).await?;
     scheduler::start(state.clone());
     let _watcher = watcher::start(state.clone());

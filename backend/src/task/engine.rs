@@ -157,14 +157,130 @@ impl TaskEngine {
         let lease_modifier = format!("+{} seconds", lease_duration.as_secs().max(1));
         let row = sqlx::query(
             "UPDATE job_item SET status='running',retry_count=retry_count+1,lease_owner=?,lease_expires_at=datetime('now',?),started_at=COALESCE(started_at,datetime('now')),updated_at=datetime('now') \
-             WHERE id=(SELECT ji.id FROM job_item ji JOIN job_run jr ON jr.id=ji.run_id WHERE ji.run_id=? AND ji.status='pending' AND jr.status IN ('pending','running') ORDER BY ji.id LIMIT 1) RETURNING *",
+             WHERE id=(SELECT ji.id FROM job_item ji JOIN job_run jr ON jr.id=ji.run_id WHERE ji.run_id=? AND ji.status='pending' AND (ji.available_at IS NULL OR ji.available_at<=datetime('now')) AND jr.status IN ('pending','running') AND (jr.lease_owner IS NULL OR jr.lease_owner=?) ORDER BY ji.id LIMIT 1) RETURNING *",
         )
         .bind(owner)
         .bind(lease_modifier)
         .bind(run_id)
+        .bind(owner)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|row| job_item_from_row(&row)))
+    }
+
+    /// Claim the highest-priority run that has pending work. Runs already
+    /// leased by another worker are never claimed twice.
+    pub async fn claim_next_run(
+        &self,
+        owner: &str,
+        lease_duration: Duration,
+        minimum_priority: i64,
+    ) -> anyhow::Result<Option<JobRun>> {
+        anyhow::ensure!(!owner.is_empty(), "lease owner is required");
+        self.recover_expired().await?;
+        let lease_modifier = format!("+{} seconds", lease_duration.as_secs().max(1));
+        let row = sqlx::query(
+            "UPDATE job_run SET status='running',started_at=COALESCE(started_at,datetime('now')),lease_owner=?,lease_expires_at=datetime('now',?),updated_at=datetime('now') \
+             WHERE id=(SELECT jr.id FROM job_run jr WHERE jr.status='pending' AND jr.priority>=? AND EXISTS(SELECT 1 FROM job_item ji WHERE ji.run_id=jr.id AND ji.status='pending' AND (ji.available_at IS NULL OR ji.available_at<=datetime('now'))) ORDER BY jr.priority DESC,jr.id LIMIT 1) RETURNING *",
+        )
+        .bind(owner)
+        .bind(lease_modifier)
+        .bind(minimum_priority)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| job_run_from_row(&row)))
+    }
+
+    pub async fn renew_run(
+        &self,
+        run_id: i64,
+        owner: &str,
+        lease_duration: Duration,
+    ) -> sqlx::Result<bool> {
+        let lease_modifier = format!("+{} seconds", lease_duration.as_secs().max(1));
+        let result = sqlx::query("UPDATE job_run SET lease_expires_at=datetime('now',?),updated_at=datetime('now') WHERE id=? AND status='running' AND lease_owner=?")
+            .bind(lease_modifier)
+            .bind(run_id)
+            .bind(owner)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Release a run after its worker finishes (success, failure, pause, cancel).
+    pub async fn release_run(
+        &self,
+        run_id: i64,
+        owner: &str,
+        to: JobStatus,
+    ) -> sqlx::Result<bool> {
+        let terminal = matches!(to, JobStatus::Success | JobStatus::Failed | JobStatus::Cancelled);
+        let result = sqlx::query(
+            "UPDATE job_run SET status=?,lease_owner=NULL,lease_expires_at=NULL,finished_at=CASE WHEN ?=1 THEN datetime('now') ELSE NULL END,updated_at=datetime('now') WHERE id=? AND lease_owner=?",
+        )
+        .bind(to.as_str())
+        .bind(terminal as i64)
+        .bind(run_id)
+        .bind(owner)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            self.notify.notify_one();
+        }
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Requeue a failed item for a later retry pass without touching the run.
+    pub async fn retry_item(
+        &self,
+        item_id: i64,
+        owner: &str,
+        delay: Duration,
+        error_message: Option<&str>,
+    ) -> sqlx::Result<bool> {
+        let modifier = format!("+{} seconds", delay.as_secs());
+        let result = sqlx::query(
+            "UPDATE job_item SET status='pending',available_at=datetime('now',?),lease_owner=NULL,lease_expires_at=NULL,error_message=?,finished_at=NULL,updated_at=datetime('now') WHERE id=? AND lease_owner=?",
+        )
+        .bind(modifier)
+        .bind(error_message)
+        .bind(item_id)
+        .bind(owner)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            self.notify.notify_one();
+        }
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn run_has_pending_work(&self, run_id: i64) -> sqlx::Result<bool> {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM job_item WHERE run_id=? AND status='pending' AND (available_at IS NULL OR available_at<=datetime('now')))",
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(pending != 0)
+    }
+
+    pub async fn recover_expired(&self) -> sqlx::Result<u64> {
+        let runs = sqlx::query(
+            "UPDATE job_run SET status='pending',lease_owner=NULL,lease_expires_at=NULL,updated_at=datetime('now') WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=datetime('now'))",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        let items = sqlx::query(
+            "UPDATE job_item SET status='pending',lease_owner=NULL,lease_expires_at=NULL,updated_at=datetime('now') WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=datetime('now'))",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if runs > 0 || items > 0 {
+            self.notify.notify_waiters();
+        }
+        Ok(runs + items)
     }
 
     /// Finish an item and refresh the run progress counters.
@@ -292,7 +408,7 @@ impl TaskEngine {
     /// Recover runs/items left in an in-progress state after a restart.
     pub async fn recover_startup(&self) -> anyhow::Result<usize> {
         let runs = sqlx::query(
-            "UPDATE job_run SET status='pending',error_message='worker interrupted by service restart',updated_at=datetime('now') WHERE status IN ('running','pausing','cancelling')",
+            "UPDATE job_run SET status='pending',lease_owner=NULL,lease_expires_at=NULL,error_message='worker interrupted by service restart',updated_at=datetime('now') WHERE status IN ('running','pausing','cancelling')",
         )
         .execute(&self.pool)
         .await?
