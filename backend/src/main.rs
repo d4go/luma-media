@@ -16,6 +16,7 @@ mod resource;
 mod scanner;
 mod scheduler;
 mod storage;
+mod task;
 mod watcher;
 
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
