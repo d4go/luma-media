@@ -22,6 +22,8 @@ use super::model::{
 };
 
 const INTERACTIVE_SESSION_MINUTES: i64 = 15;
+const CHROMIUM_PROFILE_LOCK_FILES: [&str; 3] =
+    ["SingletonLock", "SingletonSocket", "SingletonCookie"];
 
 #[derive(Debug, Clone)]
 pub struct BrowserSettings {
@@ -272,6 +274,7 @@ impl BrowserManager {
         tokio::fs::create_dir_all(&profile_path)
             .await
             .map_err(|error| browser_error(provider_key, error))?;
+        clear_stale_profile_locks(provider_key, &profile_path).await?;
         let session_id = Uuid::new_v4().to_string();
         let password = Uuid::new_v4().simple().to_string()[..12].to_owned();
         let started_at = Utc::now();
@@ -450,6 +453,7 @@ impl BrowserManager {
                     None,
                 )
             })?;
+        clear_stale_profile_locks(provider_key, &profile_path).await?;
         let mut builder = BrowserConfig::builder()
             .chrome_executable(&self.settings.executable)
             .user_data_dir(profile_path)
@@ -661,6 +665,36 @@ fn session_not_found(provider_key: &str) -> FetchError {
     )
 }
 
+async fn clear_stale_profile_locks(
+    provider_key: &str,
+    profile_path: &Path,
+) -> Result<(), FetchError> {
+    for file_name in CHROMIUM_PROFILE_LOCK_FILES {
+        let lock_path = profile_path.join(file_name);
+        match tokio::fs::symlink_metadata(&lock_path).await {
+            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+                tokio::fs::remove_file(&lock_path)
+                    .await
+                    .map_err(|error| browser_error(provider_key, error))?;
+            }
+            Ok(_) => {
+                return Err(FetchError::new(
+                    provider_key,
+                    FetchFailureKind::BrowserUnavailable,
+                    format!(
+                        "refusing to remove unexpected Chromium lock path: {}",
+                        lock_path.display()
+                    ),
+                    None,
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(browser_error(provider_key, error)),
+        }
+    }
+    Ok(())
+}
+
 fn validate_provider_key(provider_key: &str) -> Result<(), FetchError> {
     if provider_key.is_empty()
         || !provider_key
@@ -706,5 +740,13 @@ mod tests {
     fn interactive_session_uses_a_dedicated_port() {
         let manager = BrowserManager::new(settings());
         assert_eq!(manager.settings.session_port, 6080);
+    }
+
+    #[test]
+    fn only_chromium_singleton_locks_are_cleaned() {
+        assert_eq!(
+            CHROMIUM_PROFILE_LOCK_FILES,
+            ["SingletonLock", "SingletonSocket", "SingletonCookie"]
+        );
     }
 }
