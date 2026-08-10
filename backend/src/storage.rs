@@ -47,6 +47,27 @@ pub struct TaskRun {
 pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
+        .after_connect(|connection, _meta| {
+            Box::pin(async move {
+                // SQLite reliability settings for every pooled connection:
+                // WAL keeps readers from blocking writers, NORMAL sync is safe
+                // with WAL, foreign keys are enforced, and short busy waits are
+                // absorbed instead of surfacing as "database is locked".
+                sqlx::query("PRAGMA journal_mode = WAL")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("PRAGMA synchronous = NORMAL")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("PRAGMA busy_timeout = 10000")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(database_url)
         .await?;
     run_migrations_with_legacy_repair(&pool).await?;
@@ -859,6 +880,23 @@ mod tests {
                 .unwrap();
             assert_eq!(actual, expected.checksum.as_ref());
         }
+    }
+
+    #[tokio::test]
+    async fn applies_sqlite_reliability_pragmas() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let journal_mode: String =
+            sqlx::query_scalar("PRAGMA journal_mode").fetch_one(&pool).await.unwrap();
+        let synchronous: i64 =
+            sqlx::query_scalar("PRAGMA synchronous").fetch_one(&pool).await.unwrap();
+        let foreign_keys: i64 =
+            sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(&pool).await.unwrap();
+        let busy_timeout: i64 =
+            sqlx::query_scalar("PRAGMA busy_timeout").fetch_one(&pool).await.unwrap();
+        assert_eq!(journal_mode, "memory");
+        assert_eq!(synchronous, 1);
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(busy_timeout, 10000);
     }
 
     #[tokio::test]
