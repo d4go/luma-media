@@ -27,7 +27,7 @@ import {
 } from '@tabler/icons-vue'
 import { api } from '../api'
 import { formatDate } from '../format'
-import type { ProductSettings, ProviderConfig, Settings } from '../types'
+import type { BrowserSession, ProductSettings, ProviderConfig, ProviderFetchMode, ProviderRuntime, Settings } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 
 const message = useMessage()
@@ -38,16 +38,20 @@ const creatingSource = ref(false)
 const showNewSource = ref(false)
 const testing = ref('')
 const syncing = ref('')
+const diagnosing = ref('')
+const browserSessionBusy = ref('')
 const providers = ref<ProviderConfig[]>([])
+const providerRuntimes = reactive<Record<string, ProviderRuntime>>({})
+const browserSessions = reactive<Record<string, BrowserSession>>({})
 const secrets = reactive<Record<string, string>>({})
 const testMessages = reactive<Record<string, { ok: boolean; text: string }>>({})
 const sourceAdapterOptions = [
   { label: 'Jav321（当前可直连）', value: 'jav321', name: 'Jav321', baseUrl: 'https://www.jav321.com', hint: '搜索番号时可直接返回作品信息和磁力资源。' },
-  { label: 'JavDB', value: 'javdb', name: 'JavDB', baseUrl: 'https://javdb.com', hint: '支持官方站和镜像；Cloudflare 环境需填写 cf_clearance Cookie。' },
-  { label: 'JavBus', value: 'javbus', name: 'JavBus', baseUrl: 'https://www.javbus.com', hint: '支持主站、反代和多个镜像；年龄验证站点需 Cookie。' },
-  { label: 'JavLibrary', value: 'javlibrary', name: 'JavLibrary', baseUrl: 'https://www.javlibrary.com', hint: '适合作为补充元数据来源，官方站可能需要 Cloudflare Cookie。' },
+  { label: 'JavDB', value: 'javdb', name: 'JavDB', baseUrl: 'https://javdb.com', hint: '默认通过 Chromium 持久会话访问；需要正常站点交互时会明确提示。' },
+  { label: 'JavBus', value: 'javbus', name: 'JavBus', baseUrl: 'https://www.javbus.com', hint: '支持 HTTP 或 Chromium；年龄确认状态保存在该来源的浏览器 Profile。' },
+  { label: 'JavLibrary', value: 'javlibrary', name: 'JavLibrary', baseUrl: 'https://www.javlibrary.com', hint: '适合作为补充元数据来源，访问受限时不会影响本地搜索。' },
 ]
-const newSource = reactive({ adapter: 'jav321', displayName: 'Jav321', baseUrl: 'https://www.jav321.com', secret: '', config: { proxyUrl: '', userAgent: '', syncEnabled: true, syncIntervalMinutes: 1440, syncDetailLimit: 8 } })
+const newSource = reactive({ adapter: 'jav321', displayName: 'Jav321', baseUrl: 'https://www.jav321.com', secret: '', config: { fetchMode: 'http', proxyUrl: '', userAgent: '', syncEnabled: true, syncIntervalMinutes: 1440, syncDetailLimit: 8 } })
 let syncPollTimer: ReturnType<typeof setTimeout> | undefined
 
 const legacy = reactive<Settings>({
@@ -96,6 +100,29 @@ function updateSourceConfig(provider: ProviderConfig, key: 'proxyUrl' | 'userAge
   provider.config = { ...provider.config, [key]: value }
 }
 
+const fetchModeOptions = [
+  { label: '自动选择', value: 'auto' },
+  { label: 'HTTP', value: 'http' },
+  { label: 'Chromium', value: 'browser' },
+]
+
+function sourceFetchMode(provider: ProviderConfig): ProviderFetchMode {
+  const value = provider.config.fetchMode
+  return value === 'browser' || value === 'auto' ? value : 'http'
+}
+
+function updateSourceFetchMode(provider: ProviderConfig, value: ProviderFetchMode) {
+  provider.config = { ...provider.config, fetchMode: value }
+}
+
+const runtimeStateLabel: Record<ProviderRuntime['state'], string> = {
+  ready: '可用',
+  degraded: '降级',
+  cooldown: '冷却中',
+  interaction_required: '需要建立会话',
+  unavailable: '不可用',
+}
+
 function sourceSyncEnabled(provider: ProviderConfig) {
   return typeof provider.config.syncEnabled === 'boolean' ? provider.config.syncEnabled : true
 }
@@ -140,7 +167,7 @@ function selectSourceAdapter(value: string) {
   newSource.displayName = adapter.name
   newSource.baseUrl = adapter.baseUrl
   newSource.secret = ''
-  newSource.config = { proxyUrl: '', userAgent: '', syncEnabled: true, syncIntervalMinutes: 1440, syncDetailLimit: 8 }
+  newSource.config = { fetchMode: adapter.value === 'javdb' ? 'browser' : 'http', proxyUrl: '', userAgent: '', syncEnabled: true, syncIntervalMinutes: 1440, syncDetailLimit: 8 }
 }
 
 function scheduleSyncPoll() {
@@ -166,6 +193,12 @@ async function load() {
       api.productSettings(),
     ])
     providers.value = providerData
+    const runtimeResults = await Promise.allSettled(
+      providerData.filter(provider => provider.type === 'source').map(provider => api.providerRuntime(provider.key)),
+    )
+    runtimeResults.forEach(result => {
+      if (result.status === 'fulfilled') providerRuntimes[result.value.providerKey] = result.value
+    })
     Object.assign(legacy, legacyData)
     Object.assign(product, productData)
     scheduleSyncPoll()
@@ -264,6 +297,104 @@ async function testProvider(key: string) {
   }
 }
 
+async function diagnoseProvider(provider: ProviderConfig) {
+  diagnosing.value = provider.key
+  delete testMessages[provider.key]
+  try {
+    await persistProvider(provider)
+    const result = await api.diagnoseProvider(provider.key)
+    providerRuntimes[provider.key] = result.runtime
+    const attempt = result.browser.attempted ? result.browser : result.http
+    const mode = result.browser.attempted ? 'Chromium' : 'HTTP'
+    const detail = attempt.success
+      ? `${mode} 已识别真实来源页面${attempt.elapsedMs == null ? '' : ` · ${attempt.elapsedMs} ms`}`
+      : `${mode}：${attempt.pageKind ?? 'invalid_content'}${attempt.error ? ` · ${attempt.error}` : ''}`
+    testMessages[provider.key] = { ok: attempt.success, text: detail }
+  } catch (reason) {
+    testMessages[provider.key] = { ok: false, text: reason instanceof Error ? reason.message : '来源诊断失败' }
+  } finally {
+    diagnosing.value = ''
+  }
+}
+
+function browserSessionUrl(session: BrowserSession) {
+  const query = new URLSearchParams({ autoconnect: 'true', resize: 'scale' })
+  if (session.password) query.set('password', session.password)
+  return `http://${window.location.hostname}:${session.port}/vnc.html?${query}`
+}
+
+async function startBrowserSession(provider: ProviderConfig) {
+  browserSessionBusy.value = provider.key
+  const browserWindow = window.open('about:blank', '_blank')
+  if (browserWindow) browserWindow.opener = null
+  try {
+    await persistProvider(provider)
+    const session = await api.startBrowserSession(provider.key)
+    browserSessions[provider.key] = session
+    const url = browserSessionUrl(session)
+    if (browserWindow) browserWindow.location.replace(url)
+    else window.open(url, '_blank', 'noopener,noreferrer')
+    message.success('浏览器会话已建立，请在新窗口完成站点要求的正常交互')
+  } catch (reason) {
+    browserWindow?.close()
+    message.error(reason instanceof Error ? reason.message : '浏览器会话启动失败')
+  } finally {
+    browserSessionBusy.value = ''
+  }
+}
+
+async function completeBrowserSession(provider: ProviderConfig) {
+  const session = browserSessions[provider.key]
+  if (!session) return
+  browserSessionBusy.value = provider.key
+  try {
+    await api.completeBrowserSession(provider.key, session.sessionId)
+    delete browserSessions[provider.key]
+    message.success('浏览器会话已保存，正在用同一 Profile 重新诊断')
+    await diagnoseProvider(provider)
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '保存浏览器会话失败')
+  } finally {
+    browserSessionBusy.value = ''
+  }
+}
+
+async function cancelBrowserSession(provider: ProviderConfig) {
+  const session = browserSessions[provider.key]
+  if (!session) return
+  browserSessionBusy.value = provider.key
+  try {
+    await api.cancelBrowserSession(provider.key, session.sessionId)
+    delete browserSessions[provider.key]
+    message.info('浏览器会话已关闭，现有 Profile 数据仍然保留')
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '关闭浏览器会话失败')
+  } finally {
+    browserSessionBusy.value = ''
+  }
+}
+
+function clearBrowserProfile(provider: ProviderConfig) {
+  dialog.warning({
+    title: '清除浏览器会话',
+    content: `这会永久删除 ${provider.displayName} 已保存的 Cookie、登录状态和站点设置。仅在会话损坏或需要重新建立时使用。`,
+    positiveText: '确认清除',
+    negativeText: '取消',
+    async onPositiveClick() {
+      browserSessionBusy.value = provider.key
+      try {
+        await api.clearBrowserProfile(provider.key)
+        delete browserSessions[provider.key]
+        message.success('该来源的浏览器 Profile 已清除')
+      } catch (reason) {
+        message.error(reason instanceof Error ? reason.message : '清除浏览器 Profile 失败')
+      } finally {
+        browserSessionBusy.value = ''
+      }
+    },
+  })
+}
+
 async function syncProvider(provider: ProviderConfig) {
   syncing.value = provider.key
   try {
@@ -347,12 +478,19 @@ onUnmounted(() => {
             </header>
             <n-form-item label="来源名称"><n-input v-model:value="provider.displayName" /></n-form-item>
             <n-form-item label="服务地址"><n-input v-model:value="provider.baseUrl" /></n-form-item>
+            <n-form-item label="访问方式">
+              <n-select
+                :value="sourceFetchMode(provider)"
+                :options="fetchModeOptions"
+                @update:value="value => updateSourceFetchMode(provider, value)"
+              />
+            </n-form-item>
             <n-form-item label="Cookie">
               <n-input
                 v-model:value="secrets[provider.key]"
                 type="password"
                 show-password-on="click"
-                :placeholder="provider.hasSecret ? '已保存，留空保持不变' : 'Cloudflare / 年龄验证站点可填写完整 Cookie'"
+                :placeholder="provider.hasSecret ? '已保存，留空保持不变' : '正常站点会话 Cookie，可留空'"
               />
             </n-form-item>
             <n-form-item label="代理 URL（可选）">
@@ -367,7 +505,7 @@ onUnmounted(() => {
                 :value="sourceConfigText(provider, 'userAgent')"
                 type="textarea"
                 :autosize="{ minRows: 2, maxRows: 3 }"
-                placeholder="填写获取验证 Cookie 时浏览器的完整 User-Agent，二者必须一致"
+                placeholder="仅用于 HTTP 模式的兼容设置；Chromium 使用真实浏览器会话"
                 @update:value="value => updateSourceConfig(provider, 'userAgent', value)"
               />
             </n-form-item>
@@ -417,14 +555,66 @@ onUnmounted(() => {
                 </n-alert>
               </div>
             </div>
+            <div v-if="providerRuntimes[provider.key]" class="source-runtime-summary">
+              <header>
+                <div><strong>访问运行状态</strong><small>{{ providerRuntimes[provider.key].browserProfilePath }}</small></div>
+                <span class="source-sync-status" :data-status="providerRuntimes[provider.key].state">
+                  {{ runtimeStateLabel[providerRuntimes[provider.key].state] }}
+                </span>
+              </header>
+              <dl>
+                <div><dt>当前方式</dt><dd>{{ providerRuntimes[provider.key].activeFetchMode }}</dd></div>
+                <div><dt>最近成功</dt><dd>{{ syncDate(providerRuntimes[provider.key].lastSuccessAt, '尚未成功') }}</dd></div>
+                <div><dt>最近失败</dt><dd>{{ syncDate(providerRuntimes[provider.key].lastFailureAt, '无') }}</dd></div>
+                <div><dt>连续失败</dt><dd>{{ providerRuntimes[provider.key].failureCount }} 次</dd></div>
+              </dl>
+              <n-alert v-if="providerRuntimes[provider.key].lastFailureMessage" type="warning" title="最近诊断">
+                {{ providerRuntimes[provider.key].lastFailureMessage }}
+              </n-alert>
+            </div>
+            <n-alert
+              v-if="browserSessions[provider.key]"
+              type="warning"
+              title="交互浏览器会话正在运行"
+            >
+              请在新窗口完成站点正常要求的登录、年龄确认或人工验证。会话将在
+              {{ syncDate(browserSessions[provider.key].expiresAt, '15 分钟后') }} 自动关闭；完成后点击“保存并测试”。
+            </n-alert>
             <n-alert type="info" :show-icon="false">
-              403 代表站点已收到请求但拒绝访问，并非断网。Cloudflare Cookie、User-Agent 和出口 IP 必须保持一致；本机 127.0.0.1 代理不能直接给 Docker 容器使用。
+              诊断会访问该 Provider 的真实页面并验证页面结构。浏览器会话仅供你完成站点要求的正常交互，保存后的 Cookie 由该来源独立复用；不会自动处理验证码。
             </n-alert>
             <div class="provider-card-actions">
-              <n-button secondary :loading="testing === provider.key" @click="testProvider(provider.key)">
+              <n-button secondary :loading="diagnosing === provider.key" @click="diagnoseProvider(provider)">
                 <template #icon><IconPlugConnected /></template>
-                测试来源
+                真实来源诊断
               </n-button>
+              <n-button
+                v-if="!browserSessions[provider.key]"
+                secondary
+                :loading="browserSessionBusy === provider.key"
+                :disabled="!provider.enabled"
+                @click="startBrowserSession(provider)"
+              >
+                <template #icon><IconServer /></template>
+                建立浏览器会话
+              </n-button>
+              <template v-else>
+                <n-button
+                  type="success"
+                  :loading="browserSessionBusy === provider.key"
+                  @click="completeBrowserSession(provider)"
+                >
+                  <template #icon><IconCheck /></template>
+                  保存并测试
+                </n-button>
+                <n-button
+                  secondary
+                  :disabled="browserSessionBusy === provider.key"
+                  @click="cancelBrowserSession(provider)"
+                >
+                  关闭会话
+                </n-button>
+              </template>
               <n-button
                 type="primary"
                 :loading="syncing === provider.key || provider.syncStatus === 'running'"
@@ -433,6 +623,14 @@ onUnmounted(() => {
               >
                 <template #icon><IconRefresh /></template>
                 立即同步
+              </n-button>
+              <n-button
+                quaternary
+                type="error"
+                :disabled="browserSessionBusy === provider.key || Boolean(browserSessions[provider.key])"
+                @click="clearBrowserProfile(provider)"
+              >
+                清除浏览器 Profile
               </n-button>
             </div>
             <n-alert v-if="testMessages[provider.key]" :type="testMessages[provider.key].ok ? 'success' : 'error'">

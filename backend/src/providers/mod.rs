@@ -1,3 +1,4 @@
+mod api;
 mod common;
 mod jav321;
 mod javbus;
@@ -5,7 +6,9 @@ mod javdb;
 mod javlibrary;
 mod model;
 mod registry;
+pub mod runtime;
 
+pub use api::router;
 pub use common::ProviderAdapter;
 pub use model::{
     DiscoverPage, DiscoverRequest, ProviderContext, ProviderError, ProviderMediaCandidate,

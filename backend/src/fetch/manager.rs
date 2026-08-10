@@ -1,19 +1,22 @@
 use std::sync::Arc;
 
 use super::{
+    browser::BrowserManager,
     http::HttpFetcher,
-    model::{FetchError, FetchFailureKind, FetchMode, FetchRequest, FetchResponse, FetchTransport},
+    model::{FetchError, FetchMode, FetchRequest, FetchResponse, FetchTransport},
 };
 
 #[derive(Debug, Clone)]
 pub struct FetchManager {
     http: Arc<HttpFetcher>,
+    browser: Arc<BrowserManager>,
 }
 
 impl Default for FetchManager {
     fn default() -> Self {
         Self {
             http: Arc::new(HttpFetcher),
+            browser: Arc::new(BrowserManager::from_env()),
         }
     }
 }
@@ -27,12 +30,7 @@ impl FetchManager {
     ) -> Result<FetchResponse, FetchError> {
         match mode {
             FetchMode::Http | FetchMode::Auto => self.http.fetch(request, transport).await,
-            FetchMode::Browser => Err(FetchError::new(
-                request.provider_key,
-                FetchFailureKind::BrowserUnavailable,
-                "Chromium fetcher is not enabled in this build phase",
-                None,
-            )),
+            FetchMode::Browser => self.browser.fetch(request, transport).await,
         }
     }
 
@@ -42,5 +40,9 @@ impl FetchManager {
         transport: &FetchTransport,
     ) -> Result<FetchResponse, FetchError> {
         self.http.fetch(request, transport).await
+    }
+
+    pub fn browser(&self) -> &BrowserManager {
+        &self.browser
     }
 }

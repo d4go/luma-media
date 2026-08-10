@@ -1639,6 +1639,16 @@ async fn create_provider(
     validate_source_transport_config(&input.config)?;
     let mut config = input.config.as_object().cloned().unwrap_or_default();
     config.insert("adapter".into(), Value::String(adapter.clone()));
+    config.entry("fetchMode").or_insert_with(|| {
+        Value::String(
+            match state.provider_registry.default_fetch_mode(&adapter) {
+                Some(crate::fetch::FetchMode::Browser) => "browser",
+                Some(crate::fetch::FetchMode::Auto) => "auto",
+                _ => "http",
+            }
+            .into(),
+        )
+    });
     let mut suffix = 1_i64;
     let key = loop {
         let candidate = if suffix == 1 {
@@ -3390,6 +3400,15 @@ fn validate_source_transport_config(config: &Value) -> AppResult<()> {
     let Some(config) = config.as_object() else {
         return Ok(());
     };
+    if config
+        .get("fetchMode")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !matches!(value, "auto" | "http" | "browser"))
+    {
+        return Err(AppError::BadRequest(
+            "访问方式必须是 auto、http 或 browser".into(),
+        ));
+    }
     if let Some(proxy_url) = config
         .get("proxyUrl")
         .and_then(Value::as_str)

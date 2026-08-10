@@ -22,7 +22,8 @@ pub fn classify_transport(response: &FetchResponse) -> Option<PageKind> {
         Some(429) => Some(PageKind::RateLimited),
         Some(500..=599) => Some(PageKind::TemporaryUnavailable),
         Some(200..=399) => None,
-        Some(_) | None => Some(PageKind::InvalidContent),
+        Some(_) => Some(PageKind::InvalidContent),
+        None => None,
     }
 }
 

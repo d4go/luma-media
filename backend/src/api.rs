@@ -28,6 +28,7 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(crate::product::router())
+        .merge(crate::providers::router())
         .route("/dashboard", get(dashboard))
         .route("/folders", get(list_folders).post(create_folder))
         .route("/folders/{id}", put(update_folder).delete(delete_folder))

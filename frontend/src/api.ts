@@ -2,7 +2,7 @@ import type {
   BatchScrapeResponse, BatchTaskResponse, CrawlerForm, CrawlerResult, CrawlerRun, CrawlerScript,
   DashboardStats, DownloadItem, Folder, FolderInput, MediaItem, MetaTubeConnection, QBittorrentConnection,
   ScrapeOptions, ServiceStatus, Settings, Task, TaskDetail,
-  Acquisition, AcquisitionDetail, Actor, AttentionItem, AutomationRule, HomeData, LibraryItem, MediaDetail, ProductMedia, ProductSettings, ProviderConfig, SearchResponse,
+  Acquisition, AcquisitionDetail, Actor, AttentionItem, AutomationRule, BrowserSession, HomeData, LibraryItem, MediaDetail, ProductMedia, ProductSettings, ProviderConfig, ProviderDiagnoseResponse, ProviderRuntime, SearchResponse,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
@@ -72,6 +72,13 @@ export const api = {
   setProviderEnabled: (key: string, enabled: boolean) => request<ProviderConfig>(`/providers/${key}/enabled`, { method: 'POST', body: JSON.stringify({ enabled }) }),
   testProvider: (key: string) => request<{ connected: boolean; message: string; latencyMs: number }>(`/providers/${key}/test`, { method: 'POST' }),
   syncProvider: (key: string) => request<ProviderConfig>(`/providers/${key}/sync`, { method: 'POST' }),
+  providerRuntime: (key: string) => request<ProviderRuntime>(`/providers/${key}/runtime`),
+  diagnoseProvider: (key: string) => request<ProviderDiagnoseResponse>(`/providers/${key}/diagnose`, { method: 'POST' }),
+  startBrowserSession: (key: string) => request<BrowserSession>(`/providers/${key}/browser-session`, { method: 'POST' }),
+  browserSession: (key: string, sessionId: string) => request<BrowserSession>(`/providers/${key}/browser-session/${sessionId}`),
+  completeBrowserSession: (key: string, sessionId: string) => request<BrowserSession>(`/providers/${key}/browser-session/${sessionId}/complete`, { method: 'POST' }),
+  cancelBrowserSession: (key: string, sessionId: string) => request<BrowserSession>(`/providers/${key}/browser-session/${sessionId}`, { method: 'DELETE' }),
+  clearBrowserProfile: (key: string) => request<{ cleared: boolean }>(`/providers/${key}/browser-profile`, { method: 'DELETE' }),
   productSettings: () => request<ProductSettings>('/product-settings'),
   updateProductSettings: (input: ProductSettings) => request<ProductSettings>('/product-settings', { method: 'PUT', body: JSON.stringify(input) }),
   serviceStatus: () => request<ServiceStatus>('/status'),

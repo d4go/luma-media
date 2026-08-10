@@ -267,5 +267,47 @@ export interface ProviderConfig {
   syncInsertedCount: number
   syncUpdatedCount: number
 }
+export type ProviderFetchMode = 'auto' | 'http' | 'browser'
+export type ProviderRuntimeState = 'ready' | 'degraded' | 'cooldown' | 'interaction_required' | 'unavailable'
+export type ProviderPageKind = 'valid_content' | 'age_gate' | 'login_required' | 'interaction_required' | 'access_denied' | 'rate_limited' | 'temporary_unavailable' | 'invalid_content'
+export interface ProviderRuntime {
+  providerKey: string
+  state: ProviderRuntimeState
+  activeFetchMode: ProviderFetchMode
+  lastSuccessAt: string | null
+  lastFailureAt: string | null
+  lastFailureKind: string | null
+  lastFailureMessage: string | null
+  failureCount: number
+  cooldownUntil: string | null
+  browserEnabled: boolean
+  browserExecutable: string
+  browserProfilePath: string
+}
+export interface ProviderDiagnoseAttempt {
+  attempted: boolean
+  success: boolean
+  status: number | null
+  pageKind: ProviderPageKind | null
+  finalUrl: string | null
+  elapsedMs: number | null
+  error: string | null
+}
+export interface ProviderDiagnoseResponse {
+  provider: string
+  http: ProviderDiagnoseAttempt
+  browser: ProviderDiagnoseAttempt
+  runtime: ProviderRuntime
+}
+export type BrowserSessionStatus = 'active' | 'completed' | 'cancelled'
+export interface BrowserSession {
+  sessionId: string
+  providerKey: string
+  status: BrowserSessionStatus
+  port: number
+  password: string | null
+  startedAt: string
+  expiresAt: string
+}
 export interface ProductSettings { downloadRoot: string; mediaRoot: string; qbittorrentSavePath: string; qbittorrentCategory: string; qbittorrentTags: string; organizerMode: 'hardlink' | 'copy'; organizerMovieTemplate: string; organizerConflictPolicy: string }
 export interface AutomationRule { id: number; name: string; enabled: boolean; triggerType: string; triggerConfig: Record<string, unknown>; conditions: Record<string, unknown>; actionType: string; actionConfig: Record<string, unknown>; mode: 'AUTO' | 'CONFIRM' | 'NOTIFY'; lastRunAt: string | null; nextRunAt: string | null; lastStatus: string | null; lastExplanation: string | null; createdAt: string }
