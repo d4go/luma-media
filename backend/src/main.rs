@@ -2,6 +2,7 @@ mod api;
 mod asset;
 mod crawler;
 mod error;
+mod export;
 mod fetch;
 mod ingestion;
 mod metadata;

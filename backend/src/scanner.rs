@@ -130,6 +130,21 @@ pub async fn run_scan(state: AppState, folder: Folder, task_id: i64, record_id: 
             }
         }
 
+        match attach_canonical_library(&state, &folder, media_id, file).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = sqlx::query(
+                    "UPDATE media_item SET status='pending',updated_at=datetime('now') WHERE id=?",
+                )
+                .bind(media_id)
+                .execute(pool)
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, path = %file.display(), "failed to attach scanned file to canonical Luma media");
+            }
+        }
+
         let progress = 10 + (((index + 1) * 85 / total) as i64);
         let _ = storage::update_task_progress(pool, task_id, record_id, progress).await;
     }
@@ -177,6 +192,63 @@ pub async fn run_scan(state: AppState, folder: Folder, task_id: i64, record_id: 
         ),
     )
     .await;
+}
+
+async fn attach_canonical_library(
+    state: &AppState,
+    folder: &Folder,
+    legacy_media_item_id: i64,
+    video_path: &Path,
+) -> anyhow::Result<bool> {
+    let Some(code) = video_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .and_then(crate::product::extract_media_code)
+        .map(|value| crate::product::normalize_code(&value))
+    else {
+        return Ok(false);
+    };
+    let Some(media_id) =
+        sqlx::query_scalar::<_, i64>("SELECT id FROM media WHERE normalized_code=?")
+            .bind(&code)
+            .fetch_optional(&state.pool)
+            .await?
+    else {
+        return Ok(false);
+    };
+    let video_path_text = video_path.to_string_lossy().to_string();
+    let (nfo_path, poster_path) = storage::local_media_resources(&video_path_text);
+    let file_size = tokio::fs::metadata(video_path)
+        .await
+        .ok()
+        .map(|metadata| metadata.len() as i64);
+    let library_item_id: i64 = sqlx::query_scalar("INSERT INTO library_item(media_id,legacy_media_item_id,video_path,nfo_path,poster_path,status,file_size) VALUES (?,?,?,?,?,'ready',?) ON CONFLICT(video_path) DO UPDATE SET media_id=excluded.media_id,legacy_media_item_id=excluded.legacy_media_item_id,nfo_path=COALESCE(excluded.nfo_path,library_item.nfo_path),poster_path=COALESCE(excluded.poster_path,library_item.poster_path),status='ready',file_size=excluded.file_size,updated_at=datetime('now') RETURNING id")
+        .bind(media_id)
+        .bind(legacy_media_item_id)
+        .bind(&video_path_text)
+        .bind(nfo_path.as_ref().map(|path| path.to_string_lossy().to_string()))
+        .bind(poster_path.as_ref().map(|path| path.to_string_lossy().to_string()))
+        .bind(file_size)
+        .fetch_one(&state.pool)
+        .await?;
+    sqlx::query("UPDATE media_item SET provider_id=?,title=(SELECT title FROM media WHERE id=?),status='ready',updated_at=datetime('now') WHERE id=?")
+        .bind(format!("luma:{}", code.to_ascii_uppercase()))
+        .bind(media_id)
+        .bind(legacy_media_item_id)
+        .execute(&state.pool)
+        .await?;
+    if matches!(folder.output_format.as_str(), "nfo" | "both") {
+        crate::export::regenerate_library_item(
+            &state.pool,
+            library_item_id,
+            crate::export::ExportOptions {
+                overwrite_nfo: false,
+                overwrite_artwork: false,
+            },
+        )
+        .await?;
+    }
+    Ok(true)
 }
 
 struct LocalMetadata {

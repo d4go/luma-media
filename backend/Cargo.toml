@@ -12,6 +12,7 @@ chromiumoxide = "0.9.1"
 futures = "0.3"
 flate2 = "1"
 notify = "8"
+quick-xml = "0.38"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 scraper = "0.23"
 serde = { version = "1", features = ["derive"] }

@@ -70,6 +70,8 @@ pub fn router() -> Router<AppState> {
         .route("/library", get(list_library))
         .route("/library/{id}", get(library_detail))
         .route("/library/{id}/reorganize", post(reorganize_library))
+        .route("/library/{id}/nfo", post(regenerate_library_nfo))
+        .route("/library/{id}/artwork", post(sync_library_artwork))
         .route("/attention", get(list_attention))
         .route("/attention/{id}", get(attention_detail))
         .route("/attention/{id}/action", post(attention_action))
@@ -1150,54 +1152,44 @@ async fn process_acquisition_inner(state: &AppState, id: i64) -> AppResult<()> {
         state,
         id,
         "METADATA",
-        "正在通过 MetaTube 补全元数据",
+        "正在从 Luma 数据库生成本地元数据",
         json!({"videoPath": destination}),
     )
     .await?;
-    let nfo = destination.with_extension("nfo");
-    let metadata = enrich_with_metatube(state, acquisition.media_id, &acquisition.media.code).await;
-    let (remote, metadata_provider, poster_path) = match metadata {
-        Ok(value) => value,
-        Err(error) => {
-            sqlx::query("INSERT INTO metadata_record_v2(media_id, provider_key, status, raw_json, error_message) VALUES (?, 'metatube', 'failed', '{}', ?)")
-                .bind(acquisition.media_id).bind(error.to_string()).execute(&state.pool).await?;
-            (
-                json!({"title": acquisition.media.title, "number": acquisition.media.code}),
-                "luma".to_owned(),
-                None,
-            )
+    if canonical_metadata_needs_fallback(state, acquisition.media_id).await? {
+        match enrich_with_metatube(state, acquisition.media_id, &acquisition.media.code).await {
+            Ok((_, _, Some(poster_path))) => {
+                crate::export::artwork::register_cached_asset(
+                    &state.pool,
+                    acquisition.media_id,
+                    "poster",
+                    acquisition.media.poster_url.as_deref(),
+                    &poster_path,
+                    None,
+                )
+                .await?;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, media_id = acquisition.media_id, "MetaTube fallback failed; canonical Luma metadata will still be exported");
+                sqlx::query("INSERT INTO metadata_record_v2(media_id, provider_key, status, raw_json, error_message) VALUES (?, 'metatube', 'failed', '{}', ?)")
+                    .bind(acquisition.media_id)
+                    .bind(error.to_string())
+                    .execute(&state.pool)
+                    .await?;
+            }
         }
-    };
-    let title = first_json_string(&remote, &["title"]).unwrap_or(&acquisition.media.title);
-    let original_title = first_json_string(&remote, &["original_title", "number"])
-        .unwrap_or(&acquisition.media.code);
-    let summary =
-        first_json_string(&remote, &["summary", "plot", "description"]).unwrap_or_default();
-    let release_date =
-        first_json_string(&remote, &["release_date", "premiered"]).unwrap_or_default();
-    let nfo_body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<movie>\n  <title>{}</title>\n  <originaltitle>{}</originaltitle>\n  <plot>{}</plot>\n  <premiered>{}</premiered>\n  <uniqueid type=\"{}\" default=\"true\">{}</uniqueid>\n</movie>\n",
-        xml_escape(title),
-        xml_escape(original_title),
-        xml_escape(summary),
-        xml_escape(release_date),
-        xml_escape(&metadata_provider),
-        xml_escape(&acquisition.media.code)
-    );
-    tokio::fs::write(&nfo, nfo_body)
-        .await
-        .map_err(anyhow::Error::from)?;
-    sqlx::query("INSERT INTO metadata_record_v2(media_id, provider_key, status, raw_json) VALUES (?, ?, 'complete', ?)")
-        .bind(acquisition.media_id).bind(&metadata_provider).bind(remote.to_string()).execute(&state.pool).await?;
-    sqlx::query("UPDATE media SET metadata_status = ?, updated_at = datetime('now') WHERE id = ?")
-        .bind(if metadata_provider == "metatube" {
-            "complete"
-        } else {
-            "partial"
-        })
-        .bind(acquisition.media_id)
-        .execute(&state.pool)
-        .await?;
+    }
+    let export = crate::export::write_sidecars_for_media(
+        &state.pool,
+        acquisition.media_id,
+        &destination,
+        crate::export::ExportOptions {
+            overwrite_nfo: true,
+            overwrite_artwork: false,
+        },
+    )
+    .await?;
     transition(state, id, "LIBRARY_COMMIT", "正在提交媒体库", json!({})).await?;
     let file_size = tokio::fs::metadata(&destination)
         .await
@@ -1207,7 +1199,15 @@ async fn process_acquisition_inner(state: &AppState, id: i64) -> AppResult<()> {
         .bind(destination.to_string_lossy().to_string()).bind(destination.file_name().and_then(|v| v.to_str()).unwrap_or_default()).bind(format!("luma-{id}"))
         .bind(&acquisition.media.title).bind(&acquisition.media.media_type).fetch_one(&state.pool).await?.get::<i64,_>("id");
     let library_id = sqlx::query("INSERT INTO library_item(media_id, acquisition_id, legacy_media_item_id, video_path, nfo_path, poster_path, status, file_size) VALUES (?, ?, ?, ?, ?, ?, 'ready', ?)")
-        .bind(acquisition.media_id).bind(id).bind(legacy_id).bind(destination.to_string_lossy().to_string()).bind(nfo.to_string_lossy().to_string()).bind(poster_path.as_ref().map(|path| path.to_string_lossy().to_string())).bind(file_size).execute(&state.pool).await?.last_insert_rowid();
+        .bind(acquisition.media_id).bind(id).bind(legacy_id).bind(destination.to_string_lossy().to_string()).bind(export.nfo_path.to_string_lossy().to_string()).bind(export.poster_path.as_ref().map(|path| path.to_string_lossy().to_string())).bind(file_size).execute(&state.pool).await?.last_insert_rowid();
+    sqlx::query("INSERT INTO library_export_state(library_item_id,media_id,nfo_path,poster_path,metadata_updated_at,status,last_exported_at) VALUES (?,?,?,?,?,'success',datetime('now')) ON CONFLICT(library_item_id) DO UPDATE SET nfo_path=excluded.nfo_path,poster_path=COALESCE(excluded.poster_path,library_export_state.poster_path),metadata_updated_at=excluded.metadata_updated_at,status='success',last_error=NULL,last_exported_at=datetime('now'),updated_at=datetime('now')")
+        .bind(library_id)
+        .bind(acquisition.media_id)
+        .bind(export.nfo_path.to_string_lossy().to_string())
+        .bind(export.poster_path.as_ref().map(|path| path.to_string_lossy().to_string()))
+        .bind(export.metadata_updated_at)
+        .execute(&state.pool)
+        .await?;
     sqlx::query("UPDATE acquisition SET library_item_id = ? WHERE id = ?")
         .bind(library_id)
         .bind(id)
@@ -1222,6 +1222,14 @@ async fn process_acquisition_inner(state: &AppState, id: i64) -> AppResult<()> {
     )
     .await?;
     Ok(())
+}
+
+async fn canonical_metadata_needs_fallback(state: &AppState, media_id: i64) -> AppResult<bool> {
+    let needs: i64 = sqlx::query_scalar("SELECT CASE WHEN trim(title)='' OR (lower(trim(title))=lower(trim(normalized_code)) AND trim(summary)='' AND release_date IS NULL AND poster_url IS NULL) THEN 1 ELSE 0 END FROM media WHERE id=?")
+        .bind(media_id)
+        .fetch_one(&state.pool)
+        .await?;
+    Ok(needs != 0)
 }
 
 async fn enrich_with_metatube(
@@ -1513,10 +1521,55 @@ async fn reorganize_library(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
 ) -> AppResult<Json<Value>> {
+    crate::export::regenerate_library_item(
+        &state.pool,
+        id,
+        crate::export::ExportOptions::default(),
+    )
+    .await?;
     let row = sqlx::query("SELECT li.*, m.normalized_code, m.title, m.poster_url, m.release_date, m.metadata_status, mi.filename AS legacy_filename, mi.provider_id AS legacy_provider_id FROM library_item li JOIN media m ON m.id = li.media_id LEFT JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.id = ?").bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
     Ok(Json(
-        json!({"item": library_json(&row), "message": "当前文件已符合命名模板，无需移动"}),
+        json!({"item": library_json(&row), "message": "已按当前 Luma 数据重新生成 NFO"}),
     ))
+}
+
+async fn regenerate_library_nfo(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> AppResult<Json<Value>> {
+    let report = crate::export::regenerate_library_item(
+        &state.pool,
+        id,
+        crate::export::ExportOptions {
+            overwrite_nfo: true,
+            overwrite_artwork: false,
+        },
+    )
+    .await?;
+    Ok(Json(
+        json!({"export": report, "message": "NFO 已从 Luma 数据库重新生成"}),
+    ))
+}
+
+async fn sync_library_artwork(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> AppResult<Json<Value>> {
+    let report = crate::export::regenerate_library_item(
+        &state.pool,
+        id,
+        crate::export::ExportOptions {
+            overwrite_nfo: false,
+            overwrite_artwork: true,
+        },
+    )
+    .await?;
+    let message = if report.poster_path.is_some() {
+        "本地缓存图片已重新同步"
+    } else {
+        "暂无可离线同步的本地图片缓存"
+    };
+    Ok(Json(json!({"export": report, "message": message})))
 }
 
 async fn list_attention(State(state): State<AppState>) -> AppResult<Json<Vec<Value>>> {
@@ -4844,7 +4897,7 @@ fn display_media_code(
         })
 }
 
-fn extract_media_code(value: &str) -> Option<String> {
+pub(crate) fn extract_media_code(value: &str) -> Option<String> {
     let uppercase = value.to_ascii_uppercase();
     let bytes = uppercase.as_bytes();
     if let Some(fc2_at) = uppercase.find("FC2") {
@@ -4889,7 +4942,7 @@ fn extract_media_code(value: &str) -> Option<String> {
     }
     None
 }
-fn normalize_code(value: &str) -> String {
+pub(crate) fn normalize_code(value: &str) -> String {
     value
         .trim()
         .chars()
@@ -5017,14 +5070,6 @@ fn ensure_lexically_within(path: &Path, root: &Path) -> AppResult<()> {
     } else {
         Ok(())
     }
-}
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 fn chrono_like_nonce() -> u128 {
     std::time::SystemTime::now()
