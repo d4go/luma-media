@@ -58,7 +58,18 @@ BrowserFetcher 使用镜像内真实 Chromium，不实现 CAPTCHA 绕过、隐�
 | JavBus | PASS | browser | 浏览器接口无独立 HTTP status | `valid_content` | `https://www.javbus.com/` | 用户完成年龄确认后，持久 profile 可重新加载真实列表页；runtime 为 `ready` |
 | JavDB | PASS | browser | 浏览器接口无独立 HTTP status | `valid_content` | `https://javdb.com/` | 用户完成人工交互后，持久 profile 可重新加载真实站点内容；runtime 为 `ready` |
 
-这两项 PASS 仅代表真实 Provider 页面访问与分类门通过，不代表任意番号都一定存在。最终部署后还会执行一次真实番号的 on-demand `search -> detail -> Raw Snapshot -> metadata/resource -> local DB` 验收，并在本报告补记结果。
+容器更新到 `9f3601864144f0da1142260a617aabd28f9bef7a` 后再次诊断，两套持久 profile 均无需重新交互即可返回 `valid_content`：JavBus 用时 1904 ms，JavDB 用时 681 ms，runtime 均为 `ready`。这证明 `/data/browser-profiles/<provider_key>` 在容器重建后被重新加载。
+
+同版本 NAS 上执行了真实番号 STARS-134 的 on-demand 闭环：
+
+- 本地 `GET /search?q=STARS-134` 初始返回空结果，证明普通搜索没有访问外部 Provider。
+- `POST /catalog/resolve` 创建 job 72 至 75，优先级为用户 on-demand 优先级。
+- JavBus job 73 一次完成真实 `detail -> Raw Snapshot -> metadata/resource -> local DB`。
+- JavDB job 74 第一次写入遇到 SQLite `database is locked`，持久队列 60 秒后自动重试并成功，没有丢任务。
+- Jav321 对该番号无精确结果，最终独立失败；JavLibrary 返回真实 `HTTP 403 Forbidden`，最终独立失败。两者均未阻断 JavBus、JavDB 或本地搜索。
+- canonical media id 为 292，收录 2 条 Metadata source record、36 个按 info hash 去重的 Resource、48 条 Resource source mapping。JavBus 与 JavDB 的字段 provenance 和来源页面均可在作品详情页查看。
+- 媒体库 item 3 原来错误关联到 `STARS-00134`，现已重匹配到 media 292 / `STARS-134`；原 NFO 先备份到部署备份目录。
+- 生成的 `/media/STARS-134.nfo` 通过 XML 解析，根节点为 `movie`，unique id 为 `STARS-134`。第二次重建前后 raw snapshot 均为 100 条、metadata source record 均为 31 条，证明 NFO 重建没有访问外部网站。
 
 ## 5. 同步、checkpoint 与优先级
 
@@ -121,6 +132,8 @@ MetaTube 只保留为兼容降级路径：当下载完成后 canonical media 缺
 - `npm run typecheck`：通过。
 - `npm run build`：通过，Vite 生产包成功生成。
 - 自动测试覆盖：本地多语言搜索不访问外网、Bootstrap checkpoint 暂停/继续与启动恢复、持久 worker 增量同步和幂等、按番号查漏高优先级与去重、Resource 多来源去重、Metadata 优先级解析、离线 NFO 导出、qBittorrent 状态对账和重复 Acquisition。
+- NAS 镜像 build、SQLite migration 18、`/api/v1/health`、三个持久挂载和浏览器渲染均通过；资源页、作品详情、来源状态与同步进度、媒体库重匹配及 NFO 操作在真实数据上可见。
+- Luma 重启期间 qBittorrent 未重启。STARS-123 在切换前约 41.82%，切换后约 41.93%，状态保持 `DOWNLOADING/downloading`。
 - 当前编译仍有四项未接入 trait 数据模型的 `dead_code` 警告，不影响构建或运行；没有把它们记成零警告。
 
 ## 11. 已知限制
@@ -129,4 +142,4 @@ MetaTube 只保留为兼容降级路径：当下载完成后 canonical media 缺
 - 人工验证由真实 Chromium profile 保存，外站将来重新要求验证时仍会回到 `interaction_required`，需要用户再次建立会话。
 - FTS5 trigram 对少于 3 个字符没有 token；1 至 2 字符查询使用受限的精确、前缀和 LIKE 回退。
 - 历史媒体库中有旧版本把标题误当番号形成的错误关联，需要通过详情页“重新匹配”逐项修正；系统不会在没有可靠番号时自动猜测并覆盖。
-- JavDB/JavBus 页面访问门已通过；最终部署后的真实番号全链路结果将在同版本 NAS 验收后补充。
+- Jav321 对部分番号可能没有精确结果；JavLibrary 当前真实返回 `HTTP 403 Forbidden`。两项故障均会留在各自任务和 Provider 状态中，不会回退为前台搜索时实时并发访问。
