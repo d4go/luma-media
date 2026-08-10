@@ -231,8 +231,14 @@ async fn pause_run(
     ) {
         return Err(AppError::BadRequest("该任务已结束，不能暂停".into()));
     }
+    let stats = state.task_engine.run_stats(id).await?;
+    let to = if stats.running == 0 {
+        JobStatus::Paused
+    } else {
+        JobStatus::Pausing
+    };
     Ok(Json(
-        state.task_engine.transition(id, JobStatus::Pausing, None).await?,
+        state.task_engine.transition(id, to, None).await?,
     ))
 }
 
@@ -260,8 +266,14 @@ async fn cancel_run(
     ) {
         return Err(AppError::BadRequest("该任务已结束，不能取消".into()));
     }
+    let stats = state.task_engine.run_stats(id).await?;
+    let to = if stats.running == 0 {
+        JobStatus::Cancelled
+    } else {
+        JobStatus::Cancelling
+    };
     Ok(Json(
-        state.task_engine.transition(id, JobStatus::Cancelling, None).await?,
+        state.task_engine.transition(id, to, None).await?,
     ))
 }
 
