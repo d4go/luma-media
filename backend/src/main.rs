@@ -10,6 +10,7 @@ mod product;
 mod provider;
 mod providers;
 mod qbittorrent;
+mod resource;
 mod scanner;
 mod scheduler;
 mod storage;

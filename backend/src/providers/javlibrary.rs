@@ -1,6 +1,10 @@
 use crate::fetch::{FetchMode, FetchResponse, PageKind, classify_transport};
 
-use super::common::{ProviderAdapter, contains_selector};
+use super::{
+    ProviderContext, ProviderError, ProviderMediaRef, ResourceCandidate, ResourceProvider,
+    common::{ProviderAdapter, contains_selector},
+    resource_common::{detail_document, parse_magnet_candidates},
+};
 
 pub struct JavLibraryAdapter;
 
@@ -32,5 +36,25 @@ impl ProviderAdapter for JavLibraryAdapter {
         } else {
             PageKind::InvalidContent
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceProvider for JavLibraryAdapter {
+    fn key(&self) -> &'static str {
+        "javlibrary"
+    }
+
+    async fn fetch_resources(
+        &self,
+        context: &ProviderContext,
+        media: &ProviderMediaRef,
+    ) -> Result<Vec<ResourceCandidate>, ProviderError> {
+        let document = detail_document(context, media).await?;
+        Ok(parse_magnet_candidates(
+            &document.body,
+            "JavLibrary 资源",
+            &document.source_url,
+        ))
     }
 }

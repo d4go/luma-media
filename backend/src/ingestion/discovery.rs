@@ -37,6 +37,7 @@ pub struct DiscoveryJobPayload {
 #[derive(Debug, Clone)]
 pub struct DiscoveredCandidate {
     pub id: i64,
+    pub media_id: Option<i64>,
     pub content_hash: String,
     pub should_hydrate: bool,
     pub inserted: bool,
@@ -56,7 +57,7 @@ pub async fn upsert_candidates(
             .bind(&item.provider_id)
             .fetch_optional(&mut *transaction)
             .await?;
-        let (id, should_hydrate, inserted) = if let Some(existing) = existing {
+        let (id, media_id, should_hydrate, inserted) = if let Some(existing) = existing {
             let old_hash: String = existing.get("content_hash");
             let hydrated_hash: Option<String> = existing.get("last_hydrated_hash");
             let status: String = existing.get("hydration_status");
@@ -77,7 +78,7 @@ pub async fn upsert_candidates(
                 .bind(existing.get::<i64, _>("id"))
                 .execute(&mut *transaction)
                 .await?;
-            (existing.get("id"), should_hydrate, false)
+            (existing.get("id"), media_id, should_hydrate, false)
         } else {
             let id = sqlx::query_scalar("INSERT INTO provider_discovery_item(provider_key,provider_entity_id,normalized_code,source_url,release_date,title_hint,poster_hint,content_hash) VALUES (?,?,?,?,?,?,?,?) RETURNING id")
                 .bind(provider_key)
@@ -90,10 +91,11 @@ pub async fn upsert_candidates(
                 .bind(&content_hash)
                 .fetch_one(&mut *transaction)
                 .await?;
-            (id, true, true)
+            (id, None, true, true)
         };
         candidates.push(DiscoveredCandidate {
             id,
+            media_id,
             content_hash,
             should_hydrate,
             inserted,

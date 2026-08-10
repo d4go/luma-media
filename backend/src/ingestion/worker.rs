@@ -151,6 +151,10 @@ async fn execute(state: &AppState, job: &IngestionJob) -> anyhow::Result<()> {
             let payload = serde_json::from_value(job.payload.clone())?;
             crate::product::execute_hydration_job(state, &payload).await
         }
+        "resource_refresh" => {
+            let payload = serde_json::from_value(job.payload.clone())?;
+            crate::product::execute_resource_refresh_job(state, &payload).await
+        }
         job_type => anyhow::bail!("unsupported ingestion job type: {job_type}"),
     }
 }

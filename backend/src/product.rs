@@ -24,9 +24,13 @@ use crate::{
     fetch::{FetchError, FetchMethod, FetchRequest, FetchResponse, PageKind},
     ingestion::{
         DiscoveryJobPayload, EnqueueJob, HydrationJobPayload, PRIORITY_DAILY_INCREMENTAL,
-        PRIORITY_HISTORICAL_BOOTSTRAP, PRIORITY_USER_ON_DEMAND, SnapshotInput, SyncMode,
+        PRIORITY_HISTORICAL_BOOTSTRAP, PRIORITY_USER_ON_DEMAND, ResourceRefreshJobPayload,
+        SnapshotInput, SyncMode,
     },
-    providers::{SourceMedia, SourceProviderConfig},
+    providers::{
+        ProviderContext, ProviderMediaRef, RawProviderDocument, ResourceCandidate, SourceMedia,
+        SourceProviderConfig,
+    },
     qbittorrent::{QBittorrentClient, magnet_hash, normalize_hash},
     storage,
 };
@@ -42,7 +46,10 @@ pub fn router() -> Router<AppState> {
         .route("/search", get(search))
         .route("/catalog/media", get(list_media))
         .route("/catalog/media/{id}", get(media_detail))
-        .route("/catalog/media/{id}/resources", get(media_resources))
+        .route(
+            "/catalog/media/{id}/resources",
+            get(media_resources).post(refresh_media_resources),
+        )
         .route("/catalog/media/{id}/acquire", post(acquire_media))
         .route("/actors", get(list_actors))
         .route("/actors/{id}", get(actor_detail))
@@ -159,6 +166,12 @@ struct Resource {
     score: f64,
     score_reasons: Vec<String>,
     available: bool,
+    availability_status: String,
+    codec: Option<String>,
+    source_count: i64,
+    first_seen_at: Option<String>,
+    last_seen_at: Option<String>,
+    last_verified_at: Option<String>,
     qbit_hash: Option<String>,
     qbit_state: Option<String>,
     qbit_sync_status: String,
@@ -389,6 +402,39 @@ async fn media_resources(
     Ok(Json(resources_for_media(&state, id).await?))
 }
 
+async fn refresh_media_resources(
+    State(state): State<AppState>,
+    AxumPath(media_id): AxumPath<i64>,
+) -> AppResult<Json<Value>> {
+    media_exists(&state, media_id).await?;
+    let providers = resource_provider_keys_for_media(&state, media_id).await?;
+    if providers.is_empty() {
+        return Err(AppError::BadRequest(
+            "当前媒体没有支持磁链刷新的来源映射".into(),
+        ));
+    }
+    let mut jobs = Vec::new();
+    for provider_key in providers {
+        jobs.push(
+            enqueue_resource_refresh_job(
+                &state,
+                ResourceRefreshJobPayload {
+                    media_id,
+                    provider_key,
+                    force: true,
+                },
+                PRIORITY_USER_ON_DEMAND,
+            )
+            .await?,
+        );
+    }
+    Ok(Json(json!({
+        "mediaId": media_id,
+        "status": "queued",
+        "jobIds": jobs,
+    })))
+}
+
 async fn acquire_media(
     State(state): State<AppState>,
     AxumPath(media_id): AxumPath<i64>,
@@ -434,14 +480,15 @@ pub async fn request_acquisition(state: &AppState, input: AcquireInput) -> AppRe
     };
     let resource_id =
         resource_id.ok_or_else(|| AppError::BadRequest("当前媒体没有可获取资源".into()))?;
-    let belongs: i64 =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM resource WHERE id = ? AND media_id = ?)")
-            .bind(resource_id)
-            .bind(media_id)
-            .fetch_one(&state.pool)
-            .await?;
+    let belongs: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM resource WHERE id = ? AND media_id = ? AND available=1)",
+    )
+    .bind(resource_id)
+    .bind(media_id)
+    .fetch_one(&state.pool)
+    .await?;
     if belongs == 0 {
-        return Err(AppError::BadRequest("资源不属于该媒体".into()));
+        return Err(AppError::BadRequest("资源不属于该媒体或当前不可用".into()));
     }
 
     let mut tx = state.pool.begin().await?;
@@ -2163,7 +2210,7 @@ async fn enqueue_discovery_job(
             provider_key: &provider.key,
             job_type: "discovery",
             priority,
-            payload: serde_json::to_value(payload).map_err(anyhow::Error::from)?,
+            payload: serde_json::to_value(&payload).map_err(anyhow::Error::from)?,
             max_attempts: 3,
             dedupe_key: Some(&dedupe_key),
         })
@@ -2180,6 +2227,15 @@ fn validate_sync_window(from: &str, to: &str) -> AppResult<()> {
         return Err(AppError::BadRequest("from 不能晚于 to".into()));
     }
     Ok(())
+}
+
+fn resource_date_is_recent(release_date: &str, recent_days: i64) -> bool {
+    chrono::NaiveDate::parse_from_str(release_date, "%Y-%m-%d")
+        .ok()
+        .is_some_and(|date| {
+            date >= chrono::Utc::now().date_naive()
+                - chrono::Duration::days(recent_days.clamp(1, 3650))
+        })
 }
 
 fn validate_provider_page_url(
@@ -2341,6 +2397,26 @@ pub(crate) async fn execute_discovery_job(
     let mut pending_count = 0_i64;
     for candidate in &candidates {
         if !candidate.should_hydrate {
+            if payload.mode == SyncMode::Incremental
+                && let Some(media_id) = candidate.media_id
+                && state
+                    .provider_registry
+                    .resource_provider(&provider.adapter)
+                    .is_some()
+                && crate::resource::cache_needs_refresh(&state.pool, media_id, &provider.key)
+                    .await?
+            {
+                enqueue_resource_refresh_job(
+                    state,
+                    ResourceRefreshJobPayload {
+                        media_id,
+                        provider_key: provider.key.clone(),
+                        force: false,
+                    },
+                    PRIORITY_DAILY_INCREMENTAL,
+                )
+                .await?;
+            }
             continue;
         }
         let hydration = HydrationJobPayload {
@@ -2478,6 +2554,10 @@ pub(crate) async fn execute_hydration_job(
             release_date: item.release_date.clone(),
         };
         let media_id = persist_source_media(state, &provider.key, &source).await?;
+        let allow_resource_endpoint = payload.mode != SyncMode::Bootstrap
+            || item.release_date.as_deref().is_some_and(|release_date| {
+                resource_date_is_recent(release_date, provider.resource_hydration_recent_days)
+            });
         match provider.adapter.as_str() {
             "javbus" => {
                 refresh_javbus_media(
@@ -2487,6 +2567,7 @@ pub(crate) async fn execute_hydration_job(
                     &item.provider_entity_id,
                     &item.source_url,
                     payload.include_resources,
+                    allow_resource_endpoint,
                 )
                 .await?;
             }
@@ -2498,6 +2579,7 @@ pub(crate) async fn execute_hydration_job(
                     &item.provider_entity_id,
                     &item.source_url,
                     payload.include_resources,
+                    allow_resource_endpoint,
                 )
                 .await?;
             }
@@ -2681,6 +2763,7 @@ async fn synchronize_source_catalogue(
                     &item.provider_id,
                     &item.source_url,
                     true,
+                    true,
                 )
                 .await
             }
@@ -2691,6 +2774,7 @@ async fn synchronize_source_catalogue(
                     provider,
                     &item.provider_id,
                     &item.source_url,
+                    true,
                     true,
                 )
                 .await
@@ -3533,12 +3617,6 @@ pub async fn ingest_crawler_result(state: &AppState, result_id: i64) -> AppResul
     )
     .await?;
     let info_hash = magnet_hash(&result.download_url);
-    let (score, reasons) = rank_resource(
-        &result.title,
-        result.size.as_deref(),
-        &result.published_at,
-        &result.source,
-    );
     let provider_key = format!("crawler:{}", result.script_id);
     let provider_resource_id = [
         "resourceId",
@@ -3560,42 +3638,24 @@ pub async fn ingest_crawler_result(state: &AppState, result_id: i64) -> AppResul
             .map(|hash| format!("btih:{hash}"))
             .unwrap_or_else(|| format!("result:{}", result.id))
     });
-    let trackers_json = serde_json::to_string(&result.trackers).unwrap_or_else(|_| "[]".into());
-    let reasons_json = serde_json::to_string(&reasons).unwrap_or_else(|_| "[]".into());
-    let raw_json = result.raw.to_string();
-    let resource_id = if let Some(info_hash) = info_hash.as_deref() {
-        if let Some(row) = sqlx::query("SELECT id,media_id FROM resource WHERE info_hash=?")
-            .bind(info_hash)
-            .fetch_optional(&state.pool)
-            .await?
-        {
-            let existing_media_id: i64 = row.get("media_id");
-            if existing_media_id != media_id {
-                tracing::warn!(
-                    info_hash,
-                    existing_media_id,
-                    media_id,
-                    "crawler hash already belongs to another media item; preserving the original association"
-                );
-            }
-            let resource_id: i64 = row.get("id");
-            sqlx::query("UPDATE resource SET title=?,download_url=?,trackers_json=?,published_at=?,score=?,score_reasons_json=?,raw_json=?,available=1,updated_at=datetime('now') WHERE id=?")
-                .bind(&result.title).bind(&result.download_url).bind(&trackers_json).bind(&result.published_at).bind(score).bind(&reasons_json).bind(&raw_json).bind(resource_id).execute(&state.pool).await?;
-            resource_id
-        } else {
-            sqlx::query("INSERT INTO resource(media_id,provider_key,provider_resource_id,title,download_url,info_hash,trackers_json,published_at,score,score_reasons_json,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id")
-                .bind(media_id).bind(&provider_key).bind(&provider_resource_id).bind(&result.title).bind(&result.download_url).bind(info_hash).bind(&trackers_json).bind(&result.published_at).bind(score).bind(&reasons_json).bind(&raw_json).fetch_one(&state.pool).await?.get("id")
-        }
-    } else if let Some(resource_id) = sqlx::query_scalar::<_, i64>("SELECT id FROM resource WHERE provider_key=? AND provider_resource_id=? ORDER BY id LIMIT 1")
-        .bind(&provider_key).bind(&provider_resource_id).fetch_optional(&state.pool).await?
-    {
-        sqlx::query("UPDATE resource SET media_id=?,title=?,download_url=?,trackers_json=?,published_at=?,score=?,score_reasons_json=?,raw_json=?,available=1,updated_at=datetime('now') WHERE id=?")
-            .bind(media_id).bind(&result.title).bind(&result.download_url).bind(&trackers_json).bind(&result.published_at).bind(score).bind(&reasons_json).bind(&raw_json).bind(resource_id).execute(&state.pool).await?;
-        resource_id
-    } else {
-        sqlx::query("INSERT INTO resource(media_id,provider_key,provider_resource_id,title,download_url,trackers_json,published_at,score,score_reasons_json,raw_json) VALUES (?,?,?,?,?,?,?,?,?,?) RETURNING id")
-            .bind(media_id).bind(&provider_key).bind(&provider_resource_id).bind(&result.title).bind(&result.download_url).bind(&trackers_json).bind(&result.published_at).bind(score).bind(&reasons_json).bind(&raw_json).fetch_one(&state.pool).await?.get("id")
-    };
+    let resource_id = crate::resource::upsert_candidate(
+        &state.pool,
+        media_id,
+        &provider_key,
+        &ResourceCandidate {
+            provider_resource_id: Some(provider_resource_id),
+            download_url: result.download_url.clone(),
+            title: result.title.clone(),
+            info_hash,
+            trackers: result.trackers.clone(),
+            published_at: (!result.published_at.is_empty()).then(|| result.published_at.clone()),
+            source_url: result.source.clone(),
+            raw_json: result.raw.clone(),
+            ..ResourceCandidate::default()
+        },
+    )
+    .await?
+    .id;
     sqlx::query("UPDATE crawler_result SET media_id=?,resource_id=? WHERE id=?")
         .bind(media_id)
         .bind(resource_id)
@@ -3614,47 +3674,7 @@ fn json_value_string(value: &Value) -> Option<String> {
     }
 }
 
-fn rank_resource(
-    title: &str,
-    size: Option<&str>,
-    published_at: &str,
-    provider: &str,
-) -> (f64, Vec<String>) {
-    let lower = title.to_lowercase();
-    let mut score = 50.0;
-    let mut reasons = vec![format!("来源 {provider} 可用")];
-    if lower.contains("中文字幕") || lower.contains("chinese") || lower.contains("-c") {
-        score += 24.0;
-        reasons.push("包含中文字幕标记".into());
-    }
-    if lower.contains("4k") || lower.contains("2160") {
-        score += 16.0;
-        reasons.push("4K 清晰度".into());
-    } else if lower.contains("1080") {
-        score += 10.0;
-        reasons.push("1080p 清晰度".into());
-    }
-    if size.is_some() {
-        score += 3.0;
-        reasons.push("提供文件大小".into());
-    }
-    if !published_at.is_empty() {
-        score += 2.0;
-        reasons.push("提供发布时间".into());
-    }
-    (score, reasons)
-}
-
 async fn resources_for_media(state: &AppState, media_id: i64) -> AppResult<Vec<Resource>> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource WHERE media_id = ?")
-        .bind(media_id)
-        .fetch_one(&state.pool)
-        .await?;
-    if count == 0
-        && let Err(error) = refresh_source_media(state, media_id).await
-    {
-        tracing::warn!(%error, media_id, "source detail refresh failed");
-    }
     let rows = sqlx::query("SELECT r.*, (SELECT a.id FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_id, (SELECT a.state FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_state, (SELECT a.qbit_hash FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_qbit_hash FROM resource r WHERE r.media_id = ? ORDER BY r.available DESC, r.score DESC, r.published_at DESC, r.id DESC").bind(media_id).fetch_all(&state.pool).await?;
     let mut resources = rows.iter().map(resource_from_row).collect::<Vec<_>>();
     let settings = storage::load_settings(&state.pool).await?;
@@ -3704,52 +3724,138 @@ async fn resources_for_media(state: &AppState, media_id: i64) -> AppResult<Vec<R
     Ok(resources)
 }
 
-async fn refresh_source_media(state: &AppState, media_id: i64) -> anyhow::Result<usize> {
-    let rows = sqlx::query("SELECT pem.provider_entity_id, pem.source_url, pc.* FROM provider_entity_mapping pem JOIN provider_config pc ON pc.provider_key = pem.provider_key WHERE pem.entity_type='media' AND pem.media_id=? AND pc.provider_type='source' AND pc.enabled=1 ORDER BY pc.provider_key")
-        .bind(media_id).fetch_all(&state.pool).await?;
-    if rows.is_empty() {
-        anyhow::bail!("媒体没有启用的来源映射");
+async fn resource_provider_keys_for_media(
+    state: &AppState,
+    media_id: i64,
+) -> AppResult<Vec<String>> {
+    let rows = sqlx::query("SELECT DISTINCT pc.* FROM provider_entity_mapping mapping JOIN provider_config pc ON pc.provider_key=mapping.provider_key WHERE mapping.entity_type='media' AND mapping.media_id=? AND pc.provider_type='source' AND pc.enabled=1 ORDER BY pc.provider_key")
+        .bind(media_id)
+        .fetch_all(&state.pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(source_provider_from_row)
+        .filter(|provider| {
+            state
+                .provider_registry
+                .resource_provider(&provider.adapter)
+                .is_some()
+        })
+        .map(|provider| provider.key)
+        .collect())
+}
+
+async fn enqueue_resource_refresh_job(
+    state: &AppState,
+    payload: ResourceRefreshJobPayload,
+    priority: i64,
+) -> AppResult<i64> {
+    let dedupe_key = format!(
+        "resource-refresh:{}:{}",
+        payload.media_id, payload.provider_key
+    );
+    let enqueued = state
+        .ingestion_queue
+        .enqueue(EnqueueJob {
+            provider_key: &payload.provider_key,
+            job_type: "resource_refresh",
+            priority,
+            payload: serde_json::to_value(&payload).map_err(anyhow::Error::from)?,
+            max_attempts: 3,
+            dedupe_key: Some(&dedupe_key),
+        })
+        .await?;
+    Ok(enqueued.id)
+}
+
+pub(crate) async fn execute_resource_refresh_job(
+    state: &AppState,
+    payload: &ResourceRefreshJobPayload,
+) -> anyhow::Result<()> {
+    if !payload.force
+        && !crate::resource::cache_needs_refresh(
+            &state.pool,
+            payload.media_id,
+            &payload.provider_key,
+        )
+        .await?
+    {
+        return Ok(());
     }
-    let mut total = 0;
-    let mut errors = Vec::new();
-    for row in &rows {
-        let provider = source_provider_from_row(row);
-        let provider_id: String = row.get("provider_entity_id");
-        let source_url: Option<String> = row.get("source_url");
-        let result = match provider.adapter.as_str() {
-            "javbus" => {
-                refresh_javbus_media(
-                    state,
-                    media_id,
-                    &provider,
-                    &provider_id,
-                    source_url.as_deref().unwrap_or_default(),
-                    true,
-                )
-                .await
-            }
-            "javdb" | "jav321" | "javlibrary" => {
-                refresh_generic_source_media(
-                    state,
-                    media_id,
-                    &provider,
-                    &provider_id,
-                    source_url.as_deref().unwrap_or_default(),
-                    true,
-                )
-                .await
-            }
-            adapter => Err(anyhow::anyhow!("不支持的来源适配器：{adapter}")),
-        };
-        match result {
-            Ok(count) => total += count,
-            Err(error) => errors.push(format!("{}: {error}", provider.display_name)),
+    let row = sqlx::query("SELECT mapping.provider_entity_id,mapping.source_url,pc.* FROM provider_entity_mapping mapping JOIN provider_config pc ON pc.provider_key=mapping.provider_key WHERE mapping.entity_type='media' AND mapping.media_id=? AND mapping.provider_key=? AND pc.provider_type='source' AND pc.enabled=1")
+        .bind(payload.media_id)
+        .bind(&payload.provider_key)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("media/provider mapping no longer exists"))?;
+    let provider = source_provider_from_row(&row);
+    let provider_id: String = row.get("provider_entity_id");
+    let source_url = row
+        .get::<Option<String>, _>("source_url")
+        .unwrap_or_else(|| provider.base_url.clone());
+    match fetch_and_persist_resources(
+        state,
+        payload.media_id,
+        &provider,
+        &provider_id,
+        &source_url,
+        None,
+        true,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            crate::resource::record_refresh_failure(
+                &state.pool,
+                payload.media_id,
+                &provider.key,
+                &error.to_string(),
+            )
+            .await?;
+            Err(error)
         }
     }
-    if total == 0 && !errors.is_empty() {
-        anyhow::bail!(errors.join("；"));
+}
+
+async fn fetch_and_persist_resources(
+    state: &AppState,
+    media_id: i64,
+    provider: &SourceProviderConfig,
+    provider_id: &str,
+    source_url: &str,
+    raw_document: Option<RawProviderDocument>,
+    allow_resource_endpoint: bool,
+) -> anyhow::Result<usize> {
+    let resource_provider = state
+        .provider_registry
+        .resource_provider(&provider.adapter)
+        .ok_or_else(|| anyhow::anyhow!("{} does not provide resources", provider.adapter))?;
+    let context = ProviderContext {
+        state: state.clone(),
+        provider: provider.clone(),
+        media_id,
+        raw_document,
+        allow_resource_endpoint,
+    };
+    let media = ProviderMediaRef {
+        provider_id: provider_id.to_owned(),
+        source_url: source_url.to_owned(),
+    };
+    let candidates = resource_provider.fetch_resources(&context, &media).await?;
+    for candidate in &candidates {
+        crate::resource::upsert_candidate(&state.pool, media_id, &provider.key, candidate).await?;
     }
-    Ok(total)
+    crate::resource::record_refresh_success(
+        &state.pool,
+        media_id,
+        &provider.key,
+        candidates.len(),
+        provider.resource_cache_ttl_hours,
+    )
+    .await?;
+    refresh_media_search_document(state, media_id).await?;
+    Ok(candidates.len())
 }
 
 async fn refresh_javbus_media(
@@ -3759,6 +3865,7 @@ async fn refresh_javbus_media(
     provider_id: &str,
     source_url: &str,
     include_resources: bool,
+    allow_resource_endpoint: bool,
 ) -> anyhow::Result<usize> {
     let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
     let url = reqwest::Url::parse(source_url)
@@ -3774,6 +3881,7 @@ async fn refresh_javbus_media(
         Some(media_id),
     )
     .await?;
+    let final_url = response.final_url.to_string();
     let html = response.body;
     let title = meta_content(&html, "og:title");
     let poster = meta_content(&html, "og:image");
@@ -3784,19 +3892,25 @@ async fn refresh_javbus_media(
         upsert_media_title_alias(state, media_id, title, None, &provider.key, true).await?;
     }
     persist_source_actors(state, media_id, &provider.key, &html, "/star/").await?;
-    let magnets = if include_resources {
-        fetch_javbus_magnets(state, provider, media_id, provider_id, &url, &html).await?
+    let resource_count = if include_resources {
+        fetch_and_persist_resources(
+            state,
+            media_id,
+            provider,
+            provider_id,
+            &final_url,
+            Some(RawProviderDocument {
+                source_url: final_url.clone(),
+                body: html,
+            }),
+            allow_resource_endpoint,
+        )
+        .await?
     } else {
-        Vec::new()
+        refresh_media_search_document(state, media_id).await?;
+        0
     };
-    for (index, (url, label)) in magnets.iter().enumerate() {
-        let info_hash = magnet_hash(url);
-        let (score, reasons) = rank_resource(label, None, "", &provider.display_name);
-        sqlx::query("INSERT INTO resource(media_id,provider_key,provider_resource_id,title,download_url,info_hash,score,score_reasons_json) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(info_hash) WHERE info_hash IS NOT NULL DO UPDATE SET media_id=excluded.media_id,title=excluded.title,score=excluded.score,score_reasons_json=excluded.score_reasons_json,updated_at=datetime('now')")
-            .bind(media_id).bind(&provider.key).bind(format!("{provider_id}:{index}")).bind(label).bind(url).bind(info_hash).bind(score).bind(serde_json::to_string(&reasons)?).execute(&state.pool).await?;
-    }
-    refresh_media_search_document(state, media_id).await?;
-    Ok(magnets.len())
+    Ok(resource_count)
 }
 
 async fn refresh_generic_source_media(
@@ -3806,6 +3920,7 @@ async fn refresh_generic_source_media(
     provider_id: &str,
     source_url: &str,
     include_resources: bool,
+    allow_resource_endpoint: bool,
 ) -> anyhow::Result<usize> {
     let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
     let url = reqwest::Url::parse(source_url).or_else(|_| match provider.adapter.as_str() {
@@ -3823,33 +3938,46 @@ async fn refresh_generic_source_media(
         Some(media_id),
     )
     .await?;
+    let final_url = response.final_url.to_string();
     let html = response.body;
     let actor_marker = if provider.adapter == "javdb" {
         "/actors/"
     } else {
         "/star/"
     };
-    persist_source_detail_html(
-        state,
-        media_id,
-        provider,
-        provider_id,
-        &html,
-        actor_marker,
-        include_resources,
-    )
-    .await
+    persist_source_detail_html(state, media_id, provider, &html, actor_marker).await?;
+    if include_resources
+        && state
+            .provider_registry
+            .resource_provider(&provider.adapter)
+            .is_some()
+    {
+        fetch_and_persist_resources(
+            state,
+            media_id,
+            provider,
+            provider_id,
+            &final_url,
+            Some(RawProviderDocument {
+                source_url: final_url.clone(),
+                body: html,
+            }),
+            allow_resource_endpoint,
+        )
+        .await
+    } else {
+        refresh_media_search_document(state, media_id).await?;
+        Ok(0)
+    }
 }
 
 async fn persist_source_detail_html(
     state: &AppState,
     media_id: i64,
     provider: &SourceProviderConfig,
-    provider_id: &str,
     html: &str,
     actor_marker: &str,
-    include_resources: bool,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<()> {
     let title = meta_content(html, "og:title")
         .or_else(|| extract_tag_text_after(html, "panel-heading"))
         .or_else(|| extract_tag_text_after(html, "video_title"));
@@ -3863,95 +3991,8 @@ async fn persist_source_detail_html(
         upsert_media_title_alias(state, media_id, title, None, &provider.key, true).await?;
     }
     persist_source_actors(state, media_id, &provider.key, html, actor_marker).await?;
-    let magnets = if include_resources {
-        parse_magnets(html)
-    } else {
-        Vec::new()
-    };
-    for (index, (url, label)) in magnets.iter().enumerate() {
-        let info_hash = magnet_hash(url);
-        let (score, reasons) = rank_resource(label, None, "", &provider.display_name);
-        sqlx::query("INSERT INTO resource(media_id,provider_key,provider_resource_id,title,download_url,info_hash,score,score_reasons_json) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(info_hash) WHERE info_hash IS NOT NULL DO UPDATE SET media_id=excluded.media_id,title=excluded.title,score=excluded.score,score_reasons_json=excluded.score_reasons_json,updated_at=datetime('now')")
-            .bind(media_id).bind(&provider.key).bind(format!("{provider_id}:{index}")).bind(label).bind(url).bind(info_hash).bind(score).bind(serde_json::to_string(&reasons)?).execute(&state.pool).await?;
-    }
     refresh_media_search_document(state, media_id).await?;
-    Ok(magnets.len())
-}
-
-async fn fetch_javbus_magnets(
-    state: &AppState,
-    provider: &SourceProviderConfig,
-    media_id: i64,
-    provider_id: &str,
-    detail_url: &reqwest::Url,
-    html: &str,
-) -> anyhow::Result<Vec<(String, String)>> {
-    let embedded = parse_magnets(html);
-    if !embedded.is_empty() {
-        return Ok(embedded);
-    }
-    let Some(gid) = extract_js_value(html, "gid") else {
-        return Ok(Vec::new());
-    };
-    let img = extract_js_value(html, "img").unwrap_or_default();
-    let uc = extract_js_value(html, "uc").unwrap_or_else(|| "0".into());
-    let mut ajax = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
-    ajax.set_path("/ajax/uncledatoolsbyajax.php");
-    ajax.query_pairs_mut()
-        .append_pair("gid", &gid)
-        .append_pair("lang", "zh")
-        .append_pair("img", &img)
-        .append_pair("uc", &uc)
-        .append_pair("floor", "1");
-    let mut transport = provider.transport();
-    transport.cookie = Some(javbus_cookie(provider, &[]));
-    let mut request = FetchRequest::get(&provider.key, ajax);
-    request.referer = Some(detail_url.clone());
-    let response = state
-        .fetch_manager
-        .fetch(provider.fetch_mode, request, &transport)
-        .await?;
-    let magnets = parse_magnets(&response.body);
-    state
-        .snapshot_repository
-        .store(SnapshotInput {
-            provider_key: &provider.key,
-            entity_type: "resource",
-            provider_entity_id: Some(provider_id),
-            media_id: Some(media_id),
-            source_url: response.final_url.as_str(),
-            response: &response,
-            raw_json: json!({
-                "resourceState": if magnets.is_empty() { "resource_empty" } else { "resource_found" },
-                "resourceCount": magnets.len(),
-            }),
-            parser_version: "1",
-        })
-        .await?;
-    Ok(magnets)
-}
-
-fn extract_js_value(html: &str, name: &str) -> Option<String> {
-    for marker in [
-        format!("var {name}"),
-        format!("{name} ="),
-        format!("{name}="),
-    ] {
-        let Some(at) = html.find(&marker) else {
-            continue;
-        };
-        let tail = &html[at + marker.len()..char_boundary_before(html, at + marker.len() + 800)];
-        let value = tail
-            .trim_start_matches(|character: char| character.is_whitespace() || character == '=')
-            .split([';', '\n', '\r', ','])
-            .next()?
-            .trim()
-            .trim_matches(['\'', '"']);
-        if !value.is_empty() {
-            return Some(html_unescape(value));
-        }
-    }
-    None
+    Ok(())
 }
 
 async fn persist_source_actors(
@@ -3995,42 +4036,10 @@ async fn persist_source_actors(
 }
 
 fn parse_magnets(html: &str) -> Vec<(String, String)> {
-    let mut result: Vec<(String, String)> = Vec::new();
-    let mut cursor = 0;
-    while let Some(offset) = html[cursor..].find("magnet:?") {
-        let start = cursor + offset;
-        let end = html[start..]
-            .find(['\"', '\'', '<', ' '])
-            .unwrap_or(html.len() - start);
-        let url = html_unescape(&html[start..start + end]);
-        cursor = start + end;
-        if magnet_hash(&url).is_none()
-            || result
-                .iter()
-                .any(|(existing, _)| magnet_hash(existing) == magnet_hash(&url))
-        {
-            continue;
-        }
-        let label_start = char_boundary_before(html, start.saturating_sub(500));
-        let label = strip_tags(&html[label_start..start])
-            .split_whitespace()
-            .rev()
-            .take(8)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join(" ");
-        result.push((
-            url,
-            if label.is_empty() {
-                "JavBus 资源".into()
-            } else {
-                label
-            },
-        ));
-    }
-    result
+    crate::providers::parse_magnet_candidates(html, "资源", "")
+        .into_iter()
+        .map(|candidate| (candidate.download_url, candidate.title))
+        .collect()
 }
 
 fn meta_content(html: &str, property: &str) -> Option<String> {
@@ -4130,7 +4139,7 @@ async fn acquisition_by_id(state: &AppState, id: i64) -> AppResult<Acquisition> 
     Ok(acquisition_from_row(&row))
 }
 
-const ACQUISITION_SELECT: &str = "SELECT a.*, m.normalized_code, m.title AS media_title, m.original_title, m.summary, m.release_date, m.duration_minutes, m.poster_url, m.backdrop_url, m.media_type, m.metadata_status, m.created_at AS media_created_at, m.updated_at AS media_updated_at, r.provider_key AS resource_provider_key, r.title AS resource_title, r.download_url, r.info_hash, r.size_bytes, r.resolution, r.subtitle_languages_json, r.trackers_json, r.published_at, r.score, r.score_reasons_json, r.available FROM acquisition a JOIN media m ON m.id = a.media_id LEFT JOIN resource r ON r.id = a.resource_id";
+const ACQUISITION_SELECT: &str = "SELECT a.*, m.normalized_code, m.title AS media_title, m.original_title, m.summary, m.release_date, m.duration_minutes, m.poster_url, m.backdrop_url, m.media_type, m.metadata_status, m.created_at AS media_created_at, m.updated_at AS media_updated_at, r.provider_key AS resource_provider_key, r.title AS resource_title, r.download_url, r.info_hash, r.size_bytes, r.resolution, r.subtitle_languages_json, r.trackers_json, r.published_at, r.score, r.score_reasons_json, r.available, r.availability_status, r.codec, r.source_count, r.first_seen_at, r.last_seen_at, r.last_verified_at FROM acquisition a JOIN media m ON m.id = a.media_id LEFT JOIN resource r ON r.id = a.resource_id";
 
 fn acquisition_from_row(row: &sqlx::sqlite::SqliteRow) -> Acquisition {
     let resource_id: Option<i64> = row.get("resource_id");
@@ -4183,6 +4192,12 @@ fn acquisition_from_row(row: &sqlx::sqlite::SqliteRow) -> Acquisition {
             score: row.get("score"),
             score_reasons: parse_string_vec(&row.get::<String, _>("score_reasons_json")),
             available: row.get::<i64, _>("available") != 0,
+            availability_status: row.get("availability_status"),
+            codec: row.get("codec"),
+            source_count: row.get("source_count"),
+            first_seen_at: row.get("first_seen_at"),
+            last_seen_at: row.get("last_seen_at"),
+            last_verified_at: row.get("last_verified_at"),
             qbit_hash: row.try_get("qbit_hash").unwrap_or(None),
             qbit_state: row.try_get("qbit_state").unwrap_or(None),
             qbit_sync_status: "unknown".into(),
@@ -4249,6 +4264,12 @@ fn resource_from_row(row: &sqlx::sqlite::SqliteRow) -> Resource {
         score: row.get("score"),
         score_reasons: parse_string_vec(&row.get::<String, _>("score_reasons_json")),
         available: row.get::<i64, _>("available") != 0,
+        availability_status: row.get("availability_status"),
+        codec: row.get("codec"),
+        source_count: row.get("source_count"),
+        first_seen_at: row.get("first_seen_at"),
+        last_seen_at: row.get("last_seen_at"),
+        last_verified_at: row.get("last_verified_at"),
         qbit_hash: row.try_get("acquisition_qbit_hash").unwrap_or(None),
         qbit_state: None,
         qbit_sync_status: "unknown".into(),
@@ -4967,8 +4988,12 @@ mod tests {
 
     #[test]
     fn ranker_explains_why_resource_wins() {
-        let (score, reasons) =
-            rank_resource("ABC-123 4K 中文字幕", Some("5 GB"), "2026-08-01", "mock");
+        let (score, reasons) = crate::resource::rank_resource(
+            "ABC-123 4K 中文字幕",
+            Some("5 GB"),
+            "2026-08-01",
+            "mock",
+        );
         assert!(score > 90.0);
         assert!(reasons.iter().any(|reason| reason.contains("中文字幕")));
         assert!(reasons.iter().any(|reason| reason.contains("4K")));
@@ -5059,11 +5084,16 @@ mod tests {
     }
 
     #[test]
-    fn javbus_javascript_values_are_parsed() {
-        let html = "<script>var gid = 12345; var uc = 0; var img = '/cover.jpg';</script>";
-        assert_eq!(extract_js_value(html, "gid").as_deref(), Some("12345"));
-        assert_eq!(extract_js_value(html, "uc").as_deref(), Some("0"));
-        assert_eq!(extract_js_value(html, "img").as_deref(), Some("/cover.jpg"));
+    fn historical_bootstrap_only_calls_resource_endpoint_for_recent_titles() {
+        let today = chrono::Utc::now().date_naive();
+        let recent = (today - chrono::Duration::days(30))
+            .format("%Y-%m-%d")
+            .to_string();
+        let historical = (today - chrono::Duration::days(365))
+            .format("%Y-%m-%d")
+            .to_string();
+        assert!(resource_date_is_recent(&recent, 180));
+        assert!(!resource_date_is_recent(&historical, 180));
     }
 
     #[test]

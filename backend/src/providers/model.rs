@@ -18,6 +18,8 @@ pub struct SourceProviderConfig {
     pub sync_interval_minutes: i64,
     pub sync_overlap_days: i64,
     pub sync_detail_limit: usize,
+    pub resource_cache_ttl_hours: i64,
+    pub resource_hydration_recent_days: i64,
 }
 
 impl SourceProviderConfig {
@@ -70,6 +72,16 @@ impl SourceProviderConfig {
                 .and_then(Value::as_u64)
                 .unwrap_or(8)
                 .min(40) as usize,
+            resource_cache_ttl_hours: config
+                .get("resourceCacheTtlHours")
+                .and_then(Value::as_i64)
+                .unwrap_or(72)
+                .clamp(1, 24 * 30),
+            resource_hydration_recent_days: config
+                .get("resourceHydrationRecentDays")
+                .and_then(Value::as_i64)
+                .unwrap_or(180)
+                .clamp(1, 3650),
         }
     }
 
@@ -93,8 +105,14 @@ pub struct SourceMedia {
     pub release_date: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ProviderContext;
+#[derive(Clone)]
+pub struct ProviderContext {
+    pub state: crate::AppState,
+    pub provider: SourceProviderConfig,
+    pub media_id: i64,
+    pub raw_document: Option<RawProviderDocument>,
+    pub allow_resource_endpoint: bool,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct DiscoverRequest {
@@ -131,6 +149,15 @@ pub struct ResourceCandidate {
     pub provider_resource_id: Option<String>,
     pub download_url: String,
     pub title: String,
+    pub info_hash: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub resolution: Option<String>,
+    pub subtitle_languages: Vec<String>,
+    pub trackers: Vec<String>,
+    pub published_at: Option<String>,
+    pub codec: Option<String>,
+    pub source_url: String,
+    pub raw_json: Value,
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -6,6 +6,7 @@ mod javdb;
 mod javlibrary;
 mod model;
 mod registry;
+mod resource_common;
 pub mod runtime;
 
 pub use api::router;
@@ -15,6 +16,7 @@ pub use model::{
     ProviderMediaRef, RawProviderDocument, ResourceCandidate, SourceMedia, SourceProviderConfig,
 };
 pub use registry::ProviderRegistry;
+pub(crate) use resource_common::parse_magnet_candidates;
 
 use async_trait::async_trait;
 
@@ -43,7 +45,7 @@ pub trait MetadataProvider: Send + Sync {
 
 #[async_trait]
 pub trait ResourceProvider: Send + Sync {
-    fn key(&self) -> &str;
+    fn key(&self) -> &'static str;
 
     async fn fetch_resources(
         &self,

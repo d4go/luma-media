@@ -3,13 +3,14 @@ use std::{collections::HashMap, sync::Arc};
 use crate::fetch::{FetchMode, FetchResponse, PageKind};
 
 use super::{
-    ProviderAdapter, jav321::Jav321Adapter, javbus::JavBusAdapter, javdb::JavDbAdapter,
-    javlibrary::JavLibraryAdapter,
+    ProviderAdapter, ResourceProvider, jav321::Jav321Adapter, javbus::JavBusAdapter,
+    javdb::JavDbAdapter, javlibrary::JavLibraryAdapter,
 };
 
 #[derive(Clone)]
 pub struct ProviderRegistry {
     adapters: Arc<HashMap<&'static str, Arc<dyn ProviderAdapter>>>,
+    resource_providers: Arc<HashMap<&'static str, Arc<dyn ResourceProvider>>>,
 }
 
 impl std::fmt::Debug for ProviderRegistry {
@@ -17,6 +18,10 @@ impl std::fmt::Debug for ProviderRegistry {
         formatter
             .debug_struct("ProviderRegistry")
             .field("keys", &self.adapters.keys().collect::<Vec<_>>())
+            .field(
+                "resource_keys",
+                &self.resource_providers.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -29,11 +34,23 @@ impl Default for ProviderRegistry {
             Arc::new(Jav321Adapter),
             Arc::new(JavLibraryAdapter),
         ];
+        let resource_providers: Vec<Arc<dyn ResourceProvider>> = vec![
+            Arc::new(JavDbAdapter),
+            Arc::new(JavBusAdapter),
+            Arc::new(Jav321Adapter),
+            Arc::new(JavLibraryAdapter),
+        ];
         Self {
             adapters: Arc::new(
                 adapters
                     .into_iter()
                     .map(|adapter| (adapter.key(), adapter))
+                    .collect(),
+            ),
+            resource_providers: Arc::new(
+                resource_providers
+                    .into_iter()
+                    .map(|provider| (provider.key(), provider))
                     .collect(),
             ),
         }
@@ -61,6 +78,10 @@ impl ProviderRegistry {
             .map_or(PageKind::InvalidContent, |adapter| {
                 adapter.classify(response)
             })
+    }
+
+    pub fn resource_provider(&self, key: &str) -> Option<Arc<dyn ResourceProvider>> {
+        self.resource_providers.get(key).cloned()
     }
 }
 
@@ -91,6 +112,9 @@ mod tests {
             assert!(registry.contains(key));
         }
         assert_eq!(registry.label("javdb"), Some("JavDB"));
+        assert!(registry.resource_provider("javdb").is_some());
+        assert!(registry.resource_provider("javbus").is_some());
+        assert!(registry.resource_provider("javlibrary").is_some());
     }
 
     #[test]
