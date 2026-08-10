@@ -1851,10 +1851,14 @@ async fn bootstrap_provider(
         true,
     )
     .await?;
+    let status: String = sqlx::query_scalar("SELECT status FROM source_sync_run WHERE id=?")
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await?;
     Ok(Json(SyncRunResponse {
         run_id,
         mode: SyncMode::Bootstrap.as_str().into(),
-        status: "running".into(),
+        status,
     }))
 }
 
@@ -1903,12 +1907,18 @@ async fn resume_provider_bootstrap(
         .ok_or_else(|| AppError::BadRequest("这个来源还没有历史回填范围".into()))?;
     let cursor = serde_json::from_str::<Value>(&row.get::<String, _>("cursor_json"))
         .unwrap_or_else(|_| json!({}));
-    let page_url = cursor
+    let next_url = cursor
         .get("nextUrl")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .unwrap_or(&provider.base_url)
-        .to_owned();
+        .map(str::to_owned);
+    let has_more = cursor
+        .get("hasMore")
+        .and_then(Value::as_bool)
+        .unwrap_or(next_url.is_some());
+    let page_url = next_url
+        .clone()
+        .unwrap_or_else(|| provider.base_url.clone());
     let page = cursor.get("page").and_then(Value::as_i64).unwrap_or(1);
     let include_resources = cursor
         .get("includeResources")
@@ -1923,23 +1933,32 @@ async fn resume_provider_bootstrap(
             .bind(&key)
             .execute(&state.pool)
             .await?;
-        enqueue_discovery_job(
-            &state,
-            &provider,
-            DiscoveryJobPayload {
-                run_id,
-                mode: SyncMode::Bootstrap,
-                page_url,
-                page,
-                window_from: from,
-                window_to: to,
-                include_resources,
-                pages_remaining: 5,
-            },
-        )
-        .await?;
+        if has_more {
+            enqueue_discovery_job(
+                &state,
+                &provider,
+                DiscoveryJobPayload {
+                    run_id,
+                    mode: SyncMode::Bootstrap,
+                    page_url,
+                    page,
+                    window_from: from,
+                    window_to: to,
+                    include_resources,
+                    pages_remaining: 5,
+                },
+            )
+            .await?;
+        } else {
+            settle_source_sync_run(&state, run_id).await?;
+        }
         run_id
     } else {
+        if !has_more {
+            return Err(AppError::BadRequest(
+                "历史回填已到达当前 checkpoint 末尾".into(),
+            ));
+        }
         start_discovery_run(
             &state,
             &provider,
@@ -1954,10 +1973,14 @@ async fn resume_provider_bootstrap(
         )
         .await?
     };
+    let status: String = sqlx::query_scalar("SELECT status FROM source_sync_run WHERE id=?")
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await?;
     Ok(Json(SyncRunResponse {
         run_id,
         mode: SyncMode::Bootstrap.as_str().into(),
-        status: "running".into(),
+        status,
     }))
 }
 
@@ -1993,16 +2016,7 @@ pub(crate) async fn recover_interrupted_source_syncs(state: &AppState) -> anyhow
         .await?;
     for row in stranded {
         let run_id: i64 = row.get("id");
-        let job = crate::ingestion::IngestionJob {
-            id: 0,
-            provider_key: row.get("provider_key"),
-            job_type: "discovery".into(),
-            priority: PRIORITY_DAILY_INCREMENTAL,
-            payload: json!({ "runId": run_id }),
-            attempts: 0,
-            max_attempts: 0,
-        };
-        settle_ingestion_job(state, &job).await?;
+        settle_source_sync_run(state, run_id).await?;
     }
     Ok(())
 }
@@ -2523,6 +2537,10 @@ pub(crate) async fn settle_ingestion_job(
     let Some(run_id) = job.payload.get("runId").and_then(Value::as_i64) else {
         return Ok(());
     };
+    settle_source_sync_run(state, run_id).await
+}
+
+async fn settle_source_sync_run(state: &AppState, run_id: i64) -> anyhow::Result<()> {
     let run = sqlx::query("SELECT provider_key,sync_mode,status,cursor_after_json,watermark_after_json FROM source_sync_run WHERE id=?")
         .bind(run_id)
         .fetch_optional(&state.pool)
@@ -5154,6 +5172,27 @@ mod tests {
         .unwrap();
         assert_eq!(recovered_run_status, "running");
         assert_eq!(recovered_job_status, "pending");
+
+        sqlx::query("UPDATE ingestion_job SET status='succeeded',finished_at=datetime('now') WHERE job_type='discovery'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE source_sync_state SET bootstrap_paused=1,cursor_json='{\"mode\":\"bootstrap\",\"nextUrl\":null,\"page\":2,\"from\":\"2024-01-01\",\"to\":\"2026-08-10\",\"includeResources\":false,\"hasMore\":false}' WHERE provider_key='mock-bootstrap'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let completed =
+            resume_provider_bootstrap(State(state.clone()), AxumPath("mock-bootstrap".into()))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(completed.status, "success");
+        let final_job_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ingestion_job WHERE job_type='discovery'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(final_job_count, 1, "completed checkpoints must not refetch");
     }
 
     #[tokio::test]
