@@ -16,6 +16,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { api, productEventUrl } from '../api'
 import type { MediaDetail } from '../types'
 import { formatDate } from '../format'
+import PaginationBar from '../components/PaginationBar.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -25,6 +26,8 @@ const acquiring = ref<number | null>(null)
 const refreshing = ref(false)
 const data = ref<MediaDetail | null>(null)
 const id = computed(() => Number(route.params.id))
+const page = ref(1)
+const pageSize = ref(20)
 let eventSource: EventSource | undefined
 
 const fieldLabels: Record<string, string> = {
@@ -40,13 +43,16 @@ const fieldLabels: Record<string, string> = {
 async function load() {
   loading.value = true
   try {
-    data.value = await api.mediaDetail(id.value)
+    data.value = await api.mediaDetail(id.value, page.value, pageSize.value)
   } catch (reason) {
     message.error(reason instanceof Error ? reason.message : '详情加载失败')
   } finally {
     loading.value = false
   }
 }
+
+function changePage(value: number) { page.value = value; load() }
+function changePageSize(value: number) { pageSize.value = value; page.value = 1; load() }
 
 async function acquire(resourceId: number) {
   acquiring.value = resourceId
@@ -156,7 +162,7 @@ onUnmounted(() => eventSource?.close())
           <div class="identity-meta">
             <span>{{ data.media.releaseDate ?? '日期待补全' }}</span>
             <span v-if="data.media.durationMinutes">{{ data.media.durationMinutes }} 分钟</span>
-            <span>{{ data.metadataSources.length }} 个元数据来源</span>
+            <span>{{ data.metadataSources.total }} 个元数据来源</span>
           </div>
           <div class="identity-actions">
             <n-button v-if="data.libraryItemId" type="primary">
@@ -184,8 +190,8 @@ onUnmounted(() => eventSource?.close())
 
       <section class="detail-section">
         <header class="product-section-head"><div><h2>来源信息</h2><span>可以查看每个来源提供了什么，以及最终采用了哪些字段</span></div></header>
-        <div v-if="data.metadataSources.length" class="metadata-source-list">
-          <article v-for="source in data.metadataSources" :key="source.id" class="metadata-source-row">
+        <div v-if="data.metadataSources.items.length" class="metadata-source-list">
+          <article v-for="source in data.metadataSources.items" :key="source.id" class="metadata-source-row">
             <div class="metadata-source-identity">
               <IconDatabase :size="19" />
               <div><strong>{{ source.providerKey }}</strong><span>{{ source.recordKind }}，优先级 {{ source.priority }}</span></div>
@@ -196,6 +202,7 @@ onUnmounted(() => eventSource?.close())
           </article>
         </div>
         <div v-else class="quiet-empty compact"><IconDatabase :size="26" /><strong>暂无来源记录</strong><span>可以在设置中执行增量同步，或在资源搜索页按番号查找。</span></div>
+        <PaginationBar v-if="data.metadataSources.total > 0" :page="page" :page-size="pageSize" :total="data.metadataSources.total" @update:page="changePage" @update:page-size="changePageSize" />
       </section>
 
       <section class="detail-section">
@@ -203,8 +210,8 @@ onUnmounted(() => eventSource?.close())
           <div><h2>下载资源</h2><span>同一 info hash 已跨来源合并，大小和标题会保留更完整的值</span></div>
           <n-button secondary :loading="refreshing" @click="refreshResources"><template #icon><IconRefresh /></template>刷新资源</n-button>
         </header>
-        <div v-if="data.resources.length" class="resource-stack">
-          <article v-for="(resource, index) in data.resources" :key="resource.id" class="resource-card resource-card-detailed" :class="{ preferred: index === 0 }">
+        <div v-if="data.resources.items.length" class="resource-stack">
+          <article v-for="(resource, index) in data.resources.items" :key="resource.id" class="resource-card resource-card-detailed" :class="{ preferred: index === 0 }">
             <div class="resource-rank"><strong>{{ Math.round(resource.score) }}</strong><span>评分</span></div>
             <div class="resource-main">
               <div><span v-if="index === 0" class="preferred-label">推荐</span><strong>{{ resource.title }}</strong></div>
@@ -236,6 +243,7 @@ onUnmounted(() => eventSource?.close())
           <strong>本地数据库暂无下载资源</strong>
           <span>点击刷新资源会创建后台任务。来源不可用时仍会保留以前已经收录的结果。</span>
         </div>
+        <PaginationBar v-if="data.resources.total > 0" :page="page" :page-size="pageSize" :total="data.resources.total" @update:page="changePage" @update:page-size="changePageSize" />
       </section>
 
       <section class="detail-section">

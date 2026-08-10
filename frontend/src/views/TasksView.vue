@@ -10,14 +10,19 @@ import PageHeader from '../components/PageHeader.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { api } from '../api'
 import { formatDate, statusLabel, statusType, taskTypeLabel } from '../format'
-import type { Task, TaskDetail, TaskStatus } from '../types'
+import type { Paged, Task, TaskDetail, TaskStatus } from '../types'
+import PaginationBar from '../components/PaginationBar.vue'
 
 const message = useMessage()
 const route = useRoute()
-const tasks = ref<Task[]>([])
+const tasks = ref<Paged<Task>>({ items: [], total: 0, page: 1, pageSize: 20, totalPages: 0 })
 const loading = ref(true)
 const detailLoading = ref(false)
 const status = ref('')
+const page = ref(1)
+const pageSize = ref(20)
+const recordPage = ref(1)
+const recordPageSize = ref(20)
 const checkedRowKeys = ref<Array<string | number>>([])
 const batchAction = ref<'retry' | 'cancel' | ''>('')
 const detail = ref<TaskDetail | null>(null)
@@ -78,17 +83,21 @@ const rowKey = (row: Task) => row.id
 
 async function load(silent = false) {
   if (!silent) loading.value = true
-  try { tasks.value = await api.tasks(status.value) }
+  try { tasks.value = await api.tasks(status.value, page.value, pageSize.value) }
   catch (reason) { if (!silent) message.error(reason instanceof Error ? reason.message : '任务加载失败') }
   finally { loading.value = false }
 }
 async function showDetail(taskId: number) {
   drawerOpen.value = true
   detailLoading.value = true
-  try { detail.value = await api.task(taskId) }
+  try { detail.value = await api.task(taskId, recordPage.value, recordPageSize.value) }
   catch (reason) { message.error(reason instanceof Error ? reason.message : '任务详情加载失败') }
   finally { detailLoading.value = false }
 }
+function changePage(value: number) { page.value = value; load() }
+function changePageSize(value: number) { pageSize.value = value; page.value = 1; load() }
+function changeRecordPage(value: number) { recordPage.value = value; if (detail.value) showDetail(detail.value.id) }
+function changeRecordPageSize(value: number) { recordPageSize.value = value; recordPage.value = 1; if (detail.value) showDetail(detail.value.id) }
 async function retry(task: Task) {
   try {
     const updated = await api.retryTask(task.id)
@@ -159,8 +168,9 @@ onUnmounted(() => window.clearInterval(timer))
   </div>
   <section class="panel">
     <div v-if="loading" class="skeleton-block"><n-skeleton text :repeat="8" /></div>
-    <EmptyState v-else-if="!tasks.length" title="没有符合条件的任务" description="扫描媒体目录或刮削媒体后，任务会显示在这里。" />
-    <div v-else class="table-wrap"><n-data-table v-model:checked-row-keys="checkedRowKeys" :row-key="rowKey" :columns="columns" :data="tasks" :bordered="false" :single-line="false" /></div>
+    <EmptyState v-else-if="!tasks.items.length" title="没有符合条件的任务" description="扫描媒体目录或刮削媒体后，任务会显示在这里。" />
+    <div v-else class="table-wrap"><n-data-table v-model:checked-row-keys="checkedRowKeys" :row-key="rowKey" :columns="columns" :data="tasks.items" :bordered="false" :single-line="false" /></div>
+    <PaginationBar v-if="tasks.total > 0" :page="page" :page-size="pageSize" :total="tasks.total" @update:page="changePage" @update:page-size="changePageSize" />
   </section>
 
   <n-drawer v-model:show="drawerOpen" :width="drawerWidth" placement="right">
@@ -193,9 +203,9 @@ onUnmounted(() => window.clearInterval(timer))
             <span>最近一次在最上方</span>
           </div>
           <ol class="record-list">
-            <li v-for="(record, index) in detail.records" :key="record.id" class="record-item">
+            <li v-for="(record, index) in detail.records.items" :key="record.id" class="record-item">
               <div class="record-main">
-                <strong>第 {{ detail.records.length - index }} 次执行</strong>
+                <strong>第 {{ detail.records.total - (recordPage - 1) * recordPageSize - index }} 次执行</strong>
                 <n-tag :type="statusType[record.status]" :bordered="false" size="small">{{ statusLabel[record.status] }}</n-tag>
               </div>
               <div class="record-meta">
@@ -206,6 +216,7 @@ onUnmounted(() => window.clearInterval(timer))
               <p v-if="record.errorMessage" class="record-error">{{ record.errorMessage }}</p>
             </li>
           </ol>
+          <PaginationBar v-if="detail.records.total > 0" :page="recordPage" :page-size="recordPageSize" :total="detail.records.total" @update:page="changeRecordPage" @update:page-size="changeRecordPageSize" />
         </section>
       </template>
     </n-drawer-content>

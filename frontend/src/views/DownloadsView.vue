@@ -5,17 +5,20 @@ import { IconPlayerPause, IconPlayerPlay, IconRefresh, IconTrash } from '@tabler
 import PageHeader from '../components/PageHeader.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { api } from '../api'
-import type { DownloadItem } from '../types'
+import type { DownloadItem, Paged } from '../types'
+import PaginationBar from '../components/PaginationBar.vue'
 
 const message = useMessage()
 const loading = ref(true)
-const downloads = ref<DownloadItem[]>([])
+const page = ref(1)
+const pageSize = ref(20)
+const downloads = ref<Paged<DownloadItem>>({ items: [], total: 0, page: 1, pageSize: 20, totalPages: 0 })
 const actingHash = ref('')
 let poller: number | undefined
 
-const activeCount = computed(() => downloads.value.filter(item => !isPaused(item) && item.progress < 1).length)
-const totalDownloadSpeed = computed(() => downloads.value.reduce((total, item) => total + item.downloadSpeed, 0))
-const totalUploadSpeed = computed(() => downloads.value.reduce((total, item) => total + item.uploadSpeed, 0))
+const activeCount = computed(() => downloads.value.items.filter(item => !isPaused(item) && item.progress < 1).length)
+const totalDownloadSpeed = computed(() => downloads.value.items.reduce((total, item) => total + item.downloadSpeed, 0))
+const totalUploadSpeed = computed(() => downloads.value.items.reduce((total, item) => total + item.uploadSpeed, 0))
 
 function isPaused(item: DownloadItem) { return item.state.toLocaleLowerCase().includes('paused') }
 function formatBytes(value: number) {
@@ -72,10 +75,12 @@ const columns: DataTableColumns<DownloadItem> = [
 
 async function load(silent = false) {
   if (!silent) loading.value = true
-  try { downloads.value = await api.downloads() }
+  try { downloads.value = await api.downloads(page.value, pageSize.value) }
   catch (reason) { if (!silent) message.error(reason instanceof Error ? reason.message : '下载任务加载失败') }
   finally { loading.value = false }
 }
+function changePage(value: number) { page.value = value; load(true) }
+function changePageSize(value: number) { pageSize.value = value; page.value = 1; load(true) }
 async function pause(item: DownloadItem) {
   actingHash.value = item.hash
   try { await api.pauseDownload(item.hash); message.success('下载已暂停'); await load(true) }
@@ -107,12 +112,13 @@ onUnmounted(() => window.clearInterval(poller))
     <div><span>活动任务</span><strong>{{ activeCount }}</strong></div>
     <div><span>下载速度</span><strong>{{ formatSpeed(totalDownloadSpeed) }}</strong></div>
     <div><span>上传速度</span><strong>{{ formatSpeed(totalUploadSpeed) }}</strong></div>
-    <div><span>全部任务</span><strong>{{ downloads.length }}</strong></div>
+    <div><span>全部任务</span><strong>{{ downloads.total }}</strong></div>
   </section>
   <section class="panel">
-    <EmptyState v-if="!loading && !downloads.length" title="下载队列为空" description="从资源发现页面选择候选资源并加入下载。">
+    <EmptyState v-if="!loading && !downloads.items.length" title="下载队列为空" description="从资源发现页面选择候选资源并加入下载。">
       <n-button type="primary" tag="a" href="/discovery">前往资源发现</n-button>
     </EmptyState>
-    <div v-else class="table-wrap"><n-data-table :loading="loading" :columns="columns" :data="downloads" :row-key="(row: DownloadItem) => row.hash" :bordered="false" :single-line="false" /></div>
+    <div v-else class="table-wrap"><n-data-table :loading="loading" :columns="columns" :data="downloads.items" :row-key="(row: DownloadItem) => row.hash" :bordered="false" :single-line="false" /></div>
+    <PaginationBar v-if="downloads.total > 0" :page="page" :page-size="pageSize" :total="downloads.total" @update:page="changePage" @update:page-size="changePageSize" />
   </section>
 </template>

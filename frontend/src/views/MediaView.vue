@@ -12,13 +12,16 @@ import PageHeader from '../components/PageHeader.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { api, coverAssetUrl } from '../api'
 import { formatDate, statusLabel as taskStatusLabel, statusType as taskStatusType } from '../format'
-import type { MediaItem, MediaResourceState } from '../types'
+import type { MediaItem, MediaResourceState, Paged } from '../types'
+import PaginationBar from '../components/PaginationBar.vue'
 
 const message = useMessage()
 const route = useRoute()
 const router = useRouter()
 const loading = ref(true)
-const media = ref<MediaItem[]>([])
+const page = ref(1)
+const pageSize = ref(20)
+const media = ref<Paged<MediaItem>>({ items: [], total: 0, page: 1, pageSize: 20, totalPages: 0 })
 const search = ref('')
 const status = ref('')
 const linkedMediaId = ref<number | undefined>()
@@ -97,10 +100,12 @@ const columns: DataTableColumns<MediaItem> = [
 async function load() {
   loading.value = true
   checkedRowKeys.value = []
-  try { media.value = await api.media(search.value.trim(), status.value, linkedMediaId.value) }
+  try { media.value = await api.media(search.value.trim(), status.value, linkedMediaId.value, page.value, pageSize.value) }
   catch (reason) { message.error(reason instanceof Error ? reason.message : '媒体加载失败') }
   finally { loading.value = false }
 }
+function changePage(value: number) { page.value = value; load() }
+function changePageSize(value: number) { pageSize.value = value; page.value = 1; load() }
 async function searchMedia() {
   linkedMediaId.value = undefined
   await router.replace({ path: '/media' })
@@ -158,10 +163,11 @@ onMounted(() => {
   </div>
   <section class="panel">
     <div v-if="loading" style="padding: 20px"><n-skeleton text :repeat="8" /></div>
-    <EmptyState v-else-if="!media.length" title="媒体库为空" description="请先在媒体目录页面添加路径并执行扫描。">
+    <EmptyState v-else-if="!media.items.length" title="媒体库为空" description="请先在媒体目录页面添加路径并执行扫描。">
       <n-button type="primary" tag="a" href="/folders">前往媒体目录</n-button>
     </EmptyState>
-    <div v-else class="table-wrap"><n-data-table v-model:checked-row-keys="checkedRowKeys" :row-key="rowKey" :columns="columns" :data="media" :bordered="false" :single-line="false" /></div>
+    <div v-else class="table-wrap"><n-data-table v-model:checked-row-keys="checkedRowKeys" :row-key="rowKey" :columns="columns" :data="media.items" :bordered="false" :single-line="false" /></div>
+    <PaginationBar v-if="media.total > 0" :page="page" :page-size="pageSize" :total="media.total" @update:page="changePage" @update:page-size="changePageSize" />
   </section>
 
   <n-modal v-model:show="modalOpen" preset="card" :title="scrapeTargetIds.length > 1 ? '批量执行刮削' : '执行刮削'" style="width: min(500px, calc(100vw - 32px))" :bordered="false">

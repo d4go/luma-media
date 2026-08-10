@@ -2,7 +2,7 @@ import type {
   BatchScrapeResponse, BatchTaskResponse, CrawlerForm, CrawlerResult, CrawlerRun, CrawlerScript,
   DashboardStats, DownloadItem, Folder, FolderInput, MediaItem, MetaTubeConnection, QBittorrentConnection,
   ScrapeOptions, ServiceStatus, Settings, Task, TaskDetail,
-  Acquisition, AcquisitionDetail, Actor, AttentionItem, AutomationRule, BrowserSession, CatalogResolveResponse, HomeData, LibraryExportResponse, LibraryItem, LibraryRematchResponse, MediaDetail, ProductMedia, ProductSettings, ProviderConfig, ProviderDiagnoseResponse, ProviderReparseResponse, ProviderRuntime, ResourceRefreshResponse, SearchResponse, SyncRunResponse,
+  Acquisition, AcquisitionDetail, Actor, AttentionItem, AutomationRule, BrowserSession, CatalogResolveResponse, HomeData, LibraryExportResponse, LibraryItem, LibraryRematchResponse, MediaDetail, Paged, ProductMedia, ProductSettings, ProviderConfig, ProviderDiagnoseResponse, ProviderReparseResponse, ProviderRuntime, ResourceRefreshResponse, SearchResponse, SyncRunResponse,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
@@ -45,33 +45,40 @@ function crawlerForm(input: CrawlerForm) {
   return form
 }
 
+function pageQuery(page: number, pageSize: number, extra: Record<string, string> = {}) {
+  const query = new URLSearchParams(extra)
+  query.set('page', String(page))
+  query.set('pageSize', String(pageSize))
+  return `?${query.toString()}`
+}
+
 export const api = {
-  home: () => request<HomeData>('/home'),
-  search: (q: string) => request<SearchResponse>(`/search?q=${encodeURIComponent(q)}`),
+  home: (page = 1, pageSize = 6) => request<HomeData>(`/home${pageQuery(page, pageSize)}`),
+  search: (q: string, page = 1, pageSize = 20) => request<SearchResponse>(`/search${pageQuery(page, pageSize, { q })}`),
   resolveCatalog: (code: string, includeResources = true) => request<CatalogResolveResponse>('/catalog/resolve', { method: 'POST', body: JSON.stringify({ code, includeResources }) }),
-  catalogMedia: (q = '') => request<ProductMedia[]>(`/catalog/media${q ? `?q=${encodeURIComponent(q)}` : ''}`),
-  mediaDetail: (id: number) => request<MediaDetail>(`/catalog/media/${id}`),
+  catalogMedia: (q = '', page = 1, pageSize = 20) => request<Paged<ProductMedia>>(`/catalog/media${pageQuery(page, pageSize, q ? { q } : {})}`),
+  mediaDetail: (id: number, page = 1, pageSize = 20) => request<MediaDetail>(`/catalog/media/${id}${pageQuery(page, pageSize)}`),
   refreshMediaResources: (id: number) => request<ResourceRefreshResponse>(`/catalog/media/${id}/resources/refresh`, { method: 'POST' }),
   acquireMedia: (mediaId: number, resourceId?: number) => request<Acquisition>(`/catalog/media/${mediaId}/acquire`, { method: 'POST', body: JSON.stringify({ resourceId, requestedBy: 'manual' }) }),
-  actorDetail: (id: number) => request<{ actor: Actor; media: ProductMedia[] }>(`/actors/${id}`),
+  actorDetail: (id: number, page = 1, pageSize = 20) => request<{ actor: Actor; media: Paged<ProductMedia> }>(`/actors/${id}${pageQuery(page, pageSize)}`),
   followActor: (id: number, followed: boolean) => request<Actor>(`/actors/${id}/follow`, { method: followed ? 'POST' : 'DELETE' }),
-  acquisitions: (status = '') => request<Acquisition[]>(`/acquisitions${status ? `?status=${encodeURIComponent(status)}` : ''}`),
-  acquisition: (id: number) => request<AcquisitionDetail>(`/acquisitions/${id}`),
+  acquisitions: (status = '', page = 1, pageSize = 20) => request<Paged<Acquisition>>(`/acquisitions${pageQuery(page, pageSize, status ? { status } : {})}`),
+  acquisition: (id: number, page = 1, pageSize = 20) => request<AcquisitionDetail>(`/acquisitions/${id}${pageQuery(page, pageSize)}`),
   acquisitionAction: (id: number, action: 'pause' | 'resume' | 'retry' | 'cancel') => request<Acquisition>(`/acquisitions/${id}/${action}`, { method: 'POST' }),
-  attention: () => request<AttentionItem[]>('/attention'),
+  attention: (page = 1, pageSize = 20) => request<Paged<AttentionItem>>(`/attention${pageQuery(page, pageSize)}`),
   attentionAction: (id: number, action: string) => request<{ resolved: boolean }>(`/attention/${id}/action`, { method: 'POST', body: JSON.stringify({ action }) }),
-  library: (q = '') => request<{ items: LibraryItem[]; total: number }>(`/library${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+  library: (q = '', page = 1, pageSize = 20) => request<Paged<LibraryItem>>(`/library${pageQuery(page, pageSize, q ? { q } : {})}`),
   libraryItem: (id: number) => request<LibraryItem>(`/library/${id}`),
   reorganizeLibrary: (id: number) => request<{ item: LibraryItem; message: string }>(`/library/${id}/reorganize`, { method: 'POST' }),
   regenerateLibraryNfo: (id: number) => request<LibraryExportResponse>(`/library/${id}/nfo`, { method: 'POST' }),
   syncLibraryArtwork: (id: number) => request<LibraryExportResponse>(`/library/${id}/artwork`, { method: 'POST' }),
   rematchLibrary: (id: number, code?: string) => request<LibraryRematchResponse>(`/library/${id}/rematch`, { method: 'POST', body: JSON.stringify(code ? { code } : {}) }),
-  automations: () => request<AutomationRule[]>('/automations'),
+  automations: (page = 1, pageSize = 20) => request<Paged<AutomationRule>>(`/automations${pageQuery(page, pageSize)}`),
   createAutomation: (input: Omit<AutomationRule, 'id' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastExplanation' | 'createdAt'>) => request<AutomationRule>('/automations', { method: 'POST', body: JSON.stringify(input) }),
   updateAutomation: (id: number, input: Partial<AutomationRule>) => request<AutomationRule>(`/automations/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
   deleteAutomation: (id: number) => request<void>(`/automations/${id}`, { method: 'DELETE' }),
   setAutomationEnabled: (id: number, enabled: boolean) => request<AutomationRule>(`/automations/${id}/enabled`, { method: 'POST', body: JSON.stringify({ enabled }) }),
-  providers: () => request<ProviderConfig[]>('/providers'),
+  providers: (page = 1, pageSize = 20) => request<Paged<ProviderConfig>>(`/providers${pageQuery(page, pageSize)}`),
   createProvider: (input: { displayName: string; baseUrl: string; secret?: string; adapter?: string; config?: Record<string, unknown> }) => request<ProviderConfig>('/providers', { method: 'POST', body: JSON.stringify(input) }),
   updateProvider: (key: string, input: { displayName?: string; baseUrl: string; secret?: string; config?: Record<string, unknown> }) => request<ProviderConfig>(`/providers/${key}`, { method: 'PUT', body: JSON.stringify(input) }),
   deleteProvider: (key: string) => request<void>(`/providers/${key}`, { method: 'DELETE' }),
@@ -93,14 +100,14 @@ export const api = {
   productSettings: () => request<ProductSettings>('/product-settings'),
   updateProductSettings: (input: ProductSettings) => request<ProductSettings>('/product-settings', { method: 'PUT', body: JSON.stringify(input) }),
   serviceStatus: () => request<ServiceStatus>('/status'),
-  dashboard: () => request<DashboardStats>('/dashboard'),
-  folders: () => request<Folder[]>('/folders'),
+  dashboard: (page = 1, pageSize = 8) => request<DashboardStats>(`/dashboard${pageQuery(page, pageSize)}`),
+  folders: (page = 1, pageSize = 20) => request<Paged<Folder>>(`/folders${pageQuery(page, pageSize)}`),
   createFolder: (input: FolderInput) => request<Folder>('/folders', { method: 'POST', body: JSON.stringify(input) }),
   updateFolder: (id: number, input: FolderInput) => request<Folder>(`/folders/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
   deleteFolder: (id: number) => request<void>(`/folders/${id}`, { method: 'DELETE' }),
   scanFolder: (id: number) => request<Task>(`/folders/${id}/scan`, { method: 'POST' }),
-  tasks: (status = '') => request<Task[]>(`/tasks${status ? `?status=${encodeURIComponent(status)}` : ''}`),
-  task: (id: number) => request<TaskDetail>(`/tasks/${id}`),
+  tasks: (status = '', page = 1, pageSize = 20) => request<Paged<Task>>(`/tasks${pageQuery(page, pageSize, status ? { status } : {})}`),
+  task: (id: number, page = 1, pageSize = 20) => request<TaskDetail>(`/tasks/${id}${pageQuery(page, pageSize)}`),
   retryTask: (id: number) => request<Task>(`/tasks/${id}/retry`, { method: 'POST' }),
   cancelTask: (id: number) => request<Task>(`/tasks/${id}/cancel`, { method: 'POST' }),
   retryTasks: (taskIds: number[]) => request<BatchTaskResponse>('/tasks/retry', {
@@ -109,12 +116,14 @@ export const api = {
   cancelTasks: (taskIds: number[]) => request<BatchTaskResponse>('/tasks/cancel', {
     method: 'POST', body: JSON.stringify({ taskIds }),
   }),
-  media: (search = '', status = '', mediaId?: number) => {
+  media: (search = '', status = '', mediaId?: number, page = 1, pageSize = 20) => {
     const query = new URLSearchParams()
     if (mediaId) query.set('mediaId', String(mediaId))
     if (search) query.set('search', search)
     if (status) query.set('status', status)
-    return request<MediaItem[]>(`/media${query.size ? `?${query}` : ''}`)
+    query.set('page', String(page))
+    query.set('pageSize', String(pageSize))
+    return request<Paged<MediaItem>>(`/media?${query.toString()}`)
   },
   scrapeMedia: (id: number, options: ScrapeOptions) =>
     request<Task>(`/media/${id}/scrape`, { method: 'POST', body: JSON.stringify(options) }),
@@ -127,19 +136,19 @@ export const api = {
   updateSettings: (settings: Settings) => request<Settings>('/settings', { method: 'PUT', body: JSON.stringify(settings) }),
   testMetaTube: (settings: Settings) => request<MetaTubeConnection>('/settings/metatube/test', { method: 'POST', body: JSON.stringify(settings) }),
   testQBittorrent: (settings: Settings) => request<QBittorrentConnection>('/settings/qbittorrent/test', { method: 'POST', body: JSON.stringify(settings) }),
-  crawlers: () => request<CrawlerScript[]>('/crawlers'),
+  crawlers: (page = 1, pageSize = 20) => request<Paged<CrawlerScript>>(`/crawlers${pageQuery(page, pageSize)}`),
   createCrawler: (input: CrawlerForm) => request<CrawlerScript>('/crawlers', { method: 'POST', body: crawlerForm(input) }),
   updateCrawler: (id: number, input: CrawlerForm) => request<CrawlerScript>(`/crawlers/${id}`, { method: 'PUT', body: crawlerForm(input) }),
   deleteCrawler: (id: number) => request<void>(`/crawlers/${id}`, { method: 'DELETE' }),
   runCrawler: (id: number) => request<CrawlerRun>(`/crawlers/${id}/run`, { method: 'POST' }),
-  crawlerRuns: (scriptId?: number) => request<CrawlerRun[]>(`/crawler-runs${scriptId ? `?scriptId=${scriptId}` : ''}`),
-  crawlerResults: (scriptId?: number) => request<CrawlerResult[]>(`/crawler-results${scriptId ? `?scriptId=${scriptId}` : ''}`),
+  crawlerRuns: (scriptId?: number, page = 1, pageSize = 20) => request<Paged<CrawlerRun>>(`/crawler-runs${pageQuery(page, pageSize, scriptId ? { scriptId: String(scriptId) } : {})}`),
+  crawlerResults: (scriptId?: number, page = 1, pageSize = 20) => request<Paged<CrawlerResult>>(`/crawler-results${pageQuery(page, pageSize, scriptId ? { scriptId: String(scriptId) } : {})}`),
   downloadCrawlerResult: (id: number) => request<CrawlerResult>(`/crawler-results/${id}/download`, { method: 'POST' }),
   ignoreCrawlerResult: (id: number) => request<CrawlerResult>(`/crawler-results/${id}/ignore`, { method: 'POST' }),
   downloadCrawlerResults: (resultIds: number[]) => request<CrawlerResult[]>('/crawler-results/download', {
     method: 'POST', body: JSON.stringify({ resultIds }),
   }),
-  downloads: () => request<DownloadItem[]>('/downloads'),
+  downloads: (page = 1, pageSize = 20) => request<Paged<DownloadItem>>(`/downloads${pageQuery(page, pageSize)}`),
   pauseDownload: (hash: string) => request<void>(`/downloads/${encodeURIComponent(hash)}/pause`, { method: 'POST' }),
   resumeDownload: (hash: string) => request<void>(`/downloads/${encodeURIComponent(hash)}/resume`, { method: 'POST' }),
   removeDownload: (hash: string) => request<void>(`/downloads/${encodeURIComponent(hash)}`, { method: 'DELETE' }),

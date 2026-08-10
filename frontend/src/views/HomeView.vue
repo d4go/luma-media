@@ -4,12 +4,17 @@ import { NButton, NSpin, useMessage } from 'naive-ui'
 import { IconAlertTriangle, IconArrowRight, IconBolt, IconBooks, IconDownload, IconInbox, IconLibrary, IconMovie, IconSearch, IconUsers } from '@tabler/icons-vue'
 import { api } from '../api'
 import type { HomeData } from '../types'
+import PaginationBar from '../components/PaginationBar.vue'
 
 const data = ref<HomeData | null>(null)
 const loading = ref(true)
 const message = useMessage()
+const page = ref(1)
+const pageSize = ref(6)
 let events: EventSource | null = null
-async function load() { try { data.value = await api.home() } catch (reason) { message.error(reason instanceof Error ? reason.message : '首页加载失败') } finally { loading.value = false } }
+async function load() { try { data.value = await api.home(page.value, pageSize.value) } catch (reason) { message.error(reason instanceof Error ? reason.message : '首页加载失败') } finally { loading.value = false } }
+function changePage(value: number) { page.value = value; load() }
+function changePageSize(value: number) { pageSize.value = value; page.value = 1; load() }
 function stateLabel(value: string, qbitState?: string | null) {
   if (['DOWNLOADING', 'QUEUED', 'NEEDS_ATTENTION', 'CANCELLED'].includes(value) && qbitState) {
     const state = qbitState.toLocaleLowerCase()
@@ -43,10 +48,11 @@ onUnmounted(() => events?.close())
       <div class="home-workspace">
         <section class="home-section home-recent">
           <header class="product-section-head"><div><h2>最近获取</h2><p>下载状态与 qBittorrent 保持同步</p></div><RouterLink to="/downloads">查看全部<IconArrowRight :size="15" /></RouterLink></header>
-          <div v-if="data?.recentAcquisitions.length" class="home-recent-list">
-            <RouterLink v-for="item in data.recentAcquisitions" :key="item.id" :to="`/acquisitions/${item.id}`" class="home-recent-row"><span class="home-recent-poster"><img v-if="item.media.posterUrl" :src="item.media.posterUrl" :alt="item.media.title"><IconMovie v-else :size="20" /></span><span class="home-recent-copy"><strong>{{ item.media.title }}</strong><small>{{ item.media.code || '番号待识别' }}<span>{{ item.stateMessage }}</span></small></span><span class="state-chip" :data-state="item.qbitState === 'missing' ? 'NEEDS_ATTENTION' : item.state">{{ stateLabel(item.state, item.qbitState) }}</span><span class="home-recent-progress">{{ Math.round(item.progress * 100) }}%</span><IconArrowRight class="home-row-arrow" :size="16" /></RouterLink>
+          <div v-if="data?.recentAcquisitions.items.length" class="home-recent-list">
+            <RouterLink v-for="item in data.recentAcquisitions.items" :key="item.id" :to="`/acquisitions/${item.id}`" class="home-recent-row"><span class="home-recent-poster"><img v-if="item.media.posterUrl" :src="item.media.posterUrl" :alt="item.media.title"><IconMovie v-else :size="20" /></span><span class="home-recent-copy"><strong>{{ item.media.title }}</strong><small>{{ item.media.code || '番号待识别' }}<span>{{ item.stateMessage }}</span></small></span><span class="state-chip" :data-state="item.qbitState === 'missing' ? 'NEEDS_ATTENTION' : item.state">{{ stateLabel(item.state, item.qbitState) }}</span><span class="home-recent-progress">{{ Math.round(item.progress * 100) }}%</span><IconArrowRight class="home-row-arrow" :size="16" /></RouterLink>
           </div>
           <div v-else class="quiet-empty"><IconBolt :size="28" /><strong>还没有获取记录</strong><span>从一次搜索开始，Luma 会在这里保留完整进度。</span><RouterLink to="/resources">发现资源</RouterLink></div>
+          <PaginationBar v-if="data && data.recentAcquisitions.total > 0" :page="page" :page-size="pageSize" :total="data.recentAcquisitions.total" :page-sizes="[6, 10, 20]" @update:page="changePage" @update:page-size="changePageSize" />
         </section>
 
         <aside class="home-quick-starts"><header><h2>快捷入口</h2><p>继续完成常用操作</p></header><nav><RouterLink v-for="(item, index) in data?.quickStarts ?? []" :key="item.to" :to="item.to"><span class="quick-start-icon"><IconSearch v-if="index === 0" :size="18" /><IconDownload v-else-if="index === 1" :size="18" /><IconInbox v-else :size="18" /></span><span><strong>{{ item.title }}</strong><small>{{ item.description }}</small></span><IconArrowRight :size="16" /></RouterLink></nav></aside>

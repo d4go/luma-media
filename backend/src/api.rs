@@ -19,6 +19,7 @@ use crate::{
         Folder, FolderInput, LogEntry, MediaItem, MetaTubeConnection, QBittorrentConnection,
         ScrapeOptions, ServiceHealth, ServiceStatus, Settings, Task, TaskDetail,
     },
+    pagination::{Paged, PageParams},
     provider::MetaTubeClient,
     qbittorrent::QBittorrentClient,
     scanner,
@@ -65,7 +66,10 @@ pub fn router() -> Router<AppState> {
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
 }
 
-async fn dashboard(State(state): State<AppState>) -> AppResult<Json<DashboardStats>> {
+async fn dashboard(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<DashboardStats>> {
     let media_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_item")
         .fetch_one(&state.pool)
         .await?;
@@ -95,12 +99,18 @@ async fn dashboard(State(state): State<AppState>) -> AppResult<Json<DashboardSta
         Err(_) => 0,
     };
     let rows = sqlx::query(&format!(
-        "{} ORDER BY st.updated_at DESC, st.id DESC LIMIT 8",
+        "{} ORDER BY st.updated_at DESC, st.id DESC LIMIT ? OFFSET ?",
         storage::TASK_SELECT
     ))
+    .bind(params.limit())
+    .bind(params.offset())
     .fetch_all(&state.pool)
     .await?;
-    let recent_activity = rows.iter().map(task_from_row).collect();
+    let recent_activity = Paged::new(
+        rows.iter().map(task_from_row).collect(),
+        task_count,
+        params,
+    );
     Ok(Json(DashboardStats {
         media_count,
         task_count,
@@ -113,11 +123,25 @@ async fn dashboard(State(state): State<AppState>) -> AppResult<Json<DashboardSta
     }))
 }
 
-async fn list_folders(State(state): State<AppState>) -> AppResult<Json<Vec<Folder>>> {
-    let rows = sqlx::query("SELECT * FROM media_config ORDER BY name ASC")
+async fn list_folders(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<Paged<Folder>>> {
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_config")
+        .fetch_one(&state.pool)
+        .await?;
+    let rows = sqlx::query(
+        "SELECT * FROM media_config ORDER BY name ASC LIMIT ? OFFSET ?",
+    )
+    .bind(params.limit())
+    .bind(params.offset())
         .fetch_all(&state.pool)
         .await?;
-    Ok(Json(rows.iter().map(folder_from_row).collect()))
+    Ok(Json(Paged::new(
+        rows.iter().map(folder_from_row).collect(),
+        total,
+        params,
+    )))
 }
 
 async fn create_folder(
@@ -268,31 +292,57 @@ async fn scan_folder(
 async fn list_tasks(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> AppResult<Json<Vec<Task>>> {
-    let rows = if let Some(status) = query.get("status").filter(|value| !value.is_empty()) {
+) -> AppResult<Json<Paged<Task>>> {
+    let params = page_params(&query);
+    let status = query
+        .get("status")
+        .filter(|value| !value.is_empty())
+        .cloned();
+    let total: i64 = if let Some(status) = &status {
+        sqlx::query_scalar("SELECT COUNT(*) FROM scrape_task st WHERE st.status = ?")
+            .bind(status)
+            .fetch_one(&state.pool)
+            .await?
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM scrape_task st")
+            .fetch_one(&state.pool)
+            .await?
+    };
+    let rows = if let Some(status) = &status {
         sqlx::query(&format!(
-            "{} WHERE st.status = ? ORDER BY st.updated_at DESC, st.id DESC LIMIT 250",
+            "{} WHERE st.status = ? ORDER BY st.updated_at DESC, st.id DESC LIMIT ? OFFSET ?",
             storage::TASK_SELECT
         ))
         .bind(status)
+        .bind(params.limit())
+        .bind(params.offset())
         .fetch_all(&state.pool)
         .await?
     } else {
         sqlx::query(&format!(
-            "{} ORDER BY st.updated_at DESC, st.id DESC LIMIT 250",
+            "{} ORDER BY st.updated_at DESC, st.id DESC LIMIT ? OFFSET ?",
             storage::TASK_SELECT
         ))
+        .bind(params.limit())
+        .bind(params.offset())
         .fetch_all(&state.pool)
         .await?
     };
-    Ok(Json(rows.iter().map(task_from_row).collect()))
+    Ok(Json(Paged::new(
+        rows.iter().map(task_from_row).collect(),
+        total,
+        params,
+    )))
 }
 
 async fn get_task(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    Query(query): Query<HashMap<String, String>>,
 ) -> AppResult<Json<TaskDetail>> {
-    Ok(Json(storage::task_detail_by_id(&state.pool, id).await?))
+    Ok(Json(
+        storage::task_detail_by_id(&state.pool, id, page_params(&query)).await?,
+    ))
 }
 
 async fn retry_task(
@@ -442,7 +492,8 @@ async fn cancel_task_by_id(state: &AppState, id: i64) -> AppResult<Task> {
 async fn list_media(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> AppResult<Json<Vec<MediaItem>>> {
+) -> AppResult<Json<Paged<MediaItem>>> {
+    let params = page_params(&query);
     let search = query
         .get("search")
         .map(|value| value.trim())
@@ -461,42 +512,103 @@ async fn list_media(
     {
         return Err(AppError::BadRequest("unknown media status".into()));
     }
-    let rows = match (media_id, search, status) {
+    let (total, rows) = match (media_id, search, status) {
         (Some(media_id), _, _) => {
-            sqlx::query(&format!("{} WHERE mi.id = ?", storage::MEDIA_SELECT))
+            let total = sqlx::query_scalar("SELECT COUNT(*) FROM media_item mi WHERE mi.id = ?")
                 .bind(media_id)
-                .fetch_all(&state.pool)
-                .await?
+                .fetch_one(&state.pool)
+                .await?;
+            let rows = sqlx::query(&format!(
+                "{} WHERE mi.id = ? LIMIT ? OFFSET ?",
+                storage::MEDIA_SELECT
+            ))
+            .bind(media_id)
+            .bind(params.limit())
+            .bind(params.offset())
+            .fetch_all(&state.pool)
+            .await?;
+            (total, rows)
         }
         (None, Some(search), Some(status)) => {
             let pattern = format!("%{search}%");
-            sqlx::query(&format!("{} WHERE (mi.filename LIKE ? OR mi.title LIKE ?) AND mi.status = ? ORDER BY mi.updated_at DESC LIMIT 500", storage::MEDIA_SELECT))
-                .bind(&pattern).bind(&pattern).bind(status).fetch_all(&state.pool).await?
+            let total = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM media_item mi WHERE (mi.filename LIKE ? OR mi.title LIKE ?) AND mi.status = ?",
+            )
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(status)
+            .fetch_one(&state.pool)
+            .await?;
+            let rows = sqlx::query(&format!(
+                "{} WHERE (mi.filename LIKE ? OR mi.title LIKE ?) AND mi.status = ? ORDER BY mi.updated_at DESC LIMIT ? OFFSET ?",
+                storage::MEDIA_SELECT
+            ))
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(status)
+            .bind(params.limit())
+            .bind(params.offset())
+            .fetch_all(&state.pool)
+            .await?;
+            (total, rows)
         }
         (None, Some(search), None) => {
             let pattern = format!("%{search}%");
-            sqlx::query(&format!("{} WHERE mi.filename LIKE ? OR mi.title LIKE ? ORDER BY mi.updated_at DESC LIMIT 500", storage::MEDIA_SELECT))
-                .bind(&pattern).bind(&pattern).fetch_all(&state.pool).await?
+            let total = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM media_item mi WHERE mi.filename LIKE ? OR mi.title LIKE ?",
+            )
+            .bind(&pattern)
+            .bind(&pattern)
+            .fetch_one(&state.pool)
+            .await?;
+            let rows = sqlx::query(&format!(
+                "{} WHERE mi.filename LIKE ? OR mi.title LIKE ? ORDER BY mi.updated_at DESC LIMIT ? OFFSET ?",
+                storage::MEDIA_SELECT
+            ))
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(params.limit())
+            .bind(params.offset())
+            .fetch_all(&state.pool)
+            .await?;
+            (total, rows)
         }
         (None, None, Some(status)) => {
-            sqlx::query(&format!(
-                "{} WHERE mi.status = ? ORDER BY mi.updated_at DESC LIMIT 500",
+            let total = sqlx::query_scalar("SELECT COUNT(*) FROM media_item mi WHERE mi.status = ?")
+                .bind(status)
+                .fetch_one(&state.pool)
+                .await?;
+            let rows = sqlx::query(&format!(
+                "{} WHERE mi.status = ? ORDER BY mi.updated_at DESC LIMIT ? OFFSET ?",
                 storage::MEDIA_SELECT
             ))
             .bind(status)
+            .bind(params.limit())
+            .bind(params.offset())
             .fetch_all(&state.pool)
-            .await?
+            .await?;
+            (total, rows)
         }
         (None, None, None) => {
-            sqlx::query(&format!(
-                "{} ORDER BY mi.updated_at DESC LIMIT 500",
+            let total = sqlx::query_scalar("SELECT COUNT(*) FROM media_item mi")
+                .fetch_one(&state.pool)
+                .await?;
+            let rows = sqlx::query(&format!(
+                "{} ORDER BY mi.updated_at DESC LIMIT ? OFFSET ?",
                 storage::MEDIA_SELECT
             ))
+            .bind(params.limit())
+            .bind(params.offset())
             .fetch_all(&state.pool)
-            .await?
+            .await?;
+            (total, rows)
         }
     };
-    Ok(Json(rows.iter().map(media_from_row).collect()))
+    Ok(Json(Paged::new(
+        rows.iter().map(media_from_row).collect(),
+        total,
+        params,
+    )))
 }
 
 async fn scrape_media_batch(
@@ -825,8 +937,11 @@ async fn fail_scrape(state: &AppState, media_id: i64, task_id: i64, record_id: i
     storage::log(&state.pool, "error", "provider", message).await;
 }
 
-async fn list_crawlers(State(state): State<AppState>) -> AppResult<Json<Vec<CrawlerScript>>> {
-    Ok(Json(crawler::list_scripts(&state.pool).await?))
+async fn list_crawlers(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<Paged<CrawlerScript>>> {
+    Ok(Json(crawler::list_scripts(&state.pool, params).await?))
 }
 
 struct CrawlerUpload {
@@ -1041,17 +1156,21 @@ async fn run_crawler(
 async fn list_crawler_runs(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> AppResult<Json<Vec<CrawlerRun>>> {
+) -> AppResult<Json<Paged<CrawlerRun>>> {
     let script_id = query.get("scriptId").and_then(|value| value.parse().ok());
-    Ok(Json(crawler::list_runs(&state.pool, script_id).await?))
+    Ok(Json(
+        crawler::list_runs(&state.pool, script_id, page_params(&query)).await?,
+    ))
 }
 
 async fn list_crawler_results(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> AppResult<Json<Vec<CrawlerResult>>> {
+) -> AppResult<Json<Paged<CrawlerResult>>> {
     let script_id = query.get("scriptId").and_then(|value| value.parse().ok());
-    Ok(Json(crawler::list_results(&state.pool, script_id).await?))
+    Ok(Json(
+        crawler::list_results(&state.pool, script_id, page_params(&query)).await?,
+    ))
 }
 
 async fn download_crawler_result(
@@ -1087,13 +1206,24 @@ async fn ignore_crawler_result(
     Ok(Json(crawler::ignore_result(&state.pool, id).await?))
 }
 
-async fn list_downloads(State(state): State<AppState>) -> AppResult<Json<Vec<DownloadItem>>> {
+async fn list_downloads(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<Paged<DownloadItem>>> {
     let client = qbittorrent_client(&state).await?;
     let downloads = client
         .torrents()
         .await
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    Ok(Json(downloads))
+    let total = downloads.len() as i64;
+    let offset = params.offset() as usize;
+    let limit = params.limit() as usize;
+    let items = downloads
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    Ok(Json(Paged::new(items, total, params)))
 }
 
 async fn pause_download(
@@ -1362,11 +1492,21 @@ async fn ensure_metatube_connected(state: &AppState) -> AppResult<()> {
     Ok(())
 }
 
-async fn list_logs(State(state): State<AppState>) -> AppResult<Json<Vec<LogEntry>>> {
-    let rows = sqlx::query("SELECT * FROM system_log ORDER BY created_at DESC, id DESC LIMIT 100")
+async fn list_logs(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<Paged<LogEntry>>> {
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM system_log")
+        .fetch_one(&state.pool)
+        .await?;
+    let rows = sqlx::query(
+        "SELECT * FROM system_log ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+    )
+        .bind(params.limit())
+        .bind(params.offset())
         .fetch_all(&state.pool)
         .await?;
-    Ok(Json(
+    Ok(Json(Paged::new(
         rows.iter()
             .map(|row| LogEntry {
                 id: row.get("id"),
@@ -1376,7 +1516,22 @@ async fn list_logs(State(state): State<AppState>) -> AppResult<Json<Vec<LogEntry
                 created_at: row.get("created_at"),
             })
             .collect(),
-    ))
+        total,
+        params,
+    )))
+}
+
+fn page_params(query: &HashMap<String, String>) -> PageParams {
+    PageParams {
+        page: query
+            .get("page")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1),
+        page_size: query
+            .get("pageSize")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20),
+    }
 }
 
 fn validate_folder(input: &FolderInput) -> AppResult<()> {

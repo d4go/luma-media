@@ -9,15 +9,20 @@ import PageHeader from '../components/PageHeader.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { api } from '../api'
 import { formatDate } from '../format'
-import type { CrawlerForm, CrawlerRun, CrawlerScript } from '../types'
+import type { CrawlerForm, CrawlerRun, CrawlerScript, Paged } from '../types'
+import PaginationBar from '../components/PaginationBar.vue'
 
 const message = useMessage()
 const loading = ref(true)
 const saving = ref(false)
 const modalOpen = ref(false)
 const editingId = ref<number | null>(null)
-const scripts = ref<CrawlerScript[]>([])
-const runs = ref<CrawlerRun[]>([])
+const page = ref(1)
+const pageSize = ref(20)
+const runPage = ref(1)
+const runPageSize = ref(20)
+const scripts = ref<Paged<CrawlerScript>>({ items: [], total: 0, page: 1, pageSize: 20, totalPages: 0 })
+const runs = ref<Paged<CrawlerRun>>({ items: [], total: 0, page: 1, pageSize: 20, totalPages: 0 })
 const runningId = ref<number | null>(null)
 const form = reactive<CrawlerForm>({ name: '', websiteUrl: '', intervalMinutes: 60, enabled: true, autoDownload: false, script: null })
 let poller: number | undefined
@@ -46,7 +51,7 @@ const ruleColumns: DataTableColumns<CrawlerScript> = [
 ]
 const runColumns: DataTableColumns<CrawlerRun> = [
   { title: '运行', key: 'id', width: 90, render: row => `#${row.id}` },
-  { title: '规则', key: 'scriptId', minWidth: 180, render: row => scripts.value.find(script => script.id === row.scriptId)?.name ?? `#${row.scriptId}` },
+  { title: '规则', key: 'scriptId', minWidth: 180, render: row => scripts.value.items.find(script => script.id === row.scriptId)?.name ?? `#${row.scriptId}` },
   { title: '状态', key: 'status', width: 100, render: row => h(NTag, { size: 'small', bordered: false, type: statusType[row.status] }, { default: () => statusLabel[row.status] }) },
   { title: '发现资源', key: 'resultCount', width: 110, render: row => `${row.resultCount} 个` },
   { title: '开始时间', key: 'startedAt', width: 150, render: row => formatDate(row.startedAt ?? row.createdAt) },
@@ -55,10 +60,14 @@ const runColumns: DataTableColumns<CrawlerRun> = [
 
 async function load(silent = false) {
   if (!silent) loading.value = true
-  try { [scripts.value, runs.value] = await Promise.all([api.crawlers(), api.crawlerRuns()]) }
+  try { [scripts.value, runs.value] = await Promise.all([api.crawlers(page.value, pageSize.value), api.crawlerRuns(undefined, runPage.value, runPageSize.value)]) }
   catch (reason) { if (!silent) message.error(reason instanceof Error ? reason.message : '自动化规则加载失败') }
   finally { loading.value = false }
 }
+function changePage(value: number) { page.value = value; load() }
+function changePageSize(value: number) { pageSize.value = value; page.value = 1; load() }
+function changeRunPage(value: number) { runPage.value = value; load() }
+function changeRunPageSize(value: number) { runPageSize.value = value; runPage.value = 1; load() }
 function openCreate() {
   editingId.value = null
   Object.assign(form, { name: '', websiteUrl: '', intervalMinutes: 60, enabled: true, autoDownload: false, script: null })
@@ -109,16 +118,18 @@ onUnmounted(() => window.clearInterval(poller))
   </div>
 
   <n-tabs type="line" animated>
-    <n-tab-pane name="rules" :tab="`规则 (${scripts.length})`">
+    <n-tab-pane name="rules" :tab="`规则 (${scripts.total})`">
       <section class="panel">
-        <EmptyState v-if="!loading && !scripts.length" title="还没有自动化规则" description="上传 Python 脚本，设置目标来源和循环周期。" />
-        <div v-else class="table-wrap"><n-data-table :loading="loading" :columns="ruleColumns" :data="scripts" :bordered="false" :single-line="false" /></div>
+        <EmptyState v-if="!loading && !scripts.items.length" title="还没有自动化规则" description="上传 Python 脚本，设置目标来源和循环周期。" />
+        <div v-else class="table-wrap"><n-data-table :loading="loading" :columns="ruleColumns" :data="scripts.items" :bordered="false" :single-line="false" /></div>
+        <PaginationBar v-if="scripts.total > 0" :page="page" :page-size="pageSize" :total="scripts.total" @update:page="changePage" @update:page-size="changePageSize" />
       </section>
     </n-tab-pane>
-    <n-tab-pane name="runs" :tab="`运行记录 (${runs.length})`">
+    <n-tab-pane name="runs" :tab="`运行记录 (${runs.total})`">
       <section class="panel">
-        <EmptyState v-if="!loading && !runs.length" title="暂无运行记录" description="手动或定时执行规则后，结果会保存在这里。" />
-        <div v-else class="table-wrap"><n-data-table :loading="loading" :columns="runColumns" :data="runs" :bordered="false" :single-line="false" /></div>
+        <EmptyState v-if="!loading && !runs.items.length" title="暂无运行记录" description="手动或定时执行规则后，结果会保存在这里。" />
+        <div v-else class="table-wrap"><n-data-table :loading="loading" :columns="runColumns" :data="runs.items" :bordered="false" :single-line="false" /></div>
+        <PaginationBar v-if="runs.total > 0" :page="runPage" :page-size="runPageSize" :total="runs.total" @update:page="changeRunPage" @update:page-size="changeRunPageSize" />
       </section>
     </n-tab-pane>
   </n-tabs>

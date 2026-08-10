@@ -6,11 +6,14 @@ import PageHeader from '../components/PageHeader.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { api } from '../api'
 import { formatDate } from '../format'
-import type { CrawlerResult } from '../types'
+import type { CrawlerResult, Paged } from '../types'
+import PaginationBar from '../components/PaginationBar.vue'
 
 const message = useMessage()
 const loading = ref(true)
-const results = ref<CrawlerResult[]>([])
+const page = ref(1)
+const pageSize = ref(20)
+const results = ref<Paged<CrawlerResult>>({ items: [], total: 0, page: 1, pageSize: 20, totalPages: 0 })
 const search = ref('')
 const status = ref('')
 const checkedKeys = ref<Array<string | number>>([])
@@ -26,7 +29,7 @@ const statusOptions = [
 ]
 const filteredResults = computed(() => {
   const keyword = search.value.trim().toLocaleLowerCase()
-  return results.value.filter((item) => {
+  return results.value.items.filter((item) => {
     const matchesStatus = !status.value || item.downloadStatus === status.value
     const matchesSearch = !keyword || `${item.title} ${item.source}`.toLocaleLowerCase().includes(keyword)
     return matchesStatus && matchesSearch
@@ -58,10 +61,12 @@ const columns: DataTableColumns<CrawlerResult> = [
 
 async function load(silent = false) {
   if (!silent) loading.value = true
-  try { results.value = await api.crawlerResults() }
+  try { results.value = await api.crawlerResults(undefined, page.value, pageSize.value) }
   catch (reason) { if (!silent) message.error(reason instanceof Error ? reason.message : '资源加载失败') }
   finally { loading.value = false }
 }
+function changePage(value: number) { page.value = value; load(true) }
+function changePageSize(value: number) { pageSize.value = value; page.value = 1; load(true) }
 async function download(id: number) {
   actingId.value = id
   try { await api.downloadCrawlerResult(id); message.success('已加入下载队列'); await load(true) }
@@ -106,5 +111,6 @@ onUnmounted(() => window.clearInterval(poller))
     <div v-else class="table-wrap">
       <n-data-table v-model:checked-row-keys="checkedKeys" :row-key="(row: CrawlerResult) => row.id" :loading="loading" :columns="columns" :data="filteredResults" :bordered="false" :single-line="false" />
     </div>
+    <PaginationBar v-if="results.total > 0" :page="page" :page-size="pageSize" :total="results.total" @update:page="changePage" @update:page-size="changePageSize" />
   </section>
 </template>

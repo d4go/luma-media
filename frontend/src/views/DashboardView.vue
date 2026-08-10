@@ -11,11 +11,14 @@ import { api } from '../api'
 import { formatDate, statusLabel, statusType, taskTypeLabel } from '../format'
 import { serviceStatusKey } from '../service-status'
 import type { DashboardStats } from '../types'
+import PaginationBar from '../components/PaginationBar.vue'
 
 const message = useMessage()
 const serviceContext = inject(serviceStatusKey)
 const loading = ref(true)
 const stats = ref<DashboardStats | null>(null)
+const page = ref(1)
+const pageSize = ref(8)
 
 const metrics = computed(() => [
   { label: '发现资源', value: stats.value?.candidateCount ?? 0, hint: '候选资源', icon: IconBinoculars, to: '/discovery' },
@@ -35,7 +38,7 @@ const pipeline = computed(() => [
 async function load() {
   loading.value = true
   try {
-    stats.value = await api.dashboard()
+    stats.value = await api.dashboard(page.value, pageSize.value)
     await serviceContext?.refresh()
   } catch (reason) {
     message.error(reason instanceof Error ? reason.message : 'Dashboard 加载失败')
@@ -43,6 +46,9 @@ async function load() {
     loading.value = false
   }
 }
+
+function changePage(value: number) { page.value = value; load() }
+function changePageSize(value: number) { pageSize.value = value; page.value = 1; load() }
 
 onMounted(load)
 </script>
@@ -84,14 +90,15 @@ onMounted(load)
     <section class="panel activity-panel">
       <div class="panel-heading"><h2>最近任务</h2><RouterLink class="text-link" to="/tasks">查看全部</RouterLink></div>
       <div v-if="loading" class="skeleton-block"><n-skeleton text :repeat="6" /></div>
-      <div v-else-if="!stats?.recentActivity.length" class="compact-empty">还没有任务记录</div>
+      <div v-else-if="!stats?.recentActivity.items.length" class="compact-empty">还没有任务记录</div>
       <ol v-else class="activity-list">
-        <li v-for="task in stats.recentActivity" :key="task.id">
+        <li v-for="task in stats.recentActivity.items" :key="task.id">
           <span class="activity-id">#{{ task.id }}</span>
           <div><strong>{{ task.media?.title ?? task.folder?.name ?? '系统任务' }}</strong><small>{{ taskTypeLabel[task.taskType] ?? task.taskType }} · {{ formatDate(task.updatedAt) }}</small></div>
           <n-tag size="small" :bordered="false" :type="statusType[task.status]">{{ statusLabel[task.status] }}</n-tag>
         </li>
       </ol>
+      <PaginationBar v-if="stats && stats.recentActivity.total > 0" :page="page" :page-size="pageSize" :total="stats.recentActivity.total" :page-sizes="[8, 10, 20]" @update:page="changePage" @update:page-size="changePageSize" />
     </section>
 
     <aside class="panel autopilot-panel">

@@ -7,6 +7,7 @@ mod fetch;
 mod ingestion;
 mod metadata;
 mod models;
+mod pagination;
 mod product;
 mod provider;
 mod providers;

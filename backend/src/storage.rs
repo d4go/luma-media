@@ -12,6 +12,7 @@ use crate::{
         Folder, MediaItem, MediaResourceState, MediaResources, Settings, Task, TaskDetail,
         TaskFolder, TaskMedia, TaskRecord,
     },
+    pagination::{Paged, PageParams},
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -302,17 +303,31 @@ pub async fn task_by_id(pool: &SqlitePool, id: i64) -> AppResult<Task> {
     Ok(task_from_row(&row))
 }
 
-pub async fn task_detail_by_id(pool: &SqlitePool, id: i64) -> AppResult<TaskDetail> {
+pub async fn task_detail_by_id(
+    pool: &SqlitePool,
+    id: i64,
+    params: PageParams,
+) -> AppResult<TaskDetail> {
     let task = task_by_id(pool, id).await?;
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_record WHERE task_id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
     let rows = sqlx::query(
-        "SELECT * FROM task_record WHERE task_id = ? ORDER BY created_at DESC, id DESC",
+        "SELECT * FROM task_record WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
     )
     .bind(id)
+    .bind(params.limit())
+    .bind(params.offset())
     .fetch_all(pool)
     .await?;
     Ok(TaskDetail {
         task,
-        records: rows.iter().map(task_record_from_row).collect(),
+        records: Paged::new(
+            rows.iter().map(task_record_from_row).collect(),
+            total,
+            params,
+        ),
     })
 }
 
@@ -923,10 +938,19 @@ mod tests {
         assert_eq!(retry.task.record_count, 2);
         assert_eq!(retry.task.media.as_ref().unwrap().title, "Example");
 
-        let detail = task_detail_by_id(&pool, retry.task.id).await.unwrap();
-        assert_eq!(detail.records.len(), 2);
-        assert_eq!(detail.records[0].status, "pending");
-        assert_eq!(detail.records[1].status, "failed");
+        let detail = task_detail_by_id(
+            &pool,
+            retry.task.id,
+            crate::pagination::PageParams {
+                page: 1,
+                page_size: 20,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.records.items.len(), 2);
+        assert_eq!(detail.records.items[0].status, "pending");
+        assert_eq!(detail.records.items[1].status, "failed");
     }
 
     #[tokio::test]

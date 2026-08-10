@@ -9,6 +9,7 @@ use crate::{
     AppState,
     error::{AppError, AppResult},
     models::{CrawlerResult, CrawlerRun, CrawlerScript},
+    pagination::{Paged, PageParams},
     product::{self, AcquireInput},
     storage,
 };
@@ -20,11 +21,25 @@ pub const SCRIPT_SELECT: &str = "SELECT cs.*, \
     COALESCE((SELECT result_count FROM crawler_run cr WHERE cr.script_id = cs.id ORDER BY cr.id DESC LIMIT 1), 0) AS last_result_count \
     FROM crawler_script cs";
 
-pub async fn list_scripts(pool: &SqlitePool) -> AppResult<Vec<CrawlerScript>> {
-    let rows = sqlx::query(&format!("{SCRIPT_SELECT} ORDER BY cs.name, cs.id"))
+pub async fn list_scripts(
+    pool: &SqlitePool,
+    params: PageParams,
+) -> AppResult<Paged<CrawlerScript>> {
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM crawler_script cs")
+        .fetch_one(pool)
+        .await?;
+    let rows = sqlx::query(&format!(
+        "{SCRIPT_SELECT} ORDER BY cs.name, cs.id LIMIT ? OFFSET ?"
+    ))
+        .bind(params.limit())
+        .bind(params.offset())
         .fetch_all(pool)
         .await?;
-    Ok(rows.iter().map(script_from_row).collect())
+    Ok(Paged::new(
+        rows.iter().map(script_from_row).collect(),
+        total,
+        params,
+    ))
 }
 
 pub async fn script_by_id(pool: &SqlitePool, id: i64) -> AppResult<CrawlerScript> {
@@ -46,43 +61,84 @@ async fn script_file(pool: &SqlitePool, id: i64) -> AppResult<(CrawlerScript, Pa
     Ok((script_from_row(&row), PathBuf::from(path)))
 }
 
-pub async fn list_runs(pool: &SqlitePool, script_id: Option<i64>) -> AppResult<Vec<CrawlerRun>> {
-    let rows = if let Some(script_id) = script_id {
-        sqlx::query("SELECT * FROM crawler_run WHERE script_id = ? ORDER BY id DESC LIMIT 100")
+pub async fn list_runs(
+    pool: &SqlitePool,
+    script_id: Option<i64>,
+    params: PageParams,
+) -> AppResult<Paged<CrawlerRun>> {
+    let total: i64 = if let Some(script_id) = script_id {
+        sqlx::query_scalar("SELECT COUNT(*) FROM crawler_run WHERE script_id = ?")
             .bind(script_id)
+            .fetch_one(pool)
+            .await?
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM crawler_run")
+            .fetch_one(pool)
+            .await?
+    };
+    let rows = if let Some(script_id) = script_id {
+        sqlx::query("SELECT * FROM crawler_run WHERE script_id = ? ORDER BY id DESC LIMIT ? OFFSET ?")
+            .bind(script_id)
+            .bind(params.limit())
+            .bind(params.offset())
             .fetch_all(pool)
             .await?
     } else {
-        sqlx::query("SELECT * FROM crawler_run ORDER BY id DESC LIMIT 100")
+        sqlx::query("SELECT * FROM crawler_run ORDER BY id DESC LIMIT ? OFFSET ?")
+            .bind(params.limit())
+            .bind(params.offset())
             .fetch_all(pool)
             .await?
     };
-    Ok(rows.iter().map(run_from_row).collect())
+    Ok(Paged::new(
+        rows.iter().map(run_from_row).collect(),
+        total,
+        params,
+    ))
 }
 
 pub async fn list_results(
     pool: &SqlitePool,
     script_id: Option<i64>,
-) -> AppResult<Vec<CrawlerResult>> {
+    params: PageParams,
+) -> AppResult<Paged<CrawlerResult>> {
+    let total: i64 = if let Some(script_id) = script_id {
+        sqlx::query_scalar("SELECT COUNT(*) FROM crawler_result cr WHERE cr.script_id = ?")
+            .bind(script_id)
+            .fetch_one(pool)
+            .await?
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM crawler_result cr")
+            .fetch_one(pool)
+            .await?
+    };
     let rows = if let Some(script_id) = script_id {
         sqlx::query(
             "SELECT cr.*, cs.name AS source, cs.website_url AS source_url \
              FROM crawler_result cr JOIN crawler_script cs ON cs.id = cr.script_id \
-             WHERE cr.script_id = ? ORDER BY COALESCE(cr.last_seen_at, cr.created_at) DESC, cr.id DESC LIMIT 500",
+             WHERE cr.script_id = ? ORDER BY COALESCE(cr.last_seen_at, cr.created_at) DESC, cr.id DESC LIMIT ? OFFSET ?",
         )
         .bind(script_id)
+        .bind(params.limit())
+        .bind(params.offset())
         .fetch_all(pool)
         .await?
     } else {
         sqlx::query(
             "SELECT cr.*, cs.name AS source, cs.website_url AS source_url \
              FROM crawler_result cr JOIN crawler_script cs ON cs.id = cr.script_id \
-             ORDER BY COALESCE(cr.last_seen_at, cr.created_at) DESC, cr.id DESC LIMIT 500",
+             ORDER BY COALESCE(cr.last_seen_at, cr.created_at) DESC, cr.id DESC LIMIT ? OFFSET ?",
         )
+        .bind(params.limit())
+        .bind(params.offset())
         .fetch_all(pool)
         .await?
     };
-    Ok(rows.iter().map(result_from_row).collect())
+    Ok(Paged::new(
+        rows.iter().map(result_from_row).collect(),
+        total,
+        params,
+    ))
 }
 
 pub async fn result_by_id(pool: &SqlitePool, id: i64) -> AppResult<CrawlerResult> {

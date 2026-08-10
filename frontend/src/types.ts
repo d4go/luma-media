@@ -1,3 +1,11 @@
+export interface Paged<T> {
+  items: T[]
+  total: number
+  page: number
+  pageSize: number
+  totalPages: number
+}
+
 export interface Folder {
   id: number
   name: string
@@ -62,7 +70,7 @@ export interface TaskRecord {
 }
 
 export interface TaskDetail extends Task {
-  records: TaskRecord[]
+  records: Paged<TaskRecord>
 }
 
 export interface MediaItem {
@@ -118,7 +126,7 @@ export interface DashboardStats {
   candidateCount: number
   downloadCount: number
   pendingScrapeCount: number
-  recentActivity: Task[]
+  recentActivity: Paged<Task>
 }
 
 export interface Settings {
@@ -238,13 +246,13 @@ export interface Actor { id: number; name: string; aliases: string[]; avatarUrl:
 export interface Resource { id: number; mediaId: number; providerKey: string; title: string; downloadUrl: string; infoHash: string | null; sizeBytes: number | null; resolution: string | null; subtitleLanguages: string[]; trackers: string[]; publishedAt: string | null; score: number; scoreReasons: string[]; available: boolean; availabilityStatus: string; codec: string | null; sourceCount: number; firstSeenAt: string | null; lastSeenAt: string | null; lastVerifiedAt: string | null; qbitHash: string | null; qbitState: string | null; qbitSyncStatus: 'synced' | 'unavailable' | 'unknown'; acquisitionId: number | null; acquisitionState: string | null }
 export interface Acquisition { id: number; mediaId: number; resourceId: number | null; requestedBy: string; state: string; stateMessage: string; qbitHash: string | null; qbitState: string | null; progress: number; downloadSpeed: number; etaSeconds: number | null; downloadPath: string | null; libraryItemId: number | null; lastError: string | null; retryCount: number; createdAt: string; updatedAt: string; completedAt: string | null; media: ProductMedia; resource: Resource | null }
 export interface ProviderReport { providerKey: string; ok: boolean; message: string; resultCount: number }
-export interface SearchResponse { query: string; media: ProductMedia[]; actors: Actor[]; providerReports: ProviderReport[] }
-export interface HomeData { activeAcquisitions: number; libraryCount: number; attentionCount: number; followedActors: number; recentAcquisitions: Acquisition[]; quickStarts: { title: string; description: string; to: string }[] }
+export interface SearchResponse { query: string; media: Paged<ProductMedia>; actors: Paged<Actor>; providerReports: ProviderReport[] }
+export interface HomeData { activeAcquisitions: number; libraryCount: number; attentionCount: number; followedActors: number; recentAcquisitions: Paged<Acquisition>; quickStarts: { title: string; description: string; to: string }[] }
 export interface MetadataSourceRecord { id: number; providerKey: string; providerEntityId: string; sourceUrl: string | null; recordKind: string; evidenceLevel: number; priority: number; title: string | null; originalTitle: string | null; summary: string | null; releaseDate: string | null; durationMinutes: number | null; posterUrl: string | null; backdropUrl: string | null; actors: unknown[]; aliases: unknown[]; tags: string[]; firstSeenAt: string; lastSeenAt: string; updatedAt: string }
 export interface FieldProvenance { field: string; providerKey: string; sourceRecordId: number; priority: number; value: unknown; sourceUpdatedAt: string; selectedAt: string }
-export interface MediaDetail { media: ProductMedia; actors: Actor[]; resources: Resource[]; metadataSources: MetadataSourceRecord[]; fieldProvenance: FieldProvenance[]; latestAcquisitionId: number | null; libraryItemId: number | null }
+export interface MediaDetail { media: ProductMedia; actors: Actor[]; resources: Paged<Resource>; metadataSources: Paged<MetadataSourceRecord>; fieldProvenance: FieldProvenance[]; latestAcquisitionId: number | null; libraryItemId: number | null }
 export interface AcquisitionEvent { id: number; eventKey: string; fromState: string | null; toState: string; message: string; payload: unknown; createdAt: string }
-export interface AcquisitionDetail { acquisition: Acquisition; events: AcquisitionEvent[] }
+export interface AcquisitionDetail { acquisition: Acquisition; events: Paged<AcquisitionEvent> }
 export interface AttentionItem { id: number; kind: string; severity: string; title: string; message: string; acquisitionId: number | null; mediaId: number | null; mediaTitle: string | null; mediaCode: string | null; actions: string[]; createdAt: string }
 export interface LibraryItem { id: number; mediaId: number; acquisitionId: number | null; videoPath: string; nfoPath: string | null; posterPath: string | null; status: string; fileSize: number | null; addedAt: string; media: { code: string; title: string; posterUrl: string | null; releaseDate: string | null; metadataStatus: string } }
 export interface ProviderConfig {

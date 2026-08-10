@@ -30,8 +30,9 @@ import {
 } from '@tabler/icons-vue'
 import { api } from '../api'
 import { formatDate } from '../format'
-import type { BrowserSession, ProductSettings, ProviderConfig, ProviderFetchMode, ProviderRuntime, Settings } from '../types'
+import type { BrowserSession, Paged, ProductSettings, ProviderConfig, ProviderFetchMode, ProviderRuntime, Settings } from '../types'
 import PageHeader from '../components/PageHeader.vue'
+import PaginationBar from '../components/PaginationBar.vue'
 
 const message = useMessage()
 const dialog = useDialog()
@@ -44,7 +45,9 @@ const syncing = ref('')
 const reparsing = ref('')
 const diagnosing = ref('')
 const browserSessionBusy = ref('')
-const providers = ref<ProviderConfig[]>([])
+const page = ref(1)
+const pageSize = ref(20)
+const providers = ref<Paged<ProviderConfig>>({ items: [], total: 0, page: 1, pageSize: 20, totalPages: 0 })
 const providerRuntimes = reactive<Record<string, ProviderRuntime>>({})
 const browserSessions = reactive<Record<string, BrowserSession>>({})
 const secrets = reactive<Record<string, string>>({})
@@ -84,8 +87,8 @@ const product = reactive<ProductSettings>({
   organizerConflictPolicy: 'attention',
 })
 
-const providerMap = computed(() => Object.fromEntries(providers.value.map(item => [item.key, item])))
-const sourceProviders = computed(() => providers.value.filter(item => item.type === 'source'))
+const providerMap = computed(() => Object.fromEntries(providers.value.items.map(item => [item.key, item])))
+const sourceProviders = computed(() => providers.value.items.filter(item => item.type === 'source'))
 const selectedSourceAdapter = computed(() => sourceAdapterOptions.find(item => item.value === newSource.adapter) ?? sourceAdapterOptions[0])
 
 function sourceAdapter(provider: ProviderConfig) {
@@ -214,7 +217,7 @@ function scheduleSyncPoll() {
   syncPollTimer = setTimeout(async () => {
     syncPollTimer = undefined
     try {
-      providers.value = await api.providers()
+      providers.value = await api.providers(page.value, pageSize.value)
     } catch {
       // Keep the current status visible and retry while a synchronization is running.
     } finally {
@@ -227,14 +230,14 @@ async function load() {
   loading.value = true
   try {
     const [providerData, legacyData, productData] = await Promise.all([
-      api.providers(),
+      api.providers(page.value, pageSize.value),
       api.settings(),
       api.productSettings(),
     ])
     providers.value = providerData
-    providerData.filter(provider => provider.type === 'source').forEach(bootstrapWindow)
+    providerData.items.filter(provider => provider.type === 'source').forEach(bootstrapWindow)
     const runtimeResults = await Promise.allSettled(
-      providerData.filter(provider => provider.type === 'source').map(provider => api.providerRuntime(provider.key)),
+      providerData.items.filter(provider => provider.type === 'source').map(provider => api.providerRuntime(provider.key)),
     )
     runtimeResults.forEach(result => {
       if (result.status === 'fulfilled') providerRuntimes[result.value.providerKey] = result.value
@@ -248,6 +251,9 @@ async function load() {
     loading.value = false
   }
 }
+
+function changePage(value: number) { page.value = value; load() }
+function changePageSize(value: number) { pageSize.value = value; page.value = 1; load() }
 
 async function persistProvider(provider: ProviderConfig) {
   const updated = await api.updateProvider(provider.key, {
@@ -263,7 +269,7 @@ async function persistProvider(provider: ProviderConfig) {
 async function save() {
   saving.value = true
   try {
-    for (const provider of providers.value) {
+    for (const provider of providers.value.items) {
       await api.updateProvider(provider.key, {
         displayName: provider.displayName,
         baseUrl: provider.baseUrl,
@@ -294,7 +300,8 @@ async function addSource() {
   creatingSource.value = true
   try {
     const created = await api.createProvider({ ...newSource })
-    providers.value.push(created)
+    providers.value.items.push(created)
+    providers.value.total += 1
     selectSourceAdapter(newSource.adapter)
     showNewSource.value = false
     message.success('来源已添加')
@@ -313,7 +320,8 @@ function removeSource(provider: ProviderConfig) {
     negativeText: '取消',
     async onPositiveClick() {
       await api.deleteProvider(provider.key)
-      providers.value = providers.value.filter(item => item.key !== provider.key)
+      providers.value.items = providers.value.items.filter(item => item.key !== provider.key)
+      providers.value.total = Math.max(0, providers.value.total - 1)
       message.success('来源已移除')
     },
   })
@@ -323,7 +331,7 @@ async function testProvider(key: string) {
   testing.value = key
   delete testMessages[key]
   try {
-    const provider = providers.value.find(item => item.key === key)
+    const provider = providers.value.items.find(item => item.key === key)
     if (provider?.type === 'source') {
       await persistProvider(provider)
     }
@@ -779,6 +787,7 @@ onUnmounted(() => {
             </n-alert>
           </article>
         </div>
+        <PaginationBar v-if="providers.total > 0" :page="page" :page-size="pageSize" :total="providers.total" @update:page="changePage" @update:page-size="changePageSize" />
       </section>
 
       <section class="settings-group">

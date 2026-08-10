@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::pagination::Paged;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Folder {
@@ -92,7 +94,7 @@ pub struct TaskRecord {
 pub struct TaskDetail {
     #[serde(flatten)]
     pub task: Task,
-    pub records: Vec<TaskRecord>,
+    pub records: Paged<TaskRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -256,7 +258,7 @@ pub struct DashboardStats {
     pub candidate_count: i64,
     pub download_count: usize,
     pub pending_scrape_count: i64,
-    pub recent_activity: Vec<Task>,
+    pub recent_activity: Paged<Task>,
 }
 
 #[derive(Debug, Serialize)]

@@ -28,6 +28,7 @@ use crate::{
         SnapshotInput, SyncMode,
     },
     metadata::{LocalizedAlias, MetadataSourceInput, SourceActor},
+    pagination::{Paged, PageParams},
     providers::{
         ProviderContext, ProviderMediaRef, RawProviderDocument, ResourceCandidate, SourceMedia,
         SourceProviderConfig,
@@ -227,25 +228,44 @@ fn manual_requester() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchQuery {
     #[serde(default)]
     q: String,
+    #[serde(default)]
+    page: u32,
+    #[serde(default)]
+    page_size: u32,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListQuery {
     #[serde(default)]
     status: String,
     #[serde(default)]
     q: String,
+    #[serde(default)]
+    page: u32,
+    #[serde(default)]
+    page_size: u32,
+}
+
+impl ListQuery {
+    fn page_params(&self) -> PageParams {
+        PageParams {
+            page: self.page,
+            page_size: self.page_size,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchResponse {
     query: String,
-    media: Vec<Media>,
-    actors: Vec<Actor>,
+    media: Paged<Media>,
+    actors: Paged<Actor>,
     provider_reports: Vec<ProviderReport>,
 }
 
@@ -282,7 +302,10 @@ struct CatalogResolveResponse {
     job_ids: Vec<i64>,
 }
 
-async fn home(State(state): State<AppState>) -> AppResult<Json<Value>> {
+async fn home(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<Value>> {
     let active: i64 = sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM acquisition WHERE state IN ({ACTIVE_STATES})"
     ))
@@ -298,14 +321,21 @@ async fn home(State(state): State<AppState>) -> AppResult<Json<Value>> {
     let followed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actor WHERE followed = 1")
         .fetch_one(&state.pool)
         .await?;
-    let recent_rows = sqlx::query(&format!("{ACQUISITION_SELECT} ORDER BY a.id DESC"))
+    let recent_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM acquisition")
+        .fetch_one(&state.pool)
+        .await?;
+    let recent_rows = sqlx::query(&format!(
+        "{ACQUISITION_SELECT} ORDER BY a.id DESC LIMIT ? OFFSET ?"
+    ))
+        .bind(params.limit())
+        .bind(params.offset())
         .fetch_all(&state.pool)
         .await?;
-    let recent = recent_rows
-        .iter()
-        .take(6)
-        .map(acquisition_from_row)
-        .collect::<Vec<_>>();
+    let recent = Paged::new(
+        recent_rows.iter().map(acquisition_from_row).collect(),
+        recent_total,
+        params,
+    );
     Ok(Json(json!({
         "activeAcquisitions": active,
         "libraryCount": library,
@@ -324,12 +354,16 @@ async fn search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
 ) -> AppResult<Json<SearchResponse>> {
+    let params = PageParams {
+        page: query.page,
+        page_size: query.page_size,
+    };
     let term = query.q.trim();
     if term.is_empty() {
         return Ok(Json(SearchResponse {
             query: String::new(),
-            media: Vec::new(),
-            actors: Vec::new(),
+            media: Paged::new(Vec::new(), 0, params),
+            actors: Paged::new(Vec::new(), 0, params),
             provider_reports: Vec::new(),
         }));
     }
@@ -340,28 +374,58 @@ async fn search(
         .map(|code| normalize_code(&code))
         .unwrap_or_else(|| normalize_code(term));
     let normalized_alias = normalize_alias(term);
-    let (media_rows, actor_rows) = if term.chars().count() >= 3 {
+    let (media, actors) = if term.chars().count() >= 3 {
         let phrase = fts_phrase(term);
-        let media_rows = sqlx::query("WITH matches AS (SELECT rowid AS media_id, bm25(media_search_fts) AS rank FROM media_search_fts WHERE media_search_fts MATCH ?) SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m LEFT JOIN matches x ON x.media_id=m.id WHERE m.normalized_code=? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias=?) OR x.media_id IS NOT NULL ORDER BY CASE WHEN m.normalized_code=? THEN 0 WHEN EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias=?) THEN 1 ELSE 2 END, COALESCE(x.rank,0), m.updated_at DESC LIMIT 60")
-            .bind(&phrase).bind(&normalized_code).bind(&normalized_alias).bind(&normalized_code).bind(&normalized_alias).fetch_all(&state.pool).await?;
-        let actor_rows = sqlx::query("WITH matches AS (SELECT rowid AS actor_id, bm25(actor_search_fts) AS rank FROM actor_search_fts WHERE actor_search_fts MATCH ?) SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id=a.id) AS media_count FROM actor a LEFT JOIN matches x ON x.actor_id=a.id WHERE a.normalized_name=? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias=?) OR x.actor_id IS NOT NULL ORDER BY CASE WHEN a.normalized_name=? THEN 0 WHEN EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias=?) THEN 1 ELSE 2 END, a.followed DESC, COALESCE(x.rank,0), media_count DESC LIMIT 30")
-            .bind(&phrase).bind(&normalized_alias).bind(&normalized_alias).bind(&normalized_alias).bind(&normalized_alias).fetch_all(&state.pool).await?;
-        (media_rows, actor_rows)
+        let media_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (WITH matches AS (SELECT rowid AS media_id, bm25(media_search_fts) AS rank FROM media_search_fts WHERE media_search_fts MATCH ?) SELECT m.id FROM media m LEFT JOIN matches x ON x.media_id=m.id WHERE m.normalized_code=? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias=?) OR x.media_id IS NOT NULL)")
+            .bind(&phrase).bind(&normalized_code).bind(&normalized_alias).fetch_one(&state.pool).await?;
+        let media_rows = sqlx::query("WITH matches AS (SELECT rowid AS media_id, bm25(media_search_fts) AS rank FROM media_search_fts WHERE media_search_fts MATCH ?) SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m LEFT JOIN matches x ON x.media_id=m.id WHERE m.normalized_code=? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias=?) OR x.media_id IS NOT NULL ORDER BY CASE WHEN m.normalized_code=? THEN 0 WHEN EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias=?) THEN 1 ELSE 2 END, COALESCE(x.rank,0), m.updated_at DESC LIMIT ? OFFSET ?")
+            .bind(&phrase).bind(&normalized_code).bind(&normalized_alias).bind(&normalized_code).bind(&normalized_alias).bind(params.limit()).bind(params.offset()).fetch_all(&state.pool).await?;
+        let actor_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (WITH matches AS (SELECT rowid AS actor_id, bm25(actor_search_fts) AS rank FROM actor_search_fts WHERE actor_search_fts MATCH ?) SELECT a.id FROM actor a LEFT JOIN matches x ON x.actor_id=a.id WHERE a.normalized_name=? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias=?) OR x.actor_id IS NOT NULL)")
+            .bind(&phrase).bind(&normalized_alias).bind(&normalized_alias).fetch_one(&state.pool).await?;
+        let actor_rows = sqlx::query("WITH matches AS (SELECT rowid AS actor_id, bm25(actor_search_fts) AS rank FROM actor_search_fts WHERE actor_search_fts MATCH ?) SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id=a.id) AS media_count FROM actor a LEFT JOIN matches x ON x.actor_id=a.id WHERE a.normalized_name=? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias=?) OR x.actor_id IS NOT NULL ORDER BY CASE WHEN a.normalized_name=? THEN 0 WHEN EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias=?) THEN 1 ELSE 2 END, a.followed DESC, COALESCE(x.rank,0), media_count DESC LIMIT ? OFFSET ?")
+            .bind(&phrase).bind(&normalized_alias).bind(&normalized_alias).bind(&normalized_alias).bind(&normalized_alias).bind(params.limit()).bind(params.offset()).fetch_all(&state.pool).await?;
+        (
+            Paged::new(
+                media_rows.iter().map(media_from_row).collect(),
+                media_total,
+                params,
+            ),
+            Paged::new(
+                actor_rows.iter().map(actor_from_row).collect(),
+                actor_total,
+                params,
+            ),
+        )
     } else {
         // FTS5 trigram has no tokens for one- or two-character queries. Keep
         // this bounded fallback for short names while exact aliases still use
         // their B-tree indexes.
         let pattern = format!("%{}%", term.to_lowercase());
-        let media_rows = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m JOIN media_search_document d ON d.media_id=m.id WHERE m.normalized_code=? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias=?) OR lower(d.title) LIKE ? OR lower(d.original_title) LIKE ? OR lower(d.aliases) LIKE ? OR lower(d.actors) LIKE ? OR lower(d.resources) LIKE ? ORDER BY CASE WHEN m.normalized_code=? THEN 0 ELSE 1 END, m.updated_at DESC LIMIT 60")
-            .bind(&normalized_code).bind(&normalized_alias).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&normalized_code).fetch_all(&state.pool).await?;
-        let actor_rows = sqlx::query("SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id=a.id) AS media_count FROM actor a JOIN actor_search_document d ON d.actor_id=a.id WHERE a.normalized_name=? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias=?) OR lower(d.name) LIKE ? OR lower(d.aliases) LIKE ? ORDER BY CASE WHEN a.normalized_name=? THEN 0 ELSE 1 END, a.followed DESC, media_count DESC LIMIT 30")
-            .bind(&normalized_alias).bind(&normalized_alias).bind(&pattern).bind(&pattern).bind(&normalized_alias).fetch_all(&state.pool).await?;
-        (media_rows, actor_rows)
+        let media_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT m.id FROM media m JOIN media_search_document d ON d.media_id=m.id WHERE m.normalized_code=? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias=?) OR lower(d.title) LIKE ? OR lower(d.original_title) LIKE ? OR lower(d.aliases) LIKE ? OR lower(d.actors) LIKE ? OR lower(d.resources) LIKE ?)")
+            .bind(&normalized_code).bind(&normalized_alias).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).fetch_one(&state.pool).await?;
+        let media_rows = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m JOIN media_search_document d ON d.media_id=m.id WHERE m.normalized_code=? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias=?) OR lower(d.title) LIKE ? OR lower(d.original_title) LIKE ? OR lower(d.aliases) LIKE ? OR lower(d.actors) LIKE ? OR lower(d.resources) LIKE ? ORDER BY CASE WHEN m.normalized_code=? THEN 0 ELSE 1 END, m.updated_at DESC LIMIT ? OFFSET ?")
+            .bind(&normalized_code).bind(&normalized_alias).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&normalized_code).bind(params.limit()).bind(params.offset()).fetch_all(&state.pool).await?;
+        let actor_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT a.id FROM actor a JOIN actor_search_document d ON d.actor_id=a.id WHERE a.normalized_name=? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias=?) OR lower(d.name) LIKE ? OR lower(d.aliases) LIKE ?)")
+            .bind(&normalized_alias).bind(&normalized_alias).bind(&pattern).bind(&pattern).fetch_one(&state.pool).await?;
+        let actor_rows = sqlx::query("SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id=a.id) AS media_count FROM actor a JOIN actor_search_document d ON d.actor_id=a.id WHERE a.normalized_name=? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias=?) OR lower(d.name) LIKE ? OR lower(d.aliases) LIKE ? ORDER BY CASE WHEN a.normalized_name=? THEN 0 ELSE 1 END, a.followed DESC, media_count DESC LIMIT ? OFFSET ?")
+            .bind(&normalized_alias).bind(&normalized_alias).bind(&pattern).bind(&pattern).bind(&normalized_alias).bind(params.limit()).bind(params.offset()).fetch_all(&state.pool).await?;
+        (
+            Paged::new(
+                media_rows.iter().map(media_from_row).collect(),
+                media_total,
+                params,
+            ),
+            Paged::new(
+                actor_rows.iter().map(actor_from_row).collect(),
+                actor_total,
+                params,
+            ),
+        )
     };
     Ok(Json(SearchResponse {
         query: term.into(),
-        media: media_rows.iter().map(media_from_row).collect(),
-        actors: actor_rows.iter().map(actor_from_row).collect(),
+        media,
+        actors,
         provider_reports: Vec::new(),
     }))
 }
@@ -445,17 +509,25 @@ fn push_search_term(terms: &mut Vec<String>, value: &str) {
 async fn list_media(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
-) -> AppResult<Json<Vec<Media>>> {
+) -> AppResult<Json<Paged<Media>>> {
+    let params = query.page_params();
     let pattern = format!("%{}%", query.q.trim().to_lowercase());
     let alias_pattern = format!("%{}%", normalize_alias(query.q.trim()));
-    let rows = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m WHERE (? = '%%' OR lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ? OR lower(COALESCE(legacy_filename,'')) LIKE ? OR lower(COALESCE(legacy_provider_id,'')) LIKE ? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias LIKE ?)) ORDER BY m.updated_at DESC LIMIT 200")
-        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&alias_pattern).fetch_all(&state.pool).await?;
-    Ok(Json(rows.iter().map(media_from_row).collect()))
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media m WHERE (? = '%%' OR lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ? OR lower(COALESCE((SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1),'')) LIKE ? OR lower(COALESCE((SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1),'')) LIKE ? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias LIKE ?))")
+        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&alias_pattern).fetch_one(&state.pool).await?;
+    let rows = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m WHERE (? = '%%' OR lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ? OR lower(COALESCE(legacy_filename,'')) LIKE ? OR lower(COALESCE(legacy_provider_id,'')) LIKE ? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias LIKE ?)) ORDER BY m.updated_at DESC LIMIT ? OFFSET ?")
+        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&alias_pattern).bind(params.limit()).bind(params.offset()).fetch_all(&state.pool).await?;
+    Ok(Json(Paged::new(
+        rows.iter().map(media_from_row).collect(),
+        total,
+        params,
+    )))
 }
 
 async fn media_detail(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
+    Query(query): Query<PageParams>,
 ) -> AppResult<Json<Value>> {
     let row = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m WHERE m.id = ?")
         .bind(id)
@@ -463,7 +535,8 @@ async fn media_detail(
         .await?
         .ok_or(AppError::NotFound)?;
     let media = media_from_row(&row);
-    let resources = resources_for_media(&state, id).await?;
+    let (resource_items, resource_total) = resources_for_media_paged(&state, id, query).await?;
+    let resources = Paged::new(resource_items, resource_total, query);
     let actor_rows = sqlx::query("SELECT a.*, (SELECT COUNT(*) FROM media_actor x WHERE x.actor_id = a.id) AS media_count, ma.role, ma.billing_order FROM actor a JOIN media_actor ma ON ma.actor_id = a.id WHERE ma.media_id = ? ORDER BY ma.billing_order, a.name")
         .bind(id).fetch_all(&state.pool).await?;
     let actors = actor_rows.iter().map(actor_from_row).collect::<Vec<_>>();
@@ -481,13 +554,20 @@ async fn media_detail(
     .fetch_optional(&state.pool)
     .await?
     .flatten();
-    let source_rows = sqlx::query("SELECT id,provider_key,provider_entity_id,source_url,record_kind,evidence_level,priority,title,original_title,summary,release_date,duration_minutes,poster_url,backdrop_url,actors_json,aliases_json,tags_json,first_seen_at,last_seen_at,updated_at FROM metadata_source_record WHERE media_id=? ORDER BY priority DESC,provider_key")
+    let source_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metadata_source_record WHERE media_id=?")
         .bind(id)
+        .fetch_one(&state.pool)
+        .await?;
+    let source_rows = sqlx::query("SELECT id,provider_key,provider_entity_id,source_url,record_kind,evidence_level,priority,title,original_title,summary,release_date,duration_minutes,poster_url,backdrop_url,actors_json,aliases_json,tags_json,first_seen_at,last_seen_at,updated_at FROM metadata_source_record WHERE media_id=? ORDER BY priority DESC,provider_key LIMIT ? OFFSET ?")
+        .bind(id)
+        .bind(query.limit())
+        .bind(query.offset())
         .fetch_all(&state.pool)
         .await?;
-    let metadata_sources = source_rows
-        .iter()
-        .map(|row| {
+    let metadata_sources = Paged::new(
+        source_rows
+            .iter()
+            .map(|row| {
             json!({
                 "id": row.get::<i64, _>("id"),
                 "providerKey": row.get::<String, _>("provider_key"),
@@ -510,8 +590,11 @@ async fn media_detail(
                 "lastSeenAt": row.get::<String, _>("last_seen_at"),
                 "updatedAt": row.get::<String, _>("updated_at"),
             })
-        })
-        .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>(),
+        source_total,
+        query,
+    );
     let provenance_rows = sqlx::query("SELECT field_name,provider_key,source_record_id,priority,value_json,source_updated_at,selected_at FROM metadata_field_provenance WHERE media_id=? ORDER BY field_name")
         .bind(id)
         .fetch_all(&state.pool)
@@ -538,9 +621,11 @@ async fn media_detail(
 async fn media_resources(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
-) -> AppResult<Json<Vec<Resource>>> {
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<Paged<Resource>>> {
     media_exists(&state, id).await?;
-    Ok(Json(resources_for_media(&state, id).await?))
+    let (items, total) = resources_for_media_paged(&state, id, params).await?;
+    Ok(Json(Paged::new(items, total, params)))
 }
 
 async fn refresh_media_resources(
@@ -735,44 +820,84 @@ async fn submit_acquisition_inner(state: &AppState, id: i64) -> AppResult<()> {
 async fn list_acquisitions(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
-) -> AppResult<Json<Vec<Acquisition>>> {
+) -> AppResult<Json<Paged<Acquisition>>> {
+    let params = query.page_params();
     if let Err(error) = reconcile_active(&state).await {
         tracing::warn!(%error, "acquisition list reconciliation failed");
     }
-    let rows = if query.status.trim().is_empty() {
-        sqlx::query(&format!("{ACQUISITION_SELECT} ORDER BY a.id DESC"))
+    let status = query.status.trim();
+    let total: i64 = if status.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM acquisition a")
+            .fetch_one(&state.pool)
+            .await?
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM acquisition a WHERE a.state = ?")
+            .bind(status)
+            .fetch_one(&state.pool)
+            .await?
+    };
+    let rows = if status.is_empty() {
+        sqlx::query(&format!(
+            "{ACQUISITION_SELECT} ORDER BY a.id DESC LIMIT ? OFFSET ?"
+        ))
+            .bind(params.limit())
+            .bind(params.offset())
             .fetch_all(&state.pool)
             .await?
     } else {
         sqlx::query(&format!(
-            "{ACQUISITION_SELECT} WHERE a.state = ? ORDER BY a.id DESC"
+            "{ACQUISITION_SELECT} WHERE a.state = ? ORDER BY a.id DESC LIMIT ? OFFSET ?"
         ))
-        .bind(query.status.trim())
+        .bind(status)
+        .bind(params.limit())
+        .bind(params.offset())
         .fetch_all(&state.pool)
         .await?
     };
-    Ok(Json(rows.iter().map(acquisition_from_row).collect()))
+    Ok(Json(Paged::new(
+        rows.iter().map(acquisition_from_row).collect(),
+        total,
+        params,
+    )))
 }
 
 async fn acquisition_detail(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
+    Query(query): Query<PageParams>,
 ) -> AppResult<Json<Value>> {
     if let Err(error) = reconcile_active(&state).await {
         tracing::warn!(%error, acquisition_id = id, "acquisition detail reconciliation failed");
     }
     let acquisition = acquisition_by_id(&state, id).await?;
-    let event_rows =
-        sqlx::query("SELECT * FROM acquisition_event WHERE acquisition_id = ? ORDER BY id")
+    let event_total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM acquisition_event WHERE acquisition_id = ?")
             .bind(id)
-            .fetch_all(&state.pool)
+            .fetch_one(&state.pool)
             .await?;
-    let events = event_rows.iter().map(|row| json!({
-        "id": row.get::<i64,_>("id"), "eventKey": row.get::<String,_>("event_key"),
-        "fromState": row.get::<Option<String>,_>("from_state"), "toState": row.get::<String,_>("to_state"),
-        "message": row.get::<String,_>("message"), "payload": parse_json(&row.get::<String,_>("payload_json"), json!({})),
-        "createdAt": row.get::<String,_>("created_at")
-    })).collect::<Vec<_>>();
+    let event_rows = sqlx::query(
+        "SELECT * FROM acquisition_event WHERE acquisition_id = ? ORDER BY id LIMIT ? OFFSET ?",
+    )
+    .bind(id)
+    .bind(query.limit())
+    .bind(query.offset())
+    .fetch_all(&state.pool)
+    .await?;
+    let events = Paged::new(
+        event_rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<i64,_>("id"), "eventKey": row.get::<String,_>("event_key"),
+                    "fromState": row.get::<Option<String>,_>("from_state"), "toState": row.get::<String,_>("to_state"),
+                    "message": row.get::<String,_>("message"), "payload": parse_json(&row.get::<String,_>("payload_json"), json!({})),
+                    "createdAt": row.get::<String,_>("created_at")
+                })
+            })
+            .collect::<Vec<_>>(),
+        event_total,
+        query,
+    );
     Ok(Json(json!({"acquisition": acquisition, "events": events})))
 }
 
@@ -1540,23 +1665,43 @@ async fn insert_event(
 async fn list_actors(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
-) -> AppResult<Json<Vec<Actor>>> {
+) -> AppResult<Json<Paged<Actor>>> {
+    let params = query.page_params();
     let pattern = format!("%{}%", query.q.trim().to_lowercase());
     let alias_pattern = format!("%{}%", normalize_alias(query.q.trim()));
-    let rows = sqlx::query("SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id = a.id) AS media_count FROM actor a WHERE (? = '%%' OR lower(a.name) LIKE ? OR lower(a.aliases_json) LIKE ? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias LIKE ?)) ORDER BY a.followed DESC, media_count DESC, a.name LIMIT 200")
-        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&alias_pattern).fetch_all(&state.pool).await?;
-    Ok(Json(rows.iter().map(actor_from_row).collect()))
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM actor a WHERE (? = '%%' OR lower(a.name) LIKE ? OR lower(a.aliases_json) LIKE ? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias LIKE ?))")
+        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&alias_pattern).fetch_one(&state.pool).await?;
+    let rows = sqlx::query("SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id = a.id) AS media_count FROM actor a WHERE (? = '%%' OR lower(a.name) LIKE ? OR lower(a.aliases_json) LIKE ? OR EXISTS(SELECT 1 FROM actor_name_alias ana WHERE ana.actor_id=a.id AND ana.normalized_alias LIKE ?)) ORDER BY a.followed DESC, media_count DESC, a.name LIMIT ? OFFSET ?")
+        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&alias_pattern).bind(params.limit()).bind(params.offset()).fetch_all(&state.pool).await?;
+    Ok(Json(Paged::new(
+        rows.iter().map(actor_from_row).collect(),
+        total,
+        params,
+    )))
 }
 
 async fn actor_detail(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
+    Query(query): Query<PageParams>,
 ) -> AppResult<Json<Value>> {
     let row = sqlx::query("SELECT a.*, (SELECT COUNT(*) FROM media_actor ma WHERE ma.actor_id = a.id) AS media_count FROM actor a WHERE id = ?").bind(id).fetch_optional(&state.pool).await?.ok_or(AppError::NotFound)?;
-    let media_rows = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m JOIN media_actor ma ON ma.media_id = m.id WHERE ma.actor_id = ? ORDER BY m.release_date DESC, m.updated_at DESC").bind(id).fetch_all(&state.pool).await?;
-    Ok(Json(
-        json!({"actor": actor_from_row(&row), "media": media_rows.iter().map(media_from_row).collect::<Vec<_>>()}),
-    ))
+    let media_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media m JOIN media_actor ma ON ma.media_id = m.id WHERE ma.actor_id = ?")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await?;
+    let media_rows = sqlx::query("SELECT m.*, (SELECT li.legacy_media_item_id FROM library_item li WHERE li.media_id=m.id AND li.legacy_media_item_id IS NOT NULL ORDER BY li.id DESC LIMIT 1) AS legacy_media_item_id, (SELECT mi.filename FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_filename, (SELECT mi.provider_id FROM library_item li JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE li.media_id=m.id ORDER BY li.id DESC LIMIT 1) AS legacy_provider_id FROM media m JOIN media_actor ma ON ma.media_id = m.id WHERE ma.actor_id = ? ORDER BY m.release_date DESC, m.updated_at DESC LIMIT ? OFFSET ?")
+        .bind(id)
+        .bind(query.limit())
+        .bind(query.offset())
+        .fetch_all(&state.pool)
+        .await?;
+    let media = Paged::new(
+        media_rows.iter().map(media_from_row).collect(),
+        media_total,
+        query,
+    );
+    Ok(Json(json!({"actor": actor_from_row(&row), "media": media})))
 }
 
 async fn follow_actor(
@@ -1589,12 +1734,21 @@ async fn list_library(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
+    let params = query.page_params();
     let pattern = format!("%{}%", query.q.trim().to_lowercase());
     let alias_pattern = format!("%{}%", normalize_alias(query.q.trim()));
-    let rows = sqlx::query("SELECT li.*, m.normalized_code, m.title, m.poster_url, m.release_date, m.metadata_status, mi.filename AS legacy_filename, mi.provider_id AS legacy_provider_id FROM library_item li JOIN media m ON m.id = li.media_id LEFT JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE (? = '%%' OR lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ? OR lower(COALESCE(mi.filename,'')) LIKE ? OR lower(COALESCE(mi.provider_id,'')) LIKE ? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias LIKE ?)) ORDER BY li.added_at DESC LIMIT 300")
-        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&alias_pattern).fetch_all(&state.pool).await?;
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_item li JOIN media m ON m.id = li.media_id LEFT JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE (? = '%%' OR lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ? OR lower(COALESCE(mi.filename,'')) LIKE ? OR lower(COALESCE(mi.provider_id,'')) LIKE ? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias LIKE ?))")
+        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&alias_pattern).fetch_one(&state.pool).await?;
+    let rows = sqlx::query("SELECT li.*, m.normalized_code, m.title, m.poster_url, m.release_date, m.metadata_status, mi.filename AS legacy_filename, mi.provider_id AS legacy_provider_id FROM library_item li JOIN media m ON m.id = li.media_id LEFT JOIN media_item mi ON mi.id=li.legacy_media_item_id WHERE (? = '%%' OR lower(m.title) LIKE ? OR lower(m.normalized_code) LIKE ? OR lower(COALESCE(mi.filename,'')) LIKE ? OR lower(COALESCE(mi.provider_id,'')) LIKE ? OR EXISTS(SELECT 1 FROM media_title_alias mta WHERE mta.media_id=m.id AND mta.normalized_alias LIKE ?)) ORDER BY li.added_at DESC LIMIT ? OFFSET ?")
+        .bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&pattern).bind(&alias_pattern).bind(params.limit()).bind(params.offset()).fetch_all(&state.pool).await?;
     let values = rows.iter().map(library_json).collect::<Vec<_>>();
-    Ok(Json(json!({"items": values, "total": values.len()})))
+    Ok(Json(json!({
+        "items": values,
+        "total": total,
+        "page": params.page(),
+        "pageSize": params.page_size(),
+        "totalPages": Paged::<Value>::total_pages(total, params.page_size()),
+    })))
 }
 
 async fn library_detail(
@@ -1736,12 +1890,27 @@ async fn rematch_library_item(
     })))
 }
 
-async fn list_attention(State(state): State<AppState>) -> AppResult<Json<Vec<Value>>> {
+async fn list_attention(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<Paged<Value>>> {
     if let Err(error) = reconcile_active(&state).await {
         tracing::warn!(%error, "attention list reconciliation failed");
     }
-    let rows = sqlx::query("SELECT ai.*, m.title AS media_title, m.normalized_code FROM attention_item ai LEFT JOIN media m ON m.id = ai.media_id WHERE ai.status = 'open' ORDER BY CASE ai.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, ai.id DESC").fetch_all(&state.pool).await?;
-    Ok(Json(rows.iter().map(attention_json).collect()))
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM attention_item ai WHERE ai.status = 'open'")
+            .fetch_one(&state.pool)
+            .await?;
+    let rows = sqlx::query("SELECT ai.*, m.title AS media_title, m.normalized_code FROM attention_item ai LEFT JOIN media m ON m.id = ai.media_id WHERE ai.status = 'open' ORDER BY CASE ai.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, ai.id DESC LIMIT ? OFFSET ?")
+        .bind(params.limit())
+        .bind(params.offset())
+        .fetch_all(&state.pool)
+        .await?;
+    Ok(Json(Paged::new(
+        rows.iter().map(attention_json).collect(),
+        total,
+        params,
+    )))
 }
 
 async fn attention_detail(
@@ -1842,9 +2011,23 @@ fn confirm_mode() -> String {
     "CONFIRM".into()
 }
 
-async fn list_automations(State(state): State<AppState>) -> AppResult<Json<Vec<Value>>> {
-    let rows = sqlx::query("SELECT ar.*, (SELECT status FROM automation_execution ae WHERE ae.rule_id = ar.id ORDER BY ae.id DESC LIMIT 1) AS last_status, (SELECT explanation FROM automation_execution ae WHERE ae.rule_id = ar.id ORDER BY ae.id DESC LIMIT 1) AS last_explanation FROM automation_rule ar ORDER BY ar.enabled DESC, ar.id DESC").fetch_all(&state.pool).await?;
-    Ok(Json(rows.iter().map(automation_json).collect()))
+async fn list_automations(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<Paged<Value>>> {
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM automation_rule ar")
+        .fetch_one(&state.pool)
+        .await?;
+    let rows = sqlx::query("SELECT ar.*, (SELECT status FROM automation_execution ae WHERE ae.rule_id = ar.id ORDER BY ae.id DESC LIMIT 1) AS last_status, (SELECT explanation FROM automation_execution ae WHERE ae.rule_id = ar.id ORDER BY ae.id DESC LIMIT 1) AS last_explanation FROM automation_rule ar ORDER BY ar.enabled DESC, ar.id DESC LIMIT ? OFFSET ?")
+        .bind(params.limit())
+        .bind(params.offset())
+        .fetch_all(&state.pool)
+        .await?;
+    Ok(Json(Paged::new(
+        rows.iter().map(automation_json).collect(),
+        total,
+        params,
+    )))
 }
 
 async fn create_automation(
@@ -1927,11 +2110,23 @@ async fn automation_by_id(state: &AppState, id: i64) -> AppResult<Json<Value>> {
     Ok(Json(automation_json(&row)))
 }
 
-async fn list_providers(State(state): State<AppState>) -> AppResult<Json<Vec<Value>>> {
-    let rows = sqlx::query("SELECT pc.*,ss.status AS sync_status,ss.active_mode AS sync_active_mode,ss.bootstrap_paused AS sync_bootstrap_paused,ss.bootstrap_from AS sync_bootstrap_from,ss.bootstrap_to AS sync_bootstrap_to,ss.cursor_json AS sync_cursor_json,ss.last_started_at AS sync_last_started_at,ss.last_finished_at AS sync_last_finished_at,ss.last_success_at AS sync_last_success_at,ss.next_run_at AS sync_next_run_at,ss.last_message AS sync_last_message,ss.failure_count AS sync_failure_count,ss.item_count AS sync_item_count,ss.inserted_count AS sync_inserted_count,ss.updated_count AS sync_updated_count,ss.discovery_count AS sync_discovery_count,ss.hydrated_count AS sync_hydrated_count,ss.hydration_failed_count AS sync_hydration_failed_count,ss.pending_count AS sync_pending_count FROM provider_config pc LEFT JOIN source_sync_state ss ON ss.provider_key=pc.provider_key ORDER BY pc.provider_type,pc.provider_key")
+async fn list_providers(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> AppResult<Json<Paged<Value>>> {
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_config pc")
+        .fetch_one(&state.pool)
+        .await?;
+    let rows = sqlx::query("SELECT pc.*,ss.status AS sync_status,ss.active_mode AS sync_active_mode,ss.bootstrap_paused AS sync_bootstrap_paused,ss.bootstrap_from AS sync_bootstrap_from,ss.bootstrap_to AS sync_bootstrap_to,ss.cursor_json AS sync_cursor_json,ss.last_started_at AS sync_last_started_at,ss.last_finished_at AS sync_last_finished_at,ss.last_success_at AS sync_last_success_at,ss.next_run_at AS sync_next_run_at,ss.last_message AS sync_last_message,ss.failure_count AS sync_failure_count,ss.item_count AS sync_item_count,ss.inserted_count AS sync_inserted_count,ss.updated_count AS sync_updated_count,ss.discovery_count AS sync_discovery_count,ss.hydrated_count AS sync_hydrated_count,ss.hydration_failed_count AS sync_hydration_failed_count,ss.pending_count AS sync_pending_count FROM provider_config pc LEFT JOIN source_sync_state ss ON ss.provider_key=pc.provider_key ORDER BY pc.provider_type,pc.provider_key LIMIT ? OFFSET ?")
+        .bind(params.limit())
+        .bind(params.offset())
         .fetch_all(&state.pool)
         .await?;
-    Ok(Json(rows.iter().map(provider_json).collect()))
+    Ok(Json(Paged::new(
+        rows.iter().map(provider_json).collect(),
+        total,
+        params,
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4189,10 +4384,37 @@ fn json_value_string(value: &Value) -> Option<String> {
     }
 }
 
-async fn resources_for_media(state: &AppState, media_id: i64) -> AppResult<Vec<Resource>> {
-    let rows = sqlx::query("SELECT r.*, (SELECT a.id FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_id, (SELECT a.state FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_state, (SELECT a.qbit_hash FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_qbit_hash FROM resource r WHERE r.media_id = ? ORDER BY r.available DESC, r.score DESC, r.published_at DESC, r.id DESC").bind(media_id).fetch_all(&state.pool).await?;
+async fn resources_for_media_paged(
+    state: &AppState,
+    media_id: i64,
+    params: PageParams,
+) -> AppResult<(Vec<Resource>, i64)> {
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource r WHERE r.media_id = ?")
+        .bind(media_id)
+        .fetch_one(&state.pool)
+        .await?;
+    let rows = sqlx::query("SELECT r.*, (SELECT a.id FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_id, (SELECT a.state FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_state, (SELECT a.qbit_hash FROM acquisition a WHERE a.resource_id=r.id ORDER BY a.id DESC LIMIT 1) AS acquisition_qbit_hash FROM resource r WHERE r.media_id = ? ORDER BY r.available DESC, r.score DESC, r.published_at DESC, r.id DESC LIMIT ? OFFSET ?")
+        .bind(media_id)
+        .bind(params.limit())
+        .bind(params.offset())
+        .fetch_all(&state.pool)
+        .await?;
     let mut resources = rows.iter().map(resource_from_row).collect::<Vec<_>>();
-    let settings = storage::load_settings(&state.pool).await?;
+    enrich_resources_with_qbit(state, &mut resources).await;
+    Ok((resources, total))
+}
+
+async fn enrich_resources_with_qbit(state: &AppState, resources: &mut [Resource]) {
+    let settings = match storage::load_settings(&state.pool).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(%error, "resource status has invalid qBittorrent settings");
+            for resource in resources {
+                resource.qbit_sync_status = "unavailable".into();
+            }
+            return;
+        }
+    };
     match QBittorrentClient::new(&settings) {
         Ok(client) => match client.torrents().await {
             Ok(torrents) => {
@@ -4200,7 +4422,7 @@ async fn resources_for_media(state: &AppState, media_id: i64) -> AppResult<Vec<R
                     .into_iter()
                     .filter_map(|torrent| normalize_hash(&torrent.hash).map(|hash| (hash, torrent)))
                     .collect::<HashMap<_, _>>();
-                for resource in &mut resources {
+                for resource in resources.iter_mut() {
                     let resource_hash = resource
                         .info_hash
                         .as_deref()
@@ -4223,20 +4445,19 @@ async fn resources_for_media(state: &AppState, media_id: i64) -> AppResult<Vec<R
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, media_id, "resource status could not reach qBittorrent");
-                for resource in &mut resources {
+                tracing::warn!(%error, "resource status could not reach qBittorrent");
+                for resource in resources.iter_mut() {
                     resource.qbit_sync_status = "unavailable".into();
                 }
             }
         },
         Err(error) => {
-            tracing::warn!(%error, media_id, "resource status has invalid qBittorrent settings");
-            for resource in &mut resources {
+            tracing::warn!(%error, "resource status has invalid qBittorrent settings");
+            for resource in resources.iter_mut() {
                 resource.qbit_sync_status = "unavailable".into();
             }
         }
     }
-    Ok(resources)
 }
 
 async fn resource_provider_keys_for_media(
@@ -6036,12 +6257,14 @@ mod tests {
             State(state),
             Query(SearchQuery {
                 q: "ABC 123".into(),
+                page: 1,
+                page_size: 20,
             }),
         )
         .await
         .unwrap()
         .0;
-        assert_eq!(response.media.len(), 1);
+        assert_eq!(response.media.items.len(), 1);
         assert!(response.provider_reports.is_empty());
     }
 
@@ -6209,24 +6432,28 @@ mod tests {
             State(state.clone()),
             Query(SearchQuery {
                 q: "时隔五年再次出勤".into(),
+                page: 1,
+                page_size: 20,
             }),
         )
         .await
         .unwrap()
         .0;
-        assert_eq!(chinese.media[0].id, media_id);
+        assert_eq!(chinese.media.items[0].id, media_id);
         assert!(chinese.provider_reports.is_empty());
         let english = search(
             State(state.clone()),
             Query(SearchQuery {
                 q: "Mana Sakura".into(),
+                page: 1,
+                page_size: 20,
             }),
         )
         .await
         .unwrap()
         .0;
-        assert_eq!(english.actors[0].id, actor_id);
-        assert_eq!(english.media[0].id, media_id);
+        assert_eq!(english.actors.items[0].id, actor_id);
+        assert_eq!(english.media.items[0].id, media_id);
         assert!(english.provider_reports.is_empty());
         let locale: String = sqlx::query_scalar(
             "SELECT locale FROM actor_name_alias WHERE actor_id=? AND normalized_alias=?",
