@@ -197,6 +197,7 @@ mod tests {
                 pool.clone(),
                 root.join("source-cache"),
             )),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool.clone()),
         };
         let watcher = start(state);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

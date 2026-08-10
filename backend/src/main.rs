@@ -37,6 +37,7 @@ pub struct AppState {
     pub fetch_manager: Arc<fetch::FetchManager>,
     pub provider_registry: Arc<providers::ProviderRegistry>,
     pub snapshot_repository: Arc<ingestion::SnapshotRepository>,
+    pub ingestion_queue: ingestion::IngestionQueue,
 }
 
 #[tokio::main]
@@ -76,7 +77,9 @@ async fn main() -> anyhow::Result<()> {
             pool.clone(),
             source_cache_root,
         )),
+        ingestion_queue: ingestion::IngestionQueue::new(pool.clone()),
     };
+    ingestion::start_workers(state.clone());
     scheduler::start(state.clone());
     let _watcher = watcher::start(state.clone());
     asset::start_health_job(state.clone());

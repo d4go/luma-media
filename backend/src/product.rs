@@ -21,7 +21,7 @@ use crate::{
     AppState,
     error::{AppError, AppResult},
     fetch::{FetchError, FetchMethod, FetchRequest, FetchResponse, PageKind},
-    ingestion::SnapshotInput,
+    ingestion::{EnqueueJob, PRIORITY_DAILY_INCREMENTAL, PRIORITY_USER_ON_DEMAND, SnapshotInput},
     providers::{SourceMedia, SourceProviderConfig},
     qbittorrent::{QBittorrentClient, magnet_hash, normalize_hash},
     storage,
@@ -1775,69 +1775,66 @@ async fn sync_provider(
     State(state): State<AppState>,
     AxumPath(key): AxumPath<String>,
 ) -> AppResult<Json<Value>> {
-    start_source_sync(&state, &key, true).await?;
+    enqueue_source_sync(&state, &key, true).await?;
     provider_by_key(&state, &key).await
 }
 
 pub async fn schedule_source_sync(state: &AppState) -> anyhow::Result<()> {
-    recover_stale_source_syncs(state).await?;
     let rows = sqlx::query("SELECT pc.* FROM provider_config pc JOIN source_sync_state ss ON ss.provider_key=pc.provider_key WHERE pc.provider_type='source' AND pc.enabled=1 AND ss.status!='running' AND ss.next_run_at<=datetime('now') ORDER BY ss.next_run_at,pc.provider_key LIMIT 8")
         .fetch_all(&state.pool)
         .await?;
-    if let Some(provider) = rows
-        .iter()
-        .map(source_provider_from_row)
-        .find(|provider| provider.sync_enabled)
-    {
-        start_source_sync(state, &provider.key, false).await?;
+    for provider in rows.iter().map(source_provider_from_row) {
+        if provider.sync_enabled {
+            enqueue_source_sync(state, &provider.key, false).await?;
+        }
     }
     Ok(())
 }
 
-async fn recover_stale_source_syncs(state: &AppState) -> anyhow::Result<()> {
-    sqlx::query("UPDATE source_sync_run SET status='failed',error_message='服务重启或同步超时',finished_at=datetime('now') WHERE status='running' AND started_at<datetime('now','-1 hour')")
-        .execute(&state.pool)
+pub(crate) async fn recover_interrupted_source_syncs(state: &AppState) -> anyhow::Result<()> {
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query("UPDATE source_sync_run SET status='failed',error_message='worker interrupted by service restart',finished_at=datetime('now') WHERE status='running'")
+        .execute(&mut *transaction)
         .await?;
-    sqlx::query("UPDATE source_sync_state SET status='failed',last_finished_at=datetime('now'),last_message='服务重启或同步超时',failure_count=failure_count+1,next_run_at=datetime('now','+1 hour'),updated_at=datetime('now') WHERE status='running' AND last_started_at<datetime('now','-1 hour')")
-        .execute(&state.pool)
+    sqlx::query("UPDATE source_sync_state SET status='idle',last_finished_at=datetime('now'),last_message='上次同步被服务重启中断，已重新排队',lease_owner=NULL,lease_expires_at=NULL,updated_at=datetime('now') WHERE status='running'")
+        .execute(&mut *transaction)
         .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
-async fn start_source_sync(state: &AppState, key: &str, manual: bool) -> AppResult<()> {
-    recover_stale_source_syncs(state).await?;
+async fn enqueue_source_sync(state: &AppState, key: &str, manual: bool) -> AppResult<i64> {
     let provider = source_provider_by_key(state, key)
         .await?
         .ok_or(AppError::NotFound)?;
     if !manual && !provider.sync_enabled {
-        return Ok(());
+        return Ok(0);
     }
     sqlx::query("INSERT OR IGNORE INTO source_sync_state(provider_key) VALUES (?)")
         .bind(key)
         .execute(&state.pool)
         .await?;
-    let mut transaction = state.pool.begin().await?;
-    let claimed = sqlx::query("UPDATE source_sync_state SET status='running',last_started_at=datetime('now'),last_finished_at=NULL,last_message='正在采集最新目录',updated_at=datetime('now') WHERE provider_key=? AND status!='running'")
-        .bind(key)
-        .execute(&mut *transaction)
+    let dedupe_key = format!("source-sync:{key}");
+    let enqueued = state
+        .ingestion_queue
+        .enqueue(EnqueueJob {
+            provider_key: key,
+            job_type: "source_sync",
+            priority: if manual {
+                PRIORITY_USER_ON_DEMAND
+            } else {
+                PRIORITY_DAILY_INCREMENTAL
+            },
+            payload: json!({ "manual": manual }),
+            max_attempts: 3,
+            dedupe_key: Some(&dedupe_key),
+        })
         .await?;
-    if claimed.rows_affected() == 0 {
-        return Err(AppError::BadRequest("这个来源已经在同步中".into()));
-    }
-    let run_id: i64 = sqlx::query(
-        "INSERT INTO source_sync_run(provider_key,status) VALUES (?,'running') RETURNING id",
-    )
-    .bind(key)
-    .fetch_one(&mut *transaction)
-    .await?
-    .get("id");
-    transaction.commit().await?;
-
-    let task_state = state.clone();
-    tokio::spawn(async move {
-        run_source_sync(task_state, provider, run_id).await;
-    });
-    Ok(())
+    sqlx::query("UPDATE source_sync_state SET last_message=CASE WHEN status='running' THEN last_message ELSE '已加入持久同步队列' END,updated_at=datetime('now') WHERE provider_key=?")
+        .bind(key)
+        .execute(&state.pool)
+        .await?;
+    Ok(enqueued.id)
 }
 
 #[derive(Debug)]
@@ -1849,21 +1846,65 @@ struct SourceSyncStats {
     detail_failures: usize,
 }
 
-async fn run_source_sync(state: AppState, provider: SourceProviderConfig, run_id: i64) {
+pub(crate) async fn execute_source_sync_job(
+    state: &AppState,
+    key: &str,
+    manual: bool,
+    ingestion_job_id: i64,
+) -> anyhow::Result<()> {
+    let provider = source_provider_by_key(state, key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("source provider {key} no longer exists"))?;
+    if !manual && !provider.sync_enabled {
+        return Ok(());
+    }
+    let mut transaction = state.pool.begin().await?;
+    let source_lease_owner = format!("ingestion-job:{ingestion_job_id}");
+    sqlx::query("UPDATE source_sync_run SET status='failed',error_message='previous attempt did not finish',finished_at=datetime('now') WHERE status='running' AND ingestion_job_id=?")
+        .bind(ingestion_job_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("UPDATE source_sync_state SET status='idle',last_message='正在恢复未完成的同步任务',lease_owner=NULL,lease_expires_at=NULL,updated_at=datetime('now') WHERE provider_key=? AND status='running' AND lease_owner=?")
+        .bind(key)
+        .bind(&source_lease_owner)
+        .execute(&mut *transaction)
+        .await?;
+    let claimed = sqlx::query("UPDATE source_sync_state SET status='running',last_started_at=datetime('now'),last_finished_at=NULL,last_message='正在采集最新目录',lease_owner=?,lease_expires_at=datetime('now','+2 minutes'),updated_at=datetime('now') WHERE provider_key=? AND status!='running'")
+        .bind(source_lease_owner)
+        .bind(key)
+        .execute(&mut *transaction)
+        .await?;
+    anyhow::ensure!(
+        claimed.rows_affected() == 1,
+        "source provider {key} is already synchronizing"
+    );
+    let run_id: i64 = sqlx::query("INSERT INTO source_sync_run(provider_key,status,cursor_before_json,watermark_before_json,ingestion_job_id) SELECT provider_key,'running',cursor_json,watermark_json,? FROM source_sync_state WHERE provider_key=? RETURNING id")
+        .bind(ingestion_job_id)
+        .bind(key)
+        .fetch_one(&mut *transaction)
+        .await?
+        .get("id");
+    transaction.commit().await?;
+
     let permit = match state.crawler_limiter.clone().acquire_owned().await {
         Ok(permit) => permit,
         Err(error) => {
-            finish_source_sync_failure(&state, &provider, run_id, &error.to_string()).await;
-            return;
+            finish_source_sync_failure(state, &provider, run_id, &error.to_string()).await?;
+            return Err(error.into());
         }
     };
-    let outcome = synchronize_source_catalogue(&state, &provider).await;
+    let outcome = synchronize_source_catalogue(state, &provider).await;
     drop(permit);
     match outcome {
-        Ok(stats) => finish_source_sync_success(&state, &provider, run_id, &stats).await,
+        Ok(stats) => finish_source_sync_success(state, &provider, run_id, &stats).await,
         Err(error) => {
             tracing::warn!(%error, provider = provider.key, "source catalogue sync failed");
-            finish_source_sync_failure(&state, &provider, run_id, &error.to_string()).await;
+            if let Err(finish_error) =
+                finish_source_sync_failure(state, &provider, run_id, &error.to_string()).await
+            {
+                tracing::error!(%finish_error, provider = provider.key, "could not persist source sync failure");
+            }
+            Err(error)
         }
     }
 }
@@ -2031,7 +2072,7 @@ async fn finish_source_sync_success(
     provider: &SourceProviderConfig,
     run_id: i64,
     stats: &SourceSyncStats,
-) {
+) -> anyhow::Result<()> {
     let message = if stats.detail_failures == 0 {
         format!(
             "目录同步完成，收录 {} 项；更新 {} 项详情",
@@ -2044,18 +2085,12 @@ async fn finish_source_sync_success(
         )
     };
     let modifier = format!("+{} minutes", provider.sync_interval_minutes);
-    let result = async {
-        let mut transaction = state.pool.begin().await?;
-        sqlx::query("UPDATE source_sync_run SET status='success',item_count=?,inserted_count=?,updated_count=?,finished_at=datetime('now') WHERE id=?")
-            .bind(stats.item_count).bind(stats.inserted_count).bind(stats.updated_count).bind(run_id).execute(&mut *transaction).await?;
-        sqlx::query("UPDATE source_sync_state SET status='success',last_finished_at=datetime('now'),last_success_at=datetime('now'),next_run_at=datetime('now',?),last_message=?,failure_count=0,item_count=?,inserted_count=?,updated_count=?,updated_at=datetime('now') WHERE provider_key=?")
-            .bind(&modifier).bind(&message).bind(stats.item_count).bind(stats.inserted_count).bind(stats.updated_count).bind(&provider.key).execute(&mut *transaction).await?;
-        transaction.commit().await
-    }
-    .await;
-    if let Err(error) = result {
-        tracing::error!(%error, provider = provider.key, "could not persist source sync success");
-    }
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query("UPDATE source_sync_run SET status='success',item_count=?,inserted_count=?,updated_count=?,finished_at=datetime('now') WHERE id=?")
+        .bind(stats.item_count).bind(stats.inserted_count).bind(stats.updated_count).bind(run_id).execute(&mut *transaction).await?;
+    sqlx::query("UPDATE source_sync_state SET status='success',last_finished_at=datetime('now'),last_success_at=datetime('now'),next_run_at=datetime('now',?),last_message=?,failure_count=0,item_count=?,inserted_count=?,updated_count=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=datetime('now') WHERE provider_key=?")
+        .bind(&modifier).bind(&message).bind(stats.item_count).bind(stats.inserted_count).bind(stats.updated_count).bind(&provider.key).execute(&mut *transaction).await?;
+    transaction.commit().await?;
     storage::log(
         &state.pool,
         "info",
@@ -2068,6 +2103,7 @@ async fn finish_source_sync_success(
         "source-sync",
         json!({"providerKey":provider.key,"status":"success","message":message}),
     );
+    Ok(())
 }
 
 async fn finish_source_sync_failure(
@@ -2075,7 +2111,7 @@ async fn finish_source_sync_failure(
     provider: &SourceProviderConfig,
     run_id: i64,
     error: &str,
-) {
+) -> anyhow::Result<()> {
     let failure_count: i64 =
         sqlx::query_scalar("SELECT failure_count FROM source_sync_state WHERE provider_key=?")
             .bind(&provider.key)
@@ -2092,18 +2128,12 @@ async fn finish_source_sync_failure(
         _ => 720,
     };
     let modifier = format!("+{retry_minutes} minutes");
-    let result = async {
-        let mut transaction = state.pool.begin().await?;
-        sqlx::query("UPDATE source_sync_run SET status='failed',error_message=?,finished_at=datetime('now') WHERE id=?")
-            .bind(error).bind(run_id).execute(&mut *transaction).await?;
-        sqlx::query("UPDATE source_sync_state SET status='failed',last_finished_at=datetime('now'),next_run_at=datetime('now',?),last_message=?,failure_count=?,updated_at=datetime('now') WHERE provider_key=?")
-            .bind(&modifier).bind(error).bind(failure_count).bind(&provider.key).execute(&mut *transaction).await?;
-        transaction.commit().await
-    }
-    .await;
-    if let Err(persist_error) = result {
-        tracing::error!(%persist_error, provider = provider.key, "could not persist source sync failure");
-    }
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query("UPDATE source_sync_run SET status='failed',error_message=?,finished_at=datetime('now') WHERE id=?")
+        .bind(error).bind(run_id).execute(&mut *transaction).await?;
+    sqlx::query("UPDATE source_sync_state SET status='failed',last_finished_at=datetime('now'),next_run_at=datetime('now',?),last_message=?,failure_count=?,lease_owner=NULL,lease_expires_at=NULL,updated_at=datetime('now') WHERE provider_key=?")
+        .bind(&modifier).bind(error).bind(failure_count).bind(&provider.key).execute(&mut *transaction).await?;
+    transaction.commit().await?;
     storage::log(
         &state.pool,
         "warn",
@@ -2116,6 +2146,7 @@ async fn finish_source_sync_failure(
         "source-sync",
         json!({"providerKey":provider.key,"status":"failed","message":error}),
     );
+    Ok(())
 }
 
 async fn provider_by_key(state: &AppState, key: &str) -> AppResult<Json<Value>> {
@@ -4242,7 +4273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_source_sync_populates_the_local_search_index() {
+    async fn persistent_worker_sync_populates_the_local_search_index() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4285,22 +4316,42 @@ mod tests {
             fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
             provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
             snapshot_repository: std::sync::Arc::new(crate::ingestion::SnapshotRepository::new(
-                pool,
+                pool.clone(),
                 temp.join("source-cache"),
             )),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool),
         };
-        let provider = source_provider_by_key(&state, "mock-javbus")
-            .await
-            .unwrap()
-            .unwrap();
-        let stats = synchronize_source_catalogue(&state, &provider)
+        crate::ingestion::start_workers(state.clone());
+        let job_id = enqueue_source_sync(&state, "mock-javbus", true)
             .await
             .unwrap();
         server.await.unwrap();
-
-        assert_eq!(stats.item_count, 1);
-        assert_eq!(stats.inserted_count, 1);
-        assert_eq!(stats.detail_count, 1);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status: String =
+                    sqlx::query_scalar("SELECT status FROM ingestion_job WHERE id=?")
+                        .bind(job_id)
+                        .fetch_one(&state.pool)
+                        .await
+                        .unwrap();
+                if status == "succeeded" {
+                    break;
+                }
+                assert_ne!(status, "failed");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("persistent source sync job did not finish");
+        let sync_counts = sqlx::query(
+            "SELECT status,item_count,inserted_count FROM source_sync_state WHERE provider_key='mock-javbus'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(sync_counts.get::<String, _>("status"), "success");
+        assert_eq!(sync_counts.get::<i64, _>("item_count"), 1);
+        assert_eq!(sync_counts.get::<i64, _>("inserted_count"), 1);
         let resource_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource")
             .fetch_one(&state.pool)
             .await
@@ -4439,9 +4490,10 @@ mod tests {
             fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
             provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
             snapshot_repository: std::sync::Arc::new(crate::ingestion::SnapshotRepository::new(
-                pool,
+                pool.clone(),
                 temp.join("source-cache"),
             )),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool),
         };
         sqlx::query("UPDATE provider_config SET base_url='http://127.0.0.1:9',enabled=1 WHERE provider_type='source'")
             .execute(&state.pool)
@@ -4548,9 +4600,10 @@ mod tests {
             fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
             provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
             snapshot_repository: std::sync::Arc::new(crate::ingestion::SnapshotRepository::new(
-                pool,
+                pool.clone(),
                 temp.join("source-cache"),
             )),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool),
         };
         let first = request_acquisition(
             &state,
