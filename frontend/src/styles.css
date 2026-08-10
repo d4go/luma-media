@@ -581,8 +581,9 @@ body.luma-dark .state-chip { color:#b8bdc5; background:#282c31; }
 .attention-panel article p { margin:5px 0 0; color:var(--danger); font-size:9px; overflow-wrap:anywhere; }
 .attention-panel article > div { display:flex; gap:6px; }
 .acquisition-list { display:grid; gap:9px; }
-.acquisition-card { min-height:112px; padding:12px 15px 12px 12px; display:grid; grid-template-columns:60px minmax(0,1fr) 18px; align-items:center; gap:15px; color:var(--text); background:var(--surface); border:1px solid var(--hairline); border-radius:12px; text-decoration:none; transition:border-color .15s ease; }
+.acquisition-card { position:relative; min-height:112px; padding:12px 15px 12px 12px; display:grid; grid-template-columns:60px minmax(0,1fr) 18px; align-items:center; gap:15px; color:var(--text); background:var(--surface); border:1px solid var(--hairline); border-radius:12px; text-decoration:none; transition:border-color .15s ease; }
 .acquisition-card:hover { border-color:color-mix(in srgb,var(--accent) 40%,var(--hairline)); }
+.acquisition-delete { position:absolute; top:6px; right:6px; }
 .acquisition-poster { width:60px; height:86px; display:grid; place-items:center; overflow:hidden; color:var(--text-secondary); background:var(--surface-muted); border-radius:8px; }
 .acquisition-poster img { width:100%; height:100%; object-fit:cover; }
 .acquisition-copy { min-width:0; display:grid; }

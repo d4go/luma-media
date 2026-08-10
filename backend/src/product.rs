@@ -8,6 +8,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State},
+    http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post, put},
 };
@@ -68,7 +69,10 @@ pub fn router() -> Router<AppState> {
             "/acquisitions",
             get(list_acquisitions).post(create_acquisition),
         )
-        .route("/acquisitions/{id}", get(acquisition_detail))
+        .route(
+            "/acquisitions/{id}",
+            get(acquisition_detail).delete(delete_acquisition),
+        )
         .route("/acquisitions/{id}/pause", post(pause_acquisition))
         .route("/acquisitions/{id}/resume", post(resume_acquisition))
         .route("/acquisitions/{id}/retry", post(retry_acquisition))
@@ -990,6 +994,58 @@ async fn cancel_acquisition(
     }
     transition(&state, id, "CANCELLED", "获取已取消", json!({})).await?;
     Ok(Json(acquisition_by_id(&state, id).await?))
+}
+
+async fn delete_acquisition(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> AppResult<StatusCode> {
+    let item = acquisition_by_id(&state, id).await?;
+    let cancelled = item.state == "CANCELLED";
+    let qbit_missing = item.qbit_state.as_deref() == Some("missing");
+    if !cancelled && !qbit_missing {
+        return Err(AppError::BadRequest(
+            "只有已取消或 qBittorrent 中已删除的获取记录可以删除".into(),
+        ));
+    }
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("DELETE FROM acquisition_event WHERE acquisition_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM attention_item WHERE acquisition_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE library_item SET acquisition_id = NULL WHERE acquisition_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE automation_execution SET acquisition_id = NULL WHERE acquisition_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let result = sqlx::query("DELETE FROM acquisition WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    tx.commit().await?;
+    emit(
+        &state,
+        "acquisition.deleted",
+        json!({"acquisitionId": id}),
+    );
+    storage::log(
+        &state.pool,
+        "info",
+        "acquisition",
+        &format!("Deleted acquisition {}", id),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn reconcile_active(state: &AppState) -> anyhow::Result<()> {

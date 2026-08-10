@@ -65,6 +65,7 @@ export const api = {
   acquisitions: (status = '', page = 1, pageSize = 20) => request<Paged<Acquisition>>(`/acquisitions${pageQuery(page, pageSize, status ? { status } : {})}`),
   acquisition: (id: number, page = 1, pageSize = 20) => request<AcquisitionDetail>(`/acquisitions/${id}${pageQuery(page, pageSize)}`),
   acquisitionAction: (id: number, action: 'pause' | 'resume' | 'retry' | 'cancel') => request<Acquisition>(`/acquisitions/${id}/${action}`, { method: 'POST' }),
+  deleteAcquisition: (id: number) => request<void>(`/acquisitions/${id}`, { method: 'DELETE' }),
   attention: (page = 1, pageSize = 20) => request<Paged<AttentionItem>>(`/attention${pageQuery(page, pageSize)}`),
   attentionAction: (id: number, action: string) => request<{ resolved: boolean }>(`/attention/${id}/action`, { method: 'POST', body: JSON.stringify({ action }) }),
   library: (q = '', page = 1, pageSize = 20) => request<Paged<LibraryItem>>(`/library${pageQuery(page, pageSize, q ? { q } : {})}`),
