@@ -2,7 +2,7 @@ import type {
   BatchScrapeResponse, BatchTaskResponse, CrawlerForm, CrawlerResult, CrawlerRun, CrawlerScript,
   DashboardStats, DownloadItem, Folder, FolderInput, MediaItem, MetaTubeConnection, QBittorrentConnection,
   ScrapeOptions, ServiceStatus, Settings, Task, TaskDetail,
-  Acquisition, AcquisitionDetail, Actor, AttentionItem, AutomationRule, BrowserSession, CatalogResolveResponse, HomeData, LibraryExportResponse, LibraryItem, LibraryRematchResponse, MediaDetail, Paged, ProductMedia, ProductSettings, ProviderConfig, ProviderDiagnoseResponse, ProviderReparseResponse, ProviderRuntime, ResourceRefreshResponse, SearchResponse, SyncRunResponse,
+  Acquisition, AcquisitionDetail, Actor, AttentionItem, AutomationRule, BrowserSession, CatalogResolveResponse, HomeData, JobEvent, JobItem, JobRun, JobRunDetail, LibraryExportResponse, LibraryItem, LibraryRematchResponse, MediaDetail, Paged, ProductMedia, ProductSettings, ProviderConfig, ProviderDiagnoseResponse, ProviderReparseResponse, ProviderRuntime, ResourceRefreshResponse, SearchResponse, SyncRunResponse,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
@@ -150,6 +150,16 @@ export const api = {
     method: 'POST', body: JSON.stringify({ resultIds }),
   }),
   downloads: (page = 1, pageSize = 20) => request<Paged<DownloadItem>>(`/downloads${pageQuery(page, pageSize)}`),
+  jobs: (status = '', page = 1, pageSize = 20) => request<Paged<JobRun>>(`/jobs${pageQuery(page, pageSize, status ? { status } : {})}`),
+  job: (id: number) => request<JobRunDetail>(`/jobs/${id}`),
+  jobItems: (id: number, status = '', page = 1, pageSize = 20) => request<Paged<JobItem>>(`/jobs/${id}/items${pageQuery(page, pageSize, status ? { status } : {})}`),
+  jobEvents: (id: number, page = 1, pageSize = 20) => request<Paged<JobEvent>>(`/jobs/${id}/events${pageQuery(page, pageSize)}`),
+  pauseJob: (id: number) => request<JobRun>(`/jobs/${id}/pause`, { method: 'POST' }),
+  resumeJob: (id: number) => request<JobRun>(`/jobs/${id}/resume`, { method: 'POST' }),
+  cancelJob: (id: number) => request<JobRun>(`/jobs/${id}/cancel`, { method: 'POST' }),
+  retryFailedJobs: (id: number) => request<JobRun>(`/jobs/${id}/retry-failed`, { method: 'POST' }),
+  createBootstrapJob: (input: { providerKey: string; from: string; to: string; includeResources: boolean }) => request<{ run: JobRun }>('/jobs/bootstrap', { method: 'POST', body: JSON.stringify(input) }),
+  createIncrementalJob: (input: { providerKey: string; from: string; to: string; includeResources: boolean }) => request<{ run: JobRun }>('/jobs/incremental', { method: 'POST', body: JSON.stringify(input) }),
   pauseDownload: (hash: string) => request<void>(`/downloads/${encodeURIComponent(hash)}/pause`, { method: 'POST' }),
   resumeDownload: (hash: string) => request<void>(`/downloads/${encodeURIComponent(hash)}/resume`, { method: 'POST' }),
   removeDownload: (hash: string) => request<void>(`/downloads/${encodeURIComponent(hash)}`, { method: 'DELETE' }),

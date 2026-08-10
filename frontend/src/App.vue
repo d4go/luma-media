@@ -2,7 +2,7 @@
 import { computed, h, onMounted, onUnmounted, provide, ref, watch } from 'vue'
 import { darkTheme, dateZhCN, NButton, NConfigProvider, NDialogProvider, NIcon, NInput, NLoadingBarProvider, NMenu, NMessageProvider, NTooltip, zhCN, type GlobalThemeOverrides, type MenuOption } from 'naive-ui'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
-import { IconAutomation, IconBooks, IconDownload, IconHome, IconMenu2, IconMoon, IconRefresh, IconSearch, IconSettings, IconSparkles, IconSun, IconX } from '@tabler/icons-vue'
+import { IconAutomation, IconBooks, IconDownload, IconHome, IconList, IconMenu2, IconMoon, IconRefresh, IconSearch, IconSettings, IconSparkles, IconSun, IconX } from '@tabler/icons-vue'
 import { api } from './api'
 import { serviceStatusKey } from './service-status'
 import type { ServiceHealth, ServiceStatus } from './types'
@@ -24,6 +24,7 @@ const menuOptions: MenuOption[] = [
   { label: renderLink('首页', '/'), key: '/', icon: renderIcon(IconHome) },
   { label: renderLink('资源', '/resources'), key: '/resources', icon: renderIcon(IconSparkles) },
   { label: renderLink('下载', '/downloads'), key: '/downloads', icon: renderIcon(IconDownload) },
+  { label: renderLink('任务', '/tasks'), key: '/tasks', icon: renderIcon(IconList) },
   { label: renderLink('媒体库', '/library'), key: '/library', icon: renderIcon(IconBooks) },
   { label: renderLink('自动化', '/automation'), key: '/automation', icon: renderIcon(IconAutomation) },
   { label: renderLink('设置', '/settings'), key: '/settings', icon: renderIcon(IconSettings) },

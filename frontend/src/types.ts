@@ -6,6 +6,65 @@ export interface Paged<T> {
   totalPages: number
 }
 
+export type JobStatus = 'pending' | 'running' | 'pausing' | 'paused' | 'cancelling' | 'cancelled' | 'success' | 'failed'
+export type JobItemStatus = 'pending' | 'running' | 'success' | 'failed' | 'skipped' | 'cancelled'
+
+export interface JobRun {
+  id: number
+  jobDefinitionId: number | null
+  jobType: string
+  providerKey: string | null
+  status: JobStatus
+  idempotencyKey: string
+  priority: number
+  config: Record<string, unknown>
+  progressCurrent: number
+  progressTotal: number | null
+  checkpoint: unknown
+  errorMessage: string | null
+  startedAt: string | null
+  finishedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface JobRunStats {
+  success: number
+  failed: number
+  skipped: number
+  pending: number
+  running: number
+  cancelled: number
+}
+
+export interface JobRunDetail {
+  run: JobRun
+  stats: JobRunStats
+}
+
+export interface JobItem {
+  id: number
+  runId: number
+  itemKey: string
+  status: JobItemStatus
+  retryCount: number
+  checkpoint: unknown
+  errorMessage: string | null
+  startedAt: string | null
+  finishedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface JobEvent {
+  id: number
+  runId: number
+  eventKey: string
+  message: string
+  payload: unknown
+  createdAt: string
+}
+
 export interface Folder {
   id: number
   name: string
