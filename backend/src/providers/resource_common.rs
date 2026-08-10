@@ -122,14 +122,14 @@ pub fn parse_magnet_candidates(
                 candidate.info_hash.as_deref() == Some(&info_hash)
             })
         {
+            let size_bytes = parse_size_bytes(&title);
+            if existing.size_bytes.is_none() && size_bytes.is_some() {
+                existing.size_bytes = size_bytes;
+            }
             if resource_label_score(&title, default_label)
                 > resource_label_score(&existing.title, default_label)
             {
-                let size_bytes = parse_size_bytes(&title);
                 existing.title = title;
-                if size_bytes.is_some() {
-                    existing.size_bytes = size_bytes;
-                }
             }
             continue;
         }
@@ -288,5 +288,19 @@ mod tests {
             resources[0].download_url,
             "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=ABC-123"
         );
+    }
+
+    #[test]
+    fn merges_size_from_repeated_javbus_magnet_cells() {
+        let html = r#"
+            <table><tr>
+                <td><a href="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567">ABC-123</a></td>
+                <td><a href="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567">4.57GB</a></td>
+            </tr></table>
+        "#;
+        let resources = parse_magnet_candidates(html, "resource", "https://source.test/item");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].title, "ABC-123");
+        assert_eq!(resources[0].size_bytes, Some(4_907_000_136));
     }
 }
