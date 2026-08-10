@@ -33,6 +33,7 @@ use crate::{
     providers::{
         ProviderContext, ProviderMediaRef, RawProviderDocument, ResourceCandidate, SourceMedia,
         SourceProviderConfig,
+        runtime::{GateBlocked, ProviderExecutionGuard},
     },
     qbittorrent::{QBittorrentClient, magnet_hash, normalize_hash},
     storage,
@@ -3560,6 +3561,7 @@ async fn fetch_source_catalogue_page(
     provider: &SourceProviderConfig,
     page_url: &str,
 ) -> anyhow::Result<SourceCataloguePage> {
+    gate_provider(state, provider).await?;
     let url = validate_provider_page_url(provider, page_url)?;
     let response = match provider.adapter.as_str() {
         "javbus" => {
@@ -3813,14 +3815,25 @@ async fn source_fetch(
     provider: &SourceProviderConfig,
     url: reqwest::Url,
 ) -> anyhow::Result<FetchResponse> {
-    Ok(state
+    let guard = ProviderExecutionGuard::new(&state.pool, &provider.key, provider.fetch_mode);
+    match state
         .fetch_manager
         .fetch(
             provider.fetch_mode,
             FetchRequest::get(&provider.key, url),
             &provider.transport(),
         )
-        .await?)
+        .await
+    {
+        Ok(response) => {
+            let _ = guard.after_success().await;
+            Ok(response)
+        }
+        Err(error) => {
+            let _ = guard.after_fetch_failure(error.kind, &error.message).await;
+            Err(error.into())
+        }
+    }
 }
 
 async fn ensure_provider_content(
@@ -3834,11 +3847,15 @@ async fn ensure_provider_content(
     let kind = state
         .provider_registry
         .classify(&provider.adapter, response);
-    anyhow::ensure!(
-        kind == PageKind::ValidContent,
-        "{} returned {kind:?} instead of valid provider content",
-        provider.display_name
-    );
+    if kind != PageKind::ValidContent {
+        let message = format!(
+            "{} returned {kind:?} instead of valid provider content",
+            provider.display_name
+        );
+        let guard = ProviderExecutionGuard::new(&state.pool, &provider.key, provider.fetch_mode);
+        let _ = guard.after_page_failure(kind, &message).await;
+        anyhow::bail!(message);
+    }
     state
         .snapshot_repository
         .store(SnapshotInput {
@@ -4082,22 +4099,54 @@ fn javbus_cookie(provider: &SourceProviderConfig, session: &[String]) -> String 
     parts.join("; ")
 }
 
+async fn gate_provider(state: &AppState, provider: &SourceProviderConfig) -> anyhow::Result<()> {
+    let guard = ProviderExecutionGuard::new(&state.pool, &provider.key, provider.fetch_mode);
+    let decision = guard.before_fetch().await?;
+    if decision.allows_request() {
+        Ok(())
+    } else {
+        Err(anyhow::Error::new(GateBlocked {
+            provider_key: provider.key.clone(),
+            decision,
+        }))
+    }
+}
+
+async fn record_javbus_fetch(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    result: &Result<FetchResponse, FetchError>,
+) {
+    let guard = ProviderExecutionGuard::new(&state.pool, &provider.key, provider.fetch_mode);
+    match result {
+        Ok(_) => {
+            let _ = guard.after_success().await;
+        }
+        Err(error) => {
+            let _ = guard.after_fetch_failure(error.kind, &error.message).await;
+        }
+    }
+}
+
 async fn javbus_request(
     state: &AppState,
     provider: &SourceProviderConfig,
     url: reqwest::Url,
 ) -> anyhow::Result<FetchResponse> {
+    gate_provider(state, provider).await?;
     let initial_cookie = javbus_cookie(provider, &[]);
     let mut transport = provider.transport();
     transport.cookie = Some(initial_cookie.clone());
-    let response = state
+    let first_result = state
         .fetch_manager
         .fetch(
             provider.fetch_mode,
             FetchRequest::get(&provider.key, url.clone()),
             &transport,
         )
-        .await?;
+        .await;
+    record_javbus_fetch(state, provider, &first_result).await;
+    let response = first_result?;
     if !is_javbus_age_page(&response.body) {
         return Ok(response);
     }
@@ -4132,14 +4181,16 @@ async fn javbus_request(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     transport.cookie = Some(javbus_cookie(provider, &session));
-    let retried = state
+    let retried_result = state
         .fetch_manager
         .fetch(
             provider.fetch_mode,
             FetchRequest::get(&provider.key, url),
             &transport,
         )
-        .await?;
+        .await;
+    record_javbus_fetch(state, provider, &retried_result).await;
+    let retried = retried_result?;
     if is_javbus_age_page(&retried.body) {
         anyhow::bail!("JavBus 要求年龄验证，请在该来源中填写可用 Cookie 或更换镜像");
     }
@@ -4631,6 +4682,7 @@ async fn fetch_and_persist_resources(
     raw_document: Option<RawProviderDocument>,
     allow_resource_endpoint: bool,
 ) -> anyhow::Result<usize> {
+    gate_provider(state, provider).await?;
     let resource_provider = state
         .provider_registry
         .resource_provider(&provider.adapter)
@@ -4671,6 +4723,7 @@ async fn refresh_javbus_media(
     include_resources: bool,
     allow_resource_endpoint: bool,
 ) -> anyhow::Result<usize> {
+    gate_provider(state, provider).await?;
     let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
     let url = reqwest::Url::parse(source_url)
         .or_else(|_| base.join(source_url))
@@ -4735,6 +4788,7 @@ async fn refresh_generic_source_media(
     include_resources: bool,
     allow_resource_endpoint: bool,
 ) -> anyhow::Result<usize> {
+    gate_provider(state, provider).await?;
     let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
     let url = reqwest::Url::parse(source_url).or_else(|_| match provider.adapter.as_str() {
         "javdb" => base.join(&format!("/v/{provider_id}")),

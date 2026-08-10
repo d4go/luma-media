@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::AppState;
+use crate::providers::runtime::{GateBlocked, GateDecision};
 
 use super::{IngestionJob, PRIORITY_HISTORICAL_BOOTSTRAP};
 
@@ -107,26 +108,52 @@ async fn run_claimed_job(state: &AppState, owner: &str, job: IngestionJob) {
             }
         },
         Err(error) => {
-            let delay = retry_delay(job.attempts);
-            tracing::warn!(%error, job_id = job.id, retry_seconds = delay.as_secs(), "ingestion job failed");
-            match state
-                .ingestion_queue
-                .fail(job.id, owner, &error.to_string(), delay)
-                .await
-            {
-                Ok(true) => {
-                    if let Err(settle_error) =
-                        crate::product::settle_ingestion_job(state, &job).await
-                    {
-                        tracing::error!(%settle_error, job_id = job.id, "could not settle ingestion run after job failure");
-                    }
-                }
-                Ok(false) => tracing::error!(
+            if let Some(blocked) = error.downcast_ref::<GateBlocked>() {
+                let delay = gate_defer_delay(blocked.decision);
+                tracing::info!(
                     job_id = job.id,
-                    "failed ingestion job no longer owned by worker"
-                ),
-                Err(persist_error) => {
-                    tracing::error!(%persist_error, job_id = job.id, "could not persist ingestion job failure")
+                    decision = ?blocked.decision,
+                    defer_seconds = delay.as_secs(),
+                    "ingestion job deferred by provider runtime gate"
+                );
+                match state
+                    .ingestion_queue
+                    .defer(job.id, owner, delay, &error.to_string())
+                    .await
+                {
+                    Ok(true) => return,
+                    Ok(false) => tracing::error!(
+                        job_id = job.id,
+                        "deferred ingestion job no longer owned by worker"
+                    ),
+                    Err(persist_error) => tracing::error!(
+                        %persist_error,
+                        job_id = job.id,
+                        "could not defer ingestion job"
+                    ),
+                }
+            } else {
+                let delay = retry_delay(job.attempts);
+                tracing::warn!(%error, job_id = job.id, retry_seconds = delay.as_secs(), "ingestion job failed");
+                match state
+                    .ingestion_queue
+                    .fail(job.id, owner, &error.to_string(), delay)
+                    .await
+                {
+                    Ok(true) => {
+                        if let Err(settle_error) =
+                            crate::product::settle_ingestion_job(state, &job).await
+                        {
+                            tracing::error!(%settle_error, job_id = job.id, "could not settle ingestion run after job failure");
+                        }
+                    }
+                    Ok(false) => tracing::error!(
+                        job_id = job.id,
+                        "failed ingestion job no longer owned by worker"
+                    ),
+                    Err(persist_error) => {
+                        tracing::error!(%persist_error, job_id = job.id, "could not persist ingestion job failure")
+                    }
                 }
             }
         }
@@ -168,5 +195,14 @@ fn retry_delay(attempts: i64) -> Duration {
         0 | 1 => Duration::from_secs(60),
         2 => Duration::from_secs(5 * 60),
         _ => Duration::from_secs(30 * 60),
+    }
+}
+
+fn gate_defer_delay(decision: GateDecision) -> Duration {
+    match decision {
+        GateDecision::Cooldown => Duration::from_secs(2 * 60),
+        GateDecision::InteractionRequired => Duration::from_secs(15 * 60),
+        GateDecision::Unavailable => Duration::from_secs(5 * 60),
+        GateDecision::Allow | GateDecision::AllowDegraded => Duration::from_secs(60),
     }
 }

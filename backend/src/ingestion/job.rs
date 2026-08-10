@@ -187,6 +187,32 @@ impl IngestionQueue {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Requeue a job without counting a retry attempt (provider cooldown,
+    /// interaction required, or transient unavailability). The job stays
+    /// pending and becomes claimable again after `delay`.
+    pub async fn defer(
+        &self,
+        id: i64,
+        lease_owner: &str,
+        delay: Duration,
+        reason: &str,
+    ) -> sqlx::Result<bool> {
+        let modifier = format!("+{} seconds", delay.as_secs());
+        // Defer must not consume a retry attempt: the claim already incremented
+        // attempts, so roll it back before parking the job.
+        let result = sqlx::query("UPDATE ingestion_job SET status='pending',available_at=datetime('now',?),lease_owner=NULL,lease_expires_at=NULL,last_error=?,attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END,finished_at=NULL,updated_at=datetime('now') WHERE id=? AND status='running' AND lease_owner=?")
+            .bind(modifier)
+            .bind(reason)
+            .bind(id)
+            .bind(lease_owner)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 1 {
+            self.notify.notify_one();
+        }
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn recover_startup(&self) -> sqlx::Result<u64> {
         let result = sqlx::query("UPDATE ingestion_job SET status=CASE WHEN attempts<max_attempts THEN 'pending' ELSE 'failed' END,available_at=datetime('now'),lease_owner=NULL,lease_expires_at=NULL,last_error='worker interrupted by service restart',finished_at=CASE WHEN attempts<max_attempts THEN NULL ELSE datetime('now') END,updated_at=datetime('now') WHERE status='running'")
             .execute(&self.pool)
@@ -371,5 +397,41 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_job_keeps_attempts_and_stays_claimable() {
+        let queue = queue().await;
+        let enqueued = queue
+            .enqueue(EnqueueJob {
+                provider_key: "javdb",
+                job_type: "discovery",
+                priority: PRIORITY_HISTORICAL_BOOTSTRAP,
+                payload: serde_json::json!({}),
+                max_attempts: 3,
+                dedupe_key: Some("test:defer"),
+            })
+            .await
+            .unwrap();
+        let claimed = queue
+            .claim("worker-a", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.attempts, 1);
+
+        assert!(
+            queue
+                .defer(claimed.id, "worker-a", Duration::ZERO, "gate:cooldown")
+                .await
+                .unwrap()
+        );
+        let resumed = queue
+            .claim("worker-b", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.id, enqueued.id);
+        assert_eq!(resumed.attempts, 1);
     }
 }
