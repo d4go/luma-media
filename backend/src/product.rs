@@ -21,6 +21,7 @@ use crate::{
     AppState,
     error::{AppError, AppResult},
     fetch::{FetchError, FetchMethod, FetchRequest, FetchResponse, PageKind},
+    ingestion::SnapshotInput,
     providers::{SourceMedia, SourceProviderConfig},
     qbittorrent::{QBittorrentClient, magnet_hash, normalize_hash},
     storage,
@@ -1985,7 +1986,7 @@ async fn fetch_source_catalogue(
     match provider.adapter.as_str() {
         "javbus" => {
             let response = javbus_request(state, provider, base).await?;
-            ensure_provider_content(state, provider, &response)?;
+            ensure_provider_content(state, provider, &response, "catalogue", None, None).await?;
             Ok(parse_javbus_search_html(
                 &response.body,
                 "",
@@ -1994,7 +1995,7 @@ async fn fetch_source_catalogue(
         }
         "javdb" => {
             let response = source_fetch(state, provider, base).await?;
-            ensure_provider_content(state, provider, &response)?;
+            ensure_provider_content(state, provider, &response, "catalogue", None, None).await?;
             Ok(parse_javdb_search_html(
                 &response.body,
                 "",
@@ -2003,7 +2004,7 @@ async fn fetch_source_catalogue(
         }
         "jav321" => {
             let response = source_fetch(state, provider, base).await?;
-            ensure_provider_content(state, provider, &response)?;
+            ensure_provider_content(state, provider, &response, "catalogue", None, None).await?;
             Ok(parse_jav321_html(
                 &response.body,
                 "",
@@ -2013,7 +2014,7 @@ async fn fetch_source_catalogue(
         }
         "javlibrary" => {
             let response = source_fetch(state, provider, base).await?;
-            ensure_provider_content(state, provider, &response)?;
+            ensure_provider_content(state, provider, &response, "catalogue", None, None).await?;
             Ok(parse_javlibrary_html(
                 &response.body,
                 "",
@@ -2211,7 +2212,7 @@ async fn source_probe(state: &AppState, provider: &SourceProviderConfig) -> anyh
     } else {
         source_fetch(state, provider, base).await?
     };
-    ensure_provider_content(state, provider, &response)
+    ensure_provider_content(state, provider, &response, "probe", None, None).await
 }
 
 async fn source_fetch(
@@ -2229,10 +2230,13 @@ async fn source_fetch(
         .await?)
 }
 
-fn ensure_provider_content(
+async fn ensure_provider_content(
     state: &AppState,
     provider: &SourceProviderConfig,
     response: &FetchResponse,
+    entity_type: &str,
+    provider_entity_id: Option<&str>,
+    media_id: Option<i64>,
 ) -> anyhow::Result<()> {
     let kind = state
         .provider_registry
@@ -2242,6 +2246,19 @@ fn ensure_provider_content(
         "{} returned {kind:?} instead of valid provider content",
         provider.display_name
     );
+    state
+        .snapshot_repository
+        .store(SnapshotInput {
+            provider_key: &provider.key,
+            entity_type,
+            provider_entity_id,
+            media_id,
+            source_url: response.final_url.as_str(),
+            response,
+            raw_json: json!({ "pageKind": "valid_content" }),
+            parser_version: "1",
+        })
+        .await?;
     Ok(())
 }
 
@@ -2933,7 +2950,15 @@ async fn refresh_javbus_media(
         .or_else(|_| base.join(source_url))
         .or_else(|_| base.join(provider_id))?;
     let response = javbus_request(state, provider, url.clone()).await?;
-    ensure_provider_content(state, provider, &response)?;
+    ensure_provider_content(
+        state,
+        provider,
+        &response,
+        "detail",
+        Some(provider_id),
+        Some(media_id),
+    )
+    .await?;
     let html = response.body;
     let title = meta_content(&html, "og:title");
     let poster = meta_content(&html, "og:image");
@@ -2944,7 +2969,7 @@ async fn refresh_javbus_media(
         upsert_media_title_alias(state, media_id, title, None, &provider.key, true).await?;
     }
     persist_source_actors(state, media_id, &provider.key, &html, "/star/").await?;
-    let magnets = fetch_javbus_magnets(state, provider, &url, &html).await?;
+    let magnets = fetch_javbus_magnets(state, provider, media_id, provider_id, &url, &html).await?;
     for (index, (url, label)) in magnets.iter().enumerate() {
         let info_hash = magnet_hash(url);
         let (score, reasons) = rank_resource(label, None, "", &provider.display_name);
@@ -2969,7 +2994,15 @@ async fn refresh_generic_source_media(
         _ => base.join(source_url),
     })?;
     let response = source_fetch(state, provider, url).await?;
-    ensure_provider_content(state, provider, &response)?;
+    ensure_provider_content(
+        state,
+        provider,
+        &response,
+        "detail",
+        Some(provider_id),
+        Some(media_id),
+    )
+    .await?;
     let html = response.body;
     let actor_marker = if provider.adapter == "javdb" {
         "/actors/"
@@ -3014,6 +3047,8 @@ async fn persist_source_detail_html(
 async fn fetch_javbus_magnets(
     state: &AppState,
     provider: &SourceProviderConfig,
+    media_id: i64,
+    provider_id: &str,
     detail_url: &reqwest::Url,
     html: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
@@ -3042,7 +3077,24 @@ async fn fetch_javbus_magnets(
         .fetch_manager
         .fetch(provider.fetch_mode, request, &transport)
         .await?;
-    Ok(parse_magnets(&response.body))
+    let magnets = parse_magnets(&response.body);
+    state
+        .snapshot_repository
+        .store(SnapshotInput {
+            provider_key: &provider.key,
+            entity_type: "resource",
+            provider_entity_id: Some(provider_id),
+            media_id: Some(media_id),
+            source_url: response.final_url.as_str(),
+            response: &response,
+            raw_json: json!({
+                "resourceState": if magnets.is_empty() { "resource_empty" } else { "resource_found" },
+                "resourceCount": magnets.len(),
+            }),
+            parser_version: "1",
+        })
+        .await?;
+    Ok(magnets)
 }
 
 fn extract_js_value(html: &str, name: &str) -> Option<String> {
@@ -3153,6 +3205,79 @@ fn meta_content(html: &str, property: &str) -> Option<String> {
     let end = char_boundary_before(html, at + 600);
     extract_attribute(&html[at..end], "content=")
 }
+
+pub(crate) fn reparse_provider_snapshot(
+    adapter: &str,
+    entity_type: &str,
+    final_url: &reqwest::Url,
+    body: &str,
+    page_kind: PageKind,
+) -> serde_json::Value {
+    if page_kind != PageKind::ValidContent && entity_type != "resource" {
+        return json!({
+            "pageKind": page_kind,
+            "entityType": entity_type,
+            "parsed": false,
+        });
+    }
+    if entity_type == "resource" {
+        let resources = parse_magnets(body);
+        return json!({
+            "pageKind": page_kind,
+            "entityType": entity_type,
+            "parsed": true,
+            "resourceCount": resources.len(),
+            "resourceHashes": resources
+                .iter()
+                .filter_map(|(url, _)| magnet_hash(url))
+                .take(40)
+                .collect::<Vec<_>>(),
+        });
+    }
+    if entity_type == "detail" {
+        let actor_marker = if adapter == "javdb" {
+            "/actors/"
+        } else {
+            "/star/"
+        };
+        return json!({
+            "pageKind": page_kind,
+            "entityType": entity_type,
+            "parsed": true,
+            "title": meta_content(body, "og:title"),
+            "posterUrl": meta_content(body, "og:image"),
+            "actorReferenceCount": body.matches(actor_marker).count().min(40),
+            "embeddedResourceCount": parse_magnets(body).len(),
+        });
+    }
+
+    let base_url = final_url.as_str();
+    let candidates = match adapter {
+        "javbus" => parse_javbus_search_html(body, "", base_url),
+        "javdb" => parse_javdb_search_html(body, "", base_url),
+        "jav321" => parse_jav321_html(body, "", base_url, final_url),
+        "javlibrary" => parse_javlibrary_html(body, "", base_url, final_url),
+        _ => Vec::new(),
+    };
+    json!({
+        "pageKind": page_kind,
+        "entityType": entity_type,
+        "parsed": true,
+        "candidateCount": candidates.len(),
+        "candidates": candidates
+            .iter()
+            .take(40)
+            .map(|item| json!({
+                "providerEntityId": item.provider_id,
+                "code": item.code,
+                "title": item.title,
+                "posterUrl": item.poster_url,
+                "sourceUrl": item.source_url,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn extract_link_text(html: &str, marker: &str) -> Option<String> {
     let at = html.find(marker)?;
     let tail = &html[at..];
@@ -4076,6 +4201,23 @@ mod tests {
     }
 
     #[test]
+    fn cached_catalogue_can_be_reparsed_without_network_access() {
+        let html = r#"<a class="movie-box" href="/ABC-123"><div class="photo-frame"><img src="/cover.jpg" title="ABC-123 Offline title"></div></a>"#;
+        let final_url = reqwest::Url::parse("https://www.javbus.com/").unwrap();
+        let output = reparse_provider_snapshot(
+            "javbus",
+            "catalogue",
+            &final_url,
+            html,
+            PageKind::ValidContent,
+        );
+        assert_eq!(output["parsed"], true);
+        assert_eq!(output["candidateCount"], 1);
+        assert_eq!(output["candidates"][0]["code"], "abc-123");
+        assert_eq!(output["candidates"][0]["title"], "ABC-123 Offline title");
+    }
+
+    #[test]
     fn javbus_age_gate_is_detected() {
         assert!(is_javbus_age_page(
             "<title>Age Verification JavBus</title><a href='/doc/driver-verify'>verify</a>"
@@ -4134,7 +4276,7 @@ mod tests {
             .unwrap();
         let temp = std::env::temp_dir().join(format!("luma-source-sync-{}", chrono_like_nonce()));
         let state = AppState {
-            pool,
+            pool: pool.clone(),
             scrape_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             crawler_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             asset_root: temp.join("assets"),
@@ -4142,6 +4284,10 @@ mod tests {
             events: tokio::sync::broadcast::channel(32).0,
             fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
             provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
+            snapshot_repository: std::sync::Arc::new(crate::ingestion::SnapshotRepository::new(
+                pool,
+                temp.join("source-cache"),
+            )),
         };
         let provider = source_provider_by_key(&state, "mock-javbus")
             .await
@@ -4284,7 +4430,7 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let temp = std::env::temp_dir().join(format!("luma-alias-test-{}", chrono_like_nonce()));
         let state = AppState {
-            pool,
+            pool: pool.clone(),
             scrape_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             crawler_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             asset_root: temp.join("assets"),
@@ -4292,6 +4438,10 @@ mod tests {
             events: tokio::sync::broadcast::channel(32).0,
             fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
             provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
+            snapshot_repository: std::sync::Arc::new(crate::ingestion::SnapshotRepository::new(
+                pool,
+                temp.join("source-cache"),
+            )),
         };
         sqlx::query("UPDATE provider_config SET base_url='http://127.0.0.1:9',enabled=1 WHERE provider_type='source'")
             .execute(&state.pool)
@@ -4389,7 +4539,7 @@ mod tests {
         let resource_id: i64 = sqlx::query("INSERT INTO resource(media_id,provider_key,title,download_url,score) VALUES (?,'mock','ABC-123 1080p','magnet:?xt=urn:btih:ABC123',90) RETURNING id").bind(media_id).fetch_one(&pool).await.unwrap().get("id");
         let temp = std::env::temp_dir().join(format!("luma-product-test-{}", chrono_like_nonce()));
         let state = AppState {
-            pool,
+            pool: pool.clone(),
             scrape_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             crawler_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             asset_root: temp.join("assets"),
@@ -4397,6 +4547,10 @@ mod tests {
             events: tokio::sync::broadcast::channel(32).0,
             fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
             provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
+            snapshot_repository: std::sync::Arc::new(crate::ingestion::SnapshotRepository::new(
+                pool,
+                temp.join("source-cache"),
+            )),
         };
         let first = request_acquisition(
             &state,

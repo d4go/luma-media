@@ -3,6 +3,7 @@ mod asset;
 mod crawler;
 mod error;
 mod fetch;
+mod ingestion;
 mod metadata;
 mod models;
 mod product;
@@ -35,6 +36,7 @@ pub struct AppState {
     pub events: broadcast::Sender<String>,
     pub fetch_manager: Arc<fetch::FetchManager>,
     pub provider_registry: Arc<providers::ProviderRegistry>,
+    pub snapshot_repository: Arc<ingestion::SnapshotRepository>,
 }
 
 #[tokio::main]
@@ -54,13 +56,15 @@ async fn main() -> anyhow::Result<()> {
     let data_root = PathBuf::from(env::var("LUMA_DATA_DIR").unwrap_or_else(|_| "data".into()));
     let asset_root = data_root.join("assets");
     let script_root = data_root.join("crawlers");
+    let source_cache_root = data_root.join("source-cache");
     tokio::fs::create_dir_all(asset_root.join("poster")).await?;
     tokio::fs::create_dir_all(script_root.join("runs")).await?;
     tokio::fs::create_dir_all(script_root.join("scripts")).await?;
+    tokio::fs::create_dir_all(&source_cache_root).await?;
     let pool = storage::connect(&database_url).await?;
     let (events, _) = broadcast::channel(512);
     let state = AppState {
-        pool,
+        pool: pool.clone(),
         scrape_limiter: Arc::new(Semaphore::new(8)),
         crawler_limiter: Arc::new(Semaphore::new(2)),
         asset_root,
@@ -68,6 +72,10 @@ async fn main() -> anyhow::Result<()> {
         events,
         fetch_manager: Arc::new(fetch::FetchManager::default()),
         provider_registry: Arc::new(providers::ProviderRegistry::default()),
+        snapshot_repository: Arc::new(ingestion::SnapshotRepository::new(
+            pool.clone(),
+            source_cache_root,
+        )),
     };
     scheduler::start(state.clone());
     let _watcher = watcher::start(state.clone());

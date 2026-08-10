@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State},
     routing::{get, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     AppState,
@@ -12,6 +12,7 @@ use crate::{
         BrowserSessionView, FetchError, FetchFailureKind, FetchMethod, FetchMode, FetchRequest,
         FetchResponse, PageKind,
     },
+    ingestion::SnapshotInput,
 };
 
 use super::{SourceProviderConfig, runtime};
@@ -20,6 +21,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/providers/{key}/runtime", get(get_runtime))
         .route("/providers/{key}/diagnose", post(diagnose))
+        .route("/providers/{key}/reparse", post(reparse_snapshots))
         .route(
             "/providers/{key}/browser-session",
             post(start_browser_session),
@@ -240,21 +242,45 @@ async fn diagnose_mode(
     mode: FetchMode,
     url: reqwest::Url,
 ) -> DiagnoseAttempt {
+    let source_url = url.to_string();
     match fetch_for_diagnose(state, provider, mode, url).await {
         Ok(response) => {
             let page_kind = state
                 .provider_registry
                 .classify(&provider.adapter, &response);
+            let snapshot_error = if page_kind == PageKind::ValidContent {
+                state
+                    .snapshot_repository
+                    .store(SnapshotInput {
+                        provider_key: &provider.key,
+                        entity_type: "diagnose",
+                        provider_entity_id: None,
+                        media_id: None,
+                        source_url: &source_url,
+                        response: &response,
+                        raw_json: serde_json::json!({ "pageKind": "valid_content" }),
+                        parser_version: "1",
+                    })
+                    .await
+                    .err()
+                    .map(|error| format!("could not save provider snapshot: {error}"))
+            } else {
+                None
+            };
+            let snapshot_failed = snapshot_error.is_some();
             DiagnoseAttempt {
                 attempted: true,
-                success: page_kind == PageKind::ValidContent,
+                success: page_kind == PageKind::ValidContent && !snapshot_failed,
                 status: response.status,
                 page_kind: Some(page_kind),
                 final_url: Some(response.final_url.to_string()),
                 elapsed_ms: Some(response.elapsed_ms),
-                error: (page_kind != PageKind::ValidContent)
-                    .then(|| format!("provider returned {page_kind:?}")),
-                failure_kind: None,
+                error: snapshot_error.or_else(|| {
+                    (page_kind != PageKind::ValidContent)
+                        .then(|| format!("provider returned {page_kind:?}"))
+                }),
+                failure_kind: (page_kind == PageKind::ValidContent && snapshot_failed)
+                    .then_some(FetchFailureKind::InvalidContent),
             }
         }
         Err(error) => {
@@ -278,6 +304,111 @@ async fn diagnose_mode(
             }
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReparseInput {
+    parser_version: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReparseResponse {
+    provider: String,
+    parser_version: String,
+    scanned: usize,
+    valid: usize,
+    invalid: usize,
+    failed: usize,
+    network_requests: usize,
+}
+
+async fn reparse_snapshots(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    input: Option<Json<ReparseInput>>,
+) -> AppResult<Json<ReparseResponse>> {
+    let provider = load_source_config(&state, &key)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let input = input.map(|Json(value)| value).unwrap_or_default();
+    let parser_version = input.parser_version.unwrap_or_else(|| "1".into());
+    if parser_version.is_empty()
+        || parser_version.len() > 32
+        || !parser_version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(AppError::BadRequest("parserVersion 格式无效".into()));
+    }
+    let ids = state
+        .snapshot_repository
+        .latest_ids(&key, input.limit.unwrap_or(200))
+        .await?;
+    let mut response = ReparseResponse {
+        provider: key,
+        parser_version: parser_version.clone(),
+        scanned: 0,
+        valid: 0,
+        invalid: 0,
+        failed: 0,
+        network_requests: 0,
+    };
+    for id in ids {
+        response.scanned += 1;
+        let snapshot = match state.snapshot_repository.load(id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(snapshot_id = id, provider_key = provider.key, %error, "snapshot reparse failed to load cache");
+                response.failed += 1;
+                continue;
+            }
+        };
+        let final_url = snapshot
+            .final_url
+            .as_deref()
+            .unwrap_or(&snapshot.source_url);
+        let Ok(final_url) = reqwest::Url::parse(final_url) else {
+            response.failed += 1;
+            continue;
+        };
+        let entity_type = snapshot.entity_type.clone();
+        let fetch_response = FetchResponse {
+            final_url,
+            status: snapshot.http_status,
+            content_type: snapshot.content_type.clone(),
+            headers: reqwest::header::HeaderMap::new(),
+            body: snapshot.body,
+            fetched_at: chrono::Utc::now(),
+            fetch_mode: snapshot.fetch_mode,
+            elapsed_ms: 0,
+        };
+        let page_kind = state
+            .provider_registry
+            .classify(&provider.adapter, &fetch_response);
+        let output = crate::product::reparse_provider_snapshot(
+            &provider.adapter,
+            &entity_type,
+            &fetch_response.final_url,
+            &fetch_response.body,
+            page_kind,
+        );
+        if let Err(error) = state
+            .snapshot_repository
+            .mark_reparsed(snapshot.id, &parser_version, &output)
+            .await
+        {
+            tracing::warn!(snapshot_id = id, provider_key = provider.key, %error, "could not mark snapshot reparsed");
+            response.failed += 1;
+        } else if page_kind == PageKind::ValidContent || entity_type == "resource" {
+            response.valid += 1;
+        } else {
+            response.invalid += 1;
+        }
+    }
+    Ok(Json(response))
 }
 
 async fn fetch_for_diagnose(
