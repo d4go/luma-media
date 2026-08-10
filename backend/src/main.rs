@@ -21,13 +21,11 @@ mod watcher;
 
 use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 
-use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
+use serde_json::json;
 use sqlx::SqlitePool;
 use tokio::sync::{Semaphore, broadcast};
-use tower_http::{
-    services::{ServeDir, ServeFile},
-    trace::TraceLayer,
-};
+use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
@@ -95,7 +93,9 @@ async fn main() -> anyhow::Result<()> {
     let _watcher = watcher::start(state.clone());
     asset::start_health_job(state.clone());
 
-    let api_router = api::router().route("/health", get(|| async { (StatusCode::OK, "ok") }));
+    let api_router = api::router()
+        .route("/health", get(|| async { (StatusCode::OK, "ok") }))
+        .fallback(|| async { (StatusCode::NOT_FOUND, Json(json!({ "message": "not found" }))) });
 
     let mut app = Router::new()
         .route("/asset/poster/{media_id}", get(asset::poster))
@@ -106,9 +106,18 @@ async fn main() -> anyhow::Result<()> {
 
     if let Ok(static_dir) = env::var("LUMA_STATIC_DIR") {
         let directory = PathBuf::from(static_dir);
-        let index = directory.join("index.html");
-        app =
-            app.fallback_service(ServeDir::new(directory).not_found_service(ServeFile::new(index)));
+        let index = tokio::fs::read(directory.join("index.html")).await?;
+        app = app
+            .nest_service("/assets", ServeDir::new(directory.join("assets")))
+            .fallback(get(move || {
+                let index = index.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                        index,
+                    )
+                }
+            }));
     } else {
         app = app.fallback(|| async { (StatusCode::NOT_FOUND, "Luma API").into_response() });
     }
