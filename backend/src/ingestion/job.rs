@@ -117,14 +117,25 @@ impl IngestionQueue {
         lease_owner: &str,
         lease_duration: Duration,
     ) -> anyhow::Result<Option<IngestionJob>> {
+        self.claim_at_or_above(lease_owner, lease_duration, PRIORITY_HISTORICAL_BOOTSTRAP)
+            .await
+    }
+
+    pub async fn claim_at_or_above(
+        &self,
+        lease_owner: &str,
+        lease_duration: Duration,
+        minimum_priority: i64,
+    ) -> anyhow::Result<Option<IngestionJob>> {
         anyhow::ensure!(!lease_owner.is_empty(), "lease owner is required");
         self.recover_expired().await?;
         let lease_modifier = format!("+{} seconds", lease_duration.as_secs().max(1));
         let row = sqlx::query(
-            "UPDATE ingestion_job SET status='running',attempts=attempts+1,lease_owner=?,lease_expires_at=datetime('now',?),started_at=COALESCE(started_at,datetime('now')),updated_at=datetime('now'),finished_at=NULL WHERE id=(SELECT id FROM ingestion_job WHERE status='pending' AND attempts<max_attempts AND available_at<=datetime('now') ORDER BY priority DESC,available_at,id LIMIT 1) RETURNING *",
+            "UPDATE ingestion_job SET status='running',attempts=attempts+1,lease_owner=?,lease_expires_at=datetime('now',?),started_at=COALESCE(started_at,datetime('now')),updated_at=datetime('now'),finished_at=NULL WHERE id=(SELECT id FROM ingestion_job WHERE status='pending' AND attempts<max_attempts AND available_at<=datetime('now') AND priority>=? ORDER BY priority DESC,available_at,id LIMIT 1) RETURNING *",
         )
         .bind(lease_owner)
         .bind(lease_modifier)
+        .bind(minimum_priority)
         .fetch_optional(&self.pool)
         .await?;
         row.map(job_from_row).transpose()
@@ -333,5 +344,32 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.priority, PRIORITY_USER_ON_DEMAND);
         assert_eq!(claimed.payload["manual"], true);
+    }
+
+    #[tokio::test]
+    async fn reserved_worker_does_not_claim_historical_bootstrap() {
+        let queue = queue().await;
+        queue
+            .enqueue(EnqueueJob {
+                provider_key: "javdb",
+                job_type: "discovery",
+                priority: PRIORITY_HISTORICAL_BOOTSTRAP,
+                payload: serde_json::json!({}),
+                max_attempts: 3,
+                dedupe_key: Some("test:historical"),
+            })
+            .await
+            .unwrap();
+        assert!(
+            queue
+                .claim_at_or_above(
+                    "reserved-worker",
+                    Duration::from_secs(60),
+                    PRIORITY_RECENT_REPAIR,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

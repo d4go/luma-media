@@ -11,6 +11,7 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post, put},
 };
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Row, Sqlite, Transaction};
@@ -21,7 +22,10 @@ use crate::{
     AppState,
     error::{AppError, AppResult},
     fetch::{FetchError, FetchMethod, FetchRequest, FetchResponse, PageKind},
-    ingestion::{EnqueueJob, PRIORITY_DAILY_INCREMENTAL, PRIORITY_USER_ON_DEMAND, SnapshotInput},
+    ingestion::{
+        DiscoveryJobPayload, EnqueueJob, HydrationJobPayload, PRIORITY_DAILY_INCREMENTAL,
+        PRIORITY_HISTORICAL_BOOTSTRAP, PRIORITY_USER_ON_DEMAND, SnapshotInput, SyncMode,
+    },
     providers::{SourceMedia, SourceProviderConfig},
     qbittorrent::{QBittorrentClient, magnet_hash, normalize_hash},
     storage,
@@ -78,6 +82,19 @@ pub fn router() -> Router<AppState> {
         .route("/providers/{key}/enabled", post(set_provider_enabled))
         .route("/providers/{key}/test", post(test_provider))
         .route("/providers/{key}/sync", post(sync_provider))
+        .route(
+            "/providers/{key}/sync/incremental",
+            post(sync_provider_incremental),
+        )
+        .route("/providers/{key}/bootstrap", post(bootstrap_provider))
+        .route(
+            "/providers/{key}/bootstrap/pause",
+            post(pause_provider_bootstrap),
+        )
+        .route(
+            "/providers/{key}/bootstrap/resume",
+            post(resume_provider_bootstrap),
+        )
         .route(
             "/product-settings",
             get(get_product_settings).put(update_product_settings),
@@ -1775,8 +1792,173 @@ async fn sync_provider(
     State(state): State<AppState>,
     AxumPath(key): AxumPath<String>,
 ) -> AppResult<Json<Value>> {
-    enqueue_source_sync(&state, &key, true).await?;
+    start_incremental_run(&state, &key, true).await?;
     provider_by_key(&state, &key).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapInput {
+    from: String,
+    to: String,
+    #[serde(default = "default_true")]
+    include_resources: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncRunResponse {
+    run_id: i64,
+    mode: String,
+    status: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+async fn sync_provider_incremental(
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+) -> AppResult<Json<SyncRunResponse>> {
+    let run_id = start_incremental_run(&state, &key, true).await?;
+    Ok(Json(SyncRunResponse {
+        run_id,
+        mode: SyncMode::Incremental.as_str().into(),
+        status: "running".into(),
+    }))
+}
+
+async fn bootstrap_provider(
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+    Json(input): Json<BootstrapInput>,
+) -> AppResult<Json<SyncRunResponse>> {
+    validate_sync_window(&input.from, &input.to)?;
+    let provider = source_provider_by_key(&state, &key)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let run_id = start_discovery_run(
+        &state,
+        &provider,
+        SyncMode::Bootstrap,
+        &input.from,
+        &input.to,
+        input.include_resources,
+        &provider.base_url,
+        1,
+        5,
+        true,
+    )
+    .await?;
+    Ok(Json(SyncRunResponse {
+        run_id,
+        mode: SyncMode::Bootstrap.as_str().into(),
+        status: "running".into(),
+    }))
+}
+
+async fn pause_provider_bootstrap(
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+) -> AppResult<Json<SyncRunResponse>> {
+    source_provider_by_key(&state, &key)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let run_id = sqlx::query_scalar::<_, i64>("SELECT id FROM source_sync_run WHERE provider_key=? AND sync_mode='bootstrap' AND status='running' ORDER BY id DESC LIMIT 1")
+        .bind(&key)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("当前没有正在运行的历史回填".into()))?;
+    sqlx::query("UPDATE source_sync_state SET bootstrap_paused=1,last_message='历史回填将在当前批次后暂停',updated_at=datetime('now') WHERE provider_key=?")
+        .bind(&key)
+        .execute(&state.pool)
+        .await?;
+    Ok(Json(SyncRunResponse {
+        run_id,
+        mode: SyncMode::Bootstrap.as_str().into(),
+        status: "pausing".into(),
+    }))
+}
+
+async fn resume_provider_bootstrap(
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+) -> AppResult<Json<SyncRunResponse>> {
+    let provider = source_provider_by_key(&state, &key)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let row = sqlx::query("SELECT bootstrap_from,bootstrap_to,cursor_json FROM source_sync_state WHERE provider_key=?")
+        .bind(&key)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("这个来源还没有历史回填 checkpoint".into()))?;
+    let from = row
+        .get::<Option<String>, _>("bootstrap_from")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("这个来源还没有历史回填范围".into()))?;
+    let to = row
+        .get::<Option<String>, _>("bootstrap_to")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("这个来源还没有历史回填范围".into()))?;
+    let cursor = serde_json::from_str::<Value>(&row.get::<String, _>("cursor_json"))
+        .unwrap_or_else(|_| json!({}));
+    let page_url = cursor
+        .get("nextUrl")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&provider.base_url)
+        .to_owned();
+    let page = cursor.get("page").and_then(Value::as_i64).unwrap_or(1);
+    let include_resources = cursor
+        .get("includeResources")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let active_run = sqlx::query_scalar::<_, i64>("SELECT id FROM source_sync_run WHERE provider_key=? AND sync_mode='bootstrap' AND status='running' ORDER BY id DESC LIMIT 1")
+        .bind(&key)
+        .fetch_optional(&state.pool)
+        .await?;
+    let run_id = if let Some(run_id) = active_run {
+        sqlx::query("UPDATE source_sync_state SET bootstrap_paused=0,last_message='历史回填已继续',updated_at=datetime('now') WHERE provider_key=?")
+            .bind(&key)
+            .execute(&state.pool)
+            .await?;
+        enqueue_discovery_job(
+            &state,
+            &provider,
+            DiscoveryJobPayload {
+                run_id,
+                mode: SyncMode::Bootstrap,
+                page_url,
+                page,
+                window_from: from,
+                window_to: to,
+                include_resources,
+                pages_remaining: 5,
+            },
+        )
+        .await?;
+        run_id
+    } else {
+        start_discovery_run(
+            &state,
+            &provider,
+            SyncMode::Bootstrap,
+            &from,
+            &to,
+            include_resources,
+            &page_url,
+            page,
+            5,
+            false,
+        )
+        .await?
+    };
+    Ok(Json(SyncRunResponse {
+        run_id,
+        mode: SyncMode::Bootstrap.as_str().into(),
+        status: "running".into(),
+    }))
 }
 
 pub async fn schedule_source_sync(state: &AppState) -> anyhow::Result<()> {
@@ -1785,7 +1967,12 @@ pub async fn schedule_source_sync(state: &AppState) -> anyhow::Result<()> {
         .await?;
     for provider in rows.iter().map(source_provider_from_row) {
         if provider.sync_enabled {
-            enqueue_source_sync(state, &provider.key, false).await?;
+            if let Err(error) = start_incremental_run(state, &provider.key, false).await {
+                if !matches!(&error, AppError::BadRequest(message) if message.contains("正在运行"))
+                {
+                    return Err(error.into());
+                }
+            }
         }
     }
     Ok(())
@@ -1793,48 +1980,212 @@ pub async fn schedule_source_sync(state: &AppState) -> anyhow::Result<()> {
 
 pub(crate) async fn recover_interrupted_source_syncs(state: &AppState) -> anyhow::Result<()> {
     let mut transaction = state.pool.begin().await?;
-    sqlx::query("UPDATE source_sync_run SET status='failed',error_message='worker interrupted by service restart',finished_at=datetime('now') WHERE status='running'")
+    sqlx::query("UPDATE source_sync_run SET status='failed',error_message='worker interrupted by service restart',finished_at=datetime('now') WHERE status='running' AND ingestion_job_id IS NOT NULL")
         .execute(&mut *transaction)
         .await?;
-    sqlx::query("UPDATE source_sync_state SET status='idle',last_finished_at=datetime('now'),last_message='上次同步被服务重启中断，已重新排队',lease_owner=NULL,lease_expires_at=NULL,updated_at=datetime('now') WHERE status='running'")
+    sqlx::query("UPDATE source_sync_state SET status='idle',last_finished_at=datetime('now'),last_message='上次同步被服务重启中断，已重新排队',lease_owner=NULL,lease_expires_at=NULL,updated_at=datetime('now') WHERE status='running' AND NOT EXISTS(SELECT 1 FROM source_sync_run run WHERE run.provider_key=source_sync_state.provider_key AND run.status='running')")
         .execute(&mut *transaction)
         .await?;
     transaction.commit().await?;
+
+    let stranded = sqlx::query("SELECT id,provider_key FROM source_sync_run run WHERE status='running' AND ingestion_job_id IS NULL AND NOT EXISTS(SELECT 1 FROM ingestion_job job WHERE job.status IN ('pending','running') AND job.job_type IN ('discovery','hydrate') AND json_extract(job.payload_json,'$.runId')=run.id)")
+        .fetch_all(&state.pool)
+        .await?;
+    for row in stranded {
+        let run_id: i64 = row.get("id");
+        let job = crate::ingestion::IngestionJob {
+            id: 0,
+            provider_key: row.get("provider_key"),
+            job_type: "discovery".into(),
+            priority: PRIORITY_DAILY_INCREMENTAL,
+            payload: json!({ "runId": run_id }),
+            attempts: 0,
+            max_attempts: 0,
+        };
+        settle_ingestion_job(state, &job).await?;
+    }
     Ok(())
 }
 
-async fn enqueue_source_sync(state: &AppState, key: &str, manual: bool) -> AppResult<i64> {
+async fn start_incremental_run(state: &AppState, key: &str, manual: bool) -> AppResult<i64> {
     let provider = source_provider_by_key(state, key)
         .await?
         .ok_or(AppError::NotFound)?;
     if !manual && !provider.sync_enabled {
         return Ok(0);
     }
+    let today = chrono::Utc::now().date_naive();
+    let from = today - chrono::Duration::days(provider.sync_overlap_days);
+    start_discovery_run(
+        state,
+        &provider,
+        SyncMode::Incremental,
+        &from.format("%Y-%m-%d").to_string(),
+        &today.format("%Y-%m-%d").to_string(),
+        true,
+        &provider.base_url,
+        1,
+        5,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_discovery_run(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    mode: SyncMode,
+    window_from: &str,
+    window_to: &str,
+    include_resources: bool,
+    page_url: &str,
+    page: i64,
+    pages_remaining: i64,
+    reset_cursor: bool,
+) -> AppResult<i64> {
+    validate_sync_window(window_from, window_to)?;
+    validate_provider_page_url(provider, page_url)?;
     sqlx::query("INSERT OR IGNORE INTO source_sync_state(provider_key) VALUES (?)")
-        .bind(key)
+        .bind(&provider.key)
         .execute(&state.pool)
         .await?;
-    let dedupe_key = format!("source-sync:{key}");
+    let mut transaction = state.pool.begin().await?;
+    let active: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM source_sync_run WHERE provider_key=? AND status='running')",
+    )
+    .bind(&provider.key)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if active != 0 {
+        return Err(AppError::BadRequest(
+            "这个来源已有正在运行的同步批次".into(),
+        ));
+    }
+    let cursor_before: String =
+        sqlx::query_scalar("SELECT cursor_json FROM source_sync_state WHERE provider_key=?")
+            .bind(&provider.key)
+            .fetch_one(&mut *transaction)
+            .await?;
+    let initial_cursor = json!({
+        "mode": mode.as_str(),
+        "nextUrl": page_url,
+        "page": page,
+        "from": window_from,
+        "to": window_to,
+        "includeResources": include_resources,
+        "hasMore": true,
+    })
+    .to_string();
+    if mode == SyncMode::Bootstrap {
+        sqlx::query("UPDATE source_sync_state SET status='running',active_mode='bootstrap',bootstrap_paused=0,bootstrap_from=?,bootstrap_to=?,last_started_at=datetime('now'),last_finished_at=NULL,last_message='正在发现历史目录',discovery_count=0,hydrated_count=0,hydration_failed_count=0,pending_count=0,cursor_json=CASE WHEN ? THEN ? ELSE cursor_json END,updated_at=datetime('now') WHERE provider_key=?")
+            .bind(window_from)
+            .bind(window_to)
+            .bind(reset_cursor)
+            .bind(&initial_cursor)
+            .bind(&provider.key)
+            .execute(&mut *transaction)
+            .await?;
+    } else {
+        sqlx::query("UPDATE source_sync_state SET status='running',active_mode='incremental',overlap_days=?,last_started_at=datetime('now'),last_finished_at=NULL,last_message='正在发现增量目录',discovery_count=0,hydrated_count=0,hydration_failed_count=0,pending_count=0,updated_at=datetime('now') WHERE provider_key=?")
+            .bind(provider.sync_overlap_days)
+            .bind(&provider.key)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    let run_id: i64 = sqlx::query("INSERT INTO source_sync_run(provider_key,status,cursor_before_json,watermark_before_json,sync_mode,window_from,window_to) SELECT provider_key,'running',?,watermark_json,?,?,? FROM source_sync_state WHERE provider_key=? RETURNING id")
+        .bind(&cursor_before)
+        .bind(mode.as_str())
+        .bind(window_from)
+        .bind(window_to)
+        .bind(&provider.key)
+        .fetch_one(&mut *transaction)
+        .await?
+        .get("id");
+    transaction.commit().await?;
+
+    let payload = DiscoveryJobPayload {
+        run_id,
+        mode,
+        page_url: page_url.to_owned(),
+        page,
+        window_from: window_from.to_owned(),
+        window_to: window_to.to_owned(),
+        include_resources,
+        pages_remaining: pages_remaining.max(1),
+    };
+    if let Err(error) = enqueue_discovery_job(state, provider, payload).await {
+        let message = error.to_string();
+        let _ = sqlx::query("UPDATE source_sync_run SET status='failed',error_message=?,finished_at=datetime('now') WHERE id=?")
+            .bind(&message)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await;
+        let _ = sqlx::query("UPDATE source_sync_state SET status='failed',last_finished_at=datetime('now'),last_message=?,updated_at=datetime('now') WHERE provider_key=?")
+            .bind(&message)
+            .bind(&provider.key)
+            .execute(&state.pool)
+            .await;
+        return Err(error);
+    }
+    Ok(run_id)
+}
+
+async fn enqueue_discovery_job(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    payload: DiscoveryJobPayload,
+) -> AppResult<i64> {
+    validate_provider_page_url(provider, &payload.page_url)?;
+    let dedupe_key = format!("discovery:{}:{}", payload.run_id, payload.page);
+    let priority = match payload.mode {
+        SyncMode::Bootstrap => PRIORITY_HISTORICAL_BOOTSTRAP,
+        SyncMode::Incremental => PRIORITY_DAILY_INCREMENTAL,
+        SyncMode::OnDemand => PRIORITY_USER_ON_DEMAND,
+    };
     let enqueued = state
         .ingestion_queue
         .enqueue(EnqueueJob {
-            provider_key: key,
-            job_type: "source_sync",
-            priority: if manual {
-                PRIORITY_USER_ON_DEMAND
-            } else {
-                PRIORITY_DAILY_INCREMENTAL
-            },
-            payload: json!({ "manual": manual }),
+            provider_key: &provider.key,
+            job_type: "discovery",
+            priority,
+            payload: serde_json::to_value(payload).map_err(anyhow::Error::from)?,
             max_attempts: 3,
             dedupe_key: Some(&dedupe_key),
         })
         .await?;
-    sqlx::query("UPDATE source_sync_state SET last_message=CASE WHEN status='running' THEN last_message ELSE '已加入持久同步队列' END,updated_at=datetime('now') WHERE provider_key=?")
-        .bind(key)
-        .execute(&state.pool)
-        .await?;
     Ok(enqueued.id)
+}
+
+fn validate_sync_window(from: &str, to: &str) -> AppResult<()> {
+    let from_date = chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d")
+        .map_err(|_| AppError::BadRequest("from 必须是 YYYY-MM-DD".into()))?;
+    let to_date = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d")
+        .map_err(|_| AppError::BadRequest("to 必须是 YYYY-MM-DD".into()))?;
+    if from_date > to_date {
+        return Err(AppError::BadRequest("from 不能晚于 to".into()));
+    }
+    Ok(())
+}
+
+fn validate_provider_page_url(
+    provider: &SourceProviderConfig,
+    page_url: &str,
+) -> AppResult<reqwest::Url> {
+    let base = reqwest::Url::parse(&provider.base_url)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let url = reqwest::Url::parse(page_url)
+        .or_else(|_| base.join(page_url))
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str() != base.host_str()
+        || url.port_or_known_default() != base.port_or_known_default()
+    {
+        return Err(AppError::BadRequest(
+            "目录分页 URL 必须与来源使用同一站点".into(),
+        ));
+    }
+    Ok(url)
 }
 
 #[derive(Debug)]
@@ -1909,6 +2260,350 @@ pub(crate) async fn execute_source_sync_job(
     }
 }
 
+pub(crate) async fn execute_discovery_job(
+    state: &AppState,
+    payload: &DiscoveryJobPayload,
+) -> anyhow::Result<()> {
+    let run_status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM source_sync_run WHERE id=?")
+            .bind(payload.run_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    if run_status.as_deref() != Some("running") {
+        return Ok(());
+    }
+    let page_completed: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM source_sync_page WHERE run_id=? AND page_number=?)",
+    )
+    .bind(payload.run_id)
+    .bind(payload.page)
+    .fetch_one(&state.pool)
+    .await?;
+    if page_completed != 0 {
+        return Ok(());
+    }
+    if payload.mode == SyncMode::Bootstrap {
+        let paused: i64 = sqlx::query_scalar(
+            "SELECT bootstrap_paused FROM source_sync_state WHERE provider_key=?",
+        )
+        .bind(
+            sqlx::query_scalar::<_, String>("SELECT provider_key FROM source_sync_run WHERE id=?")
+                .bind(payload.run_id)
+                .fetch_one(&state.pool)
+                .await?,
+        )
+        .fetch_one(&state.pool)
+        .await?;
+        if paused != 0 {
+            return Ok(());
+        }
+    }
+    let provider_key: String =
+        sqlx::query_scalar("SELECT provider_key FROM source_sync_run WHERE id=?")
+            .bind(payload.run_id)
+            .fetch_one(&state.pool)
+            .await?;
+    let provider = source_provider_by_key(state, &provider_key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("source provider {provider_key} no longer exists"))?;
+    let page = fetch_source_catalogue_page(state, &provider, &payload.page_url).await?;
+    let reached_start = crate::ingestion::reached_window_start(&page.items, &payload.window_from);
+    let candidates = crate::ingestion::upsert_candidates(
+        &state.pool,
+        &provider.key,
+        page.items
+            .into_iter()
+            .filter(|item| {
+                crate::ingestion::within_window(item, &payload.window_from, &payload.window_to)
+            })
+            .collect(),
+    )
+    .await?;
+    let priority = match payload.mode {
+        SyncMode::Bootstrap => PRIORITY_HISTORICAL_BOOTSTRAP,
+        SyncMode::Incremental => PRIORITY_DAILY_INCREMENTAL,
+        SyncMode::OnDemand => PRIORITY_USER_ON_DEMAND,
+    };
+    let mut pending_count = 0_i64;
+    for candidate in &candidates {
+        if !candidate.should_hydrate {
+            continue;
+        }
+        let hydration = HydrationJobPayload {
+            run_id: payload.run_id,
+            discovery_item_id: candidate.id,
+            content_hash: candidate.content_hash.clone(),
+            mode: payload.mode,
+            include_resources: payload.include_resources,
+        };
+        let dedupe_key = format!(
+            "hydrate:{}:{}:{}",
+            provider.key, candidate.id, candidate.content_hash
+        );
+        state
+            .ingestion_queue
+            .enqueue(EnqueueJob {
+                provider_key: &provider.key,
+                job_type: "hydrate",
+                priority,
+                payload: serde_json::to_value(hydration)?,
+                max_attempts: 3,
+                dedupe_key: Some(&dedupe_key),
+            })
+            .await?;
+        pending_count += 1;
+    }
+    let inserted_count = candidates.iter().filter(|item| item.inserted).count() as i64;
+    let updated_count = candidates.len() as i64 - inserted_count;
+    let actual_next = if !reached_start { page.next_url } else { None };
+    let next_cursor = json!({
+        "mode": payload.mode.as_str(),
+        "nextUrl": actual_next.clone(),
+        "page": payload.page + 1,
+        "from": payload.window_from,
+        "to": payload.window_to,
+        "includeResources": payload.include_resources,
+        "hasMore": actual_next.is_some(),
+    });
+    let watermark_after = json!({
+        "from": payload.window_from,
+        "to": payload.window_to,
+    });
+    if let Some(next_url) = actual_next.as_deref()
+        && payload.pages_remaining > 1
+    {
+        let can_continue = if payload.mode == SyncMode::Bootstrap {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT bootstrap_paused FROM source_sync_state WHERE provider_key=?",
+            )
+            .bind(&provider.key)
+            .fetch_one(&state.pool)
+            .await?
+                == 0
+        } else {
+            true
+        };
+        if can_continue {
+            enqueue_discovery_job(
+                state,
+                &provider,
+                DiscoveryJobPayload {
+                    run_id: payload.run_id,
+                    mode: payload.mode,
+                    page_url: next_url.to_owned(),
+                    page: payload.page + 1,
+                    window_from: payload.window_from.clone(),
+                    window_to: payload.window_to.clone(),
+                    include_resources: payload.include_resources,
+                    pages_remaining: payload.pages_remaining - 1,
+                },
+            )
+            .await?;
+        }
+    }
+    let mut transaction = state.pool.begin().await?;
+    let recorded = sqlx::query("INSERT OR IGNORE INTO source_sync_page(run_id,page_number,page_url,item_count,inserted_count,updated_count,cursor_after_json) VALUES (?,?,?,?,?,?,?)")
+        .bind(payload.run_id)
+        .bind(payload.page)
+        .bind(&payload.page_url)
+        .bind(candidates.len() as i64)
+        .bind(inserted_count)
+        .bind(updated_count)
+        .bind(next_cursor.to_string())
+        .execute(&mut *transaction)
+        .await?;
+    if recorded.rows_affected() == 0 {
+        transaction.rollback().await?;
+        return Ok(());
+    }
+    sqlx::query("UPDATE source_sync_run SET item_count=item_count+?,inserted_count=inserted_count+?,updated_count=updated_count+?,discovery_count=discovery_count+?,pending_count=pending_count+?,cursor_after_json=?,watermark_after_json=? WHERE id=? AND status='running'")
+        .bind(candidates.len() as i64)
+        .bind(inserted_count)
+        .bind(updated_count)
+        .bind(candidates.len() as i64)
+        .bind(pending_count)
+        .bind(next_cursor.to_string())
+        .bind(watermark_after.to_string())
+        .bind(payload.run_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("UPDATE source_sync_state SET cursor_json=?,last_message=?,discovery_count=discovery_count+?,pending_count=pending_count+?,updated_at=datetime('now') WHERE provider_key=?")
+        .bind(next_cursor.to_string())
+        .bind(format!("已发现 {} 项，等待详情补全", candidates.len()))
+        .bind(candidates.len() as i64)
+        .bind(pending_count)
+        .bind(&provider.key)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn execute_hydration_job(
+    state: &AppState,
+    payload: &HydrationJobPayload,
+) -> anyhow::Result<()> {
+    let item = crate::ingestion::start_hydration(&state.pool, payload.discovery_item_id).await?;
+    if item.content_hash != payload.content_hash {
+        sqlx::query("UPDATE provider_discovery_item SET hydration_status='pending' WHERE id=?")
+            .bind(item.id)
+            .execute(&state.pool)
+            .await?;
+        return Ok(());
+    }
+    let outcome = async {
+        let provider = source_provider_by_key(state, &item.provider_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("source provider {} no longer exists", item.provider_key))?;
+        let source = SourceMedia {
+            provider_id: item.provider_entity_id.clone(),
+            code: item.normalized_code.clone(),
+            title: item.title_hint.clone(),
+            poster_url: item.poster_hint.clone(),
+            source_url: item.source_url.clone(),
+            release_date: item.release_date.clone(),
+        };
+        let media_id = persist_source_media(state, &provider.key, &source).await?;
+        match provider.adapter.as_str() {
+            "javbus" => {
+                refresh_javbus_media(
+                    state,
+                    media_id,
+                    &provider,
+                    &item.provider_entity_id,
+                    &item.source_url,
+                    payload.include_resources,
+                )
+                .await?;
+            }
+            "javdb" | "jav321" | "javlibrary" => {
+                refresh_generic_source_media(
+                    state,
+                    media_id,
+                    &provider,
+                    &item.provider_entity_id,
+                    &item.source_url,
+                    payload.include_resources,
+                )
+                .await?;
+            }
+            adapter => anyhow::bail!("不支持的来源适配器：{adapter}"),
+        }
+        crate::ingestion::finish_hydration(
+            &state.pool,
+            item.id,
+            media_id,
+            &item.content_hash,
+        )
+        .await?;
+        sqlx::query("UPDATE source_sync_run SET hydrated_count=hydrated_count+1,pending_count=MAX(pending_count-1,0) WHERE id=?")
+            .bind(payload.run_id)
+            .execute(&state.pool)
+            .await?;
+        sqlx::query("UPDATE source_sync_state SET hydrated_count=hydrated_count+1,pending_count=MAX(pending_count-1,0),updated_at=datetime('now') WHERE provider_key=?")
+            .bind(&item.provider_key)
+            .execute(&state.pool)
+            .await?;
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(error) = &outcome {
+        crate::ingestion::fail_hydration(&state.pool, item.id, &error.to_string()).await?;
+    }
+    outcome
+}
+
+pub(crate) async fn settle_ingestion_job(
+    state: &AppState,
+    job: &crate::ingestion::IngestionJob,
+) -> anyhow::Result<()> {
+    if !matches!(job.job_type.as_str(), "discovery" | "hydrate") {
+        return Ok(());
+    }
+    let Some(run_id) = job.payload.get("runId").and_then(Value::as_i64) else {
+        return Ok(());
+    };
+    let run = sqlx::query("SELECT provider_key,sync_mode,status,cursor_after_json,watermark_after_json FROM source_sync_run WHERE id=?")
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    let Some(run) = run else {
+        return Ok(());
+    };
+    if run.get::<String, _>("status") != "running" {
+        return Ok(());
+    }
+    let active_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingestion_job WHERE status IN ('pending','running') AND job_type IN ('discovery','hydrate') AND json_extract(payload_json,'$.runId')=?")
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await?;
+    if active_count > 0 {
+        return Ok(());
+    }
+    let provider_key: String = run.get("provider_key");
+    if run.get::<String, _>("sync_mode") == "bootstrap" {
+        let paused: i64 = sqlx::query_scalar(
+            "SELECT bootstrap_paused FROM source_sync_state WHERE provider_key=?",
+        )
+        .bind(&provider_key)
+        .fetch_one(&state.pool)
+        .await?;
+        if paused != 0 {
+            sqlx::query("UPDATE source_sync_state SET last_message='历史回填已暂停，可从 checkpoint 继续',updated_at=datetime('now') WHERE provider_key=?")
+                .bind(&provider_key)
+                .execute(&state.pool)
+                .await?;
+            return Ok(());
+        }
+    }
+    let failed_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ingestion_job WHERE status='failed' AND job_type IN ('discovery','hydrate') AND json_extract(payload_json,'$.runId')=?")
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await?;
+    let provider = source_provider_by_key(state, &provider_key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("source provider {provider_key} no longer exists"))?;
+    let stats = sqlx::query("SELECT item_count,inserted_count,updated_count,discovery_count,hydrated_count,pending_count FROM source_sync_run WHERE id=?")
+        .bind(run_id)
+        .fetch_one(&state.pool)
+        .await?;
+    let mut transaction = state.pool.begin().await?;
+    if failed_count > 0 {
+        sqlx::query("UPDATE source_sync_run SET status='failed',hydration_failed_count=?,pending_count=0,error_message='one or more ingestion jobs exhausted their retries',finished_at=datetime('now') WHERE id=? AND status='running'")
+            .bind(failed_count)
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE source_sync_state SET status='failed',last_finished_at=datetime('now'),last_message='部分详情补全失败，保留已完成数据与 checkpoint',hydration_failed_count=?,pending_count=0,updated_at=datetime('now') WHERE provider_key=?")
+            .bind(failed_count)
+            .bind(&provider_key)
+            .execute(&mut *transaction)
+            .await?;
+    } else {
+        let cursor_after: String = run.get("cursor_after_json");
+        let watermark_after: String = run.get("watermark_after_json");
+        let next_modifier = format!("+{} minutes", provider.sync_interval_minutes);
+        sqlx::query("UPDATE source_sync_run SET status='success',pending_count=0,finished_at=datetime('now') WHERE id=? AND status='running'")
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE source_sync_state SET status='success',last_finished_at=datetime('now'),last_success_at=datetime('now'),next_run_at=datetime('now',?),last_message='同步批次完成',failure_count=0,item_count=?,inserted_count=?,updated_count=?,discovery_count=?,hydrated_count=?,hydration_failed_count=0,pending_count=0,cursor_json=?,watermark_json=?,updated_at=datetime('now') WHERE provider_key=?")
+            .bind(next_modifier)
+            .bind(stats.get::<i64, _>("item_count"))
+            .bind(stats.get::<i64, _>("inserted_count"))
+            .bind(stats.get::<i64, _>("updated_count"))
+            .bind(stats.get::<i64, _>("discovery_count"))
+            .bind(stats.get::<i64, _>("hydrated_count"))
+            .bind(cursor_after)
+            .bind(watermark_after)
+            .bind(&provider_key)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
 async fn synchronize_source_catalogue(
     state: &AppState,
     provider: &SourceProviderConfig,
@@ -1967,6 +2662,7 @@ async fn synchronize_source_catalogue(
                     provider,
                     &item.provider_id,
                     &item.source_url,
+                    true,
                 )
                 .await
             }
@@ -1977,6 +2673,7 @@ async fn synchronize_source_catalogue(
                     provider,
                     &item.provider_id,
                     &item.source_url,
+                    true,
                 )
                 .await
             }
@@ -2023,48 +2720,90 @@ async fn fetch_source_catalogue(
     state: &AppState,
     provider: &SourceProviderConfig,
 ) -> anyhow::Result<Vec<SourceMedia>> {
-    let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
-    match provider.adapter.as_str() {
+    Ok(
+        fetch_source_catalogue_page(state, provider, &provider.base_url)
+            .await?
+            .items,
+    )
+}
+
+struct SourceCataloguePage {
+    items: Vec<SourceMedia>,
+    next_url: Option<String>,
+}
+
+async fn fetch_source_catalogue_page(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    page_url: &str,
+) -> anyhow::Result<SourceCataloguePage> {
+    let url = validate_provider_page_url(provider, page_url)?;
+    let response = match provider.adapter.as_str() {
         "javbus" => {
-            let response = javbus_request(state, provider, base).await?;
+            let response = javbus_request(state, provider, url).await?;
             ensure_provider_content(state, provider, &response, "catalogue", None, None).await?;
-            Ok(parse_javbus_search_html(
-                &response.body,
-                "",
-                &provider.base_url,
-            ))
+            response
         }
         "javdb" => {
-            let response = source_fetch(state, provider, base).await?;
+            let response = source_fetch(state, provider, url).await?;
             ensure_provider_content(state, provider, &response, "catalogue", None, None).await?;
-            Ok(parse_javdb_search_html(
-                &response.body,
-                "",
-                &provider.base_url,
-            ))
+            response
         }
         "jav321" => {
-            let response = source_fetch(state, provider, base).await?;
+            let response = source_fetch(state, provider, url).await?;
             ensure_provider_content(state, provider, &response, "catalogue", None, None).await?;
-            Ok(parse_jav321_html(
-                &response.body,
-                "",
-                &provider.base_url,
-                &response.final_url,
-            ))
+            response
         }
         "javlibrary" => {
-            let response = source_fetch(state, provider, base).await?;
+            let response = source_fetch(state, provider, url).await?;
             ensure_provider_content(state, provider, &response, "catalogue", None, None).await?;
-            Ok(parse_javlibrary_html(
-                &response.body,
-                "",
-                &provider.base_url,
-                &response.final_url,
-            ))
+            response
         }
         adapter => anyhow::bail!("不支持的来源适配器：{adapter}"),
+    };
+    let items = match provider.adapter.as_str() {
+        "javbus" => parse_javbus_search_html(&response.body, "", &provider.base_url),
+        "javdb" => parse_javdb_search_html(&response.body, "", &provider.base_url),
+        "jav321" => parse_jav321_html(&response.body, "", &provider.base_url, &response.final_url),
+        "javlibrary" => {
+            parse_javlibrary_html(&response.body, "", &provider.base_url, &response.final_url)
+        }
+        _ => Vec::new(),
+    };
+    let next_url = extract_next_page_url(provider, &response);
+    Ok(SourceCataloguePage { items, next_url })
+}
+
+fn extract_next_page_url(
+    provider: &SourceProviderConfig,
+    response: &FetchResponse,
+) -> Option<String> {
+    let document = Html::parse_document(&response.body);
+    for selector in [
+        "a[rel='next']",
+        "a.next",
+        "li.next a",
+        "a.pagination-next",
+        ".pagination a[aria-label='Next']",
+    ] {
+        let Ok(selector) = Selector::parse(selector) else {
+            continue;
+        };
+        for link in document.select(&selector) {
+            let Some(href) = link.value().attr("href") else {
+                continue;
+            };
+            let Ok(url) = response.final_url.join(href) else {
+                continue;
+            };
+            if url != response.final_url
+                && validate_provider_page_url(provider, url.as_str()).is_ok()
+            {
+                return Some(url.into());
+            }
+        }
     }
+    None
 }
 
 async fn finish_source_sync_success(
@@ -2336,6 +3075,7 @@ fn parse_javdb_search_html(html: &str, fallback: &str, base_url: &str) -> Vec<So
             title,
             poster_url,
             source_url: absolute_url(base_url, href).unwrap_or_else(|| href.to_owned()),
+            release_date: extract_iso_date(tail),
         });
         if items.len() >= 40 {
             break;
@@ -2379,6 +3119,7 @@ fn parse_jav321_html(
             title,
             poster_url,
             source_url: final_url.to_string(),
+            release_date: extract_iso_date(html),
         }];
     }
 
@@ -2413,6 +3154,7 @@ fn parse_javlibrary_html(
             poster_url: meta_content(html, "og:image")
                 .and_then(|value| absolute_url(base_url, &value)),
             source_url: final_url.to_string(),
+            release_date: extract_iso_date(html),
         }];
     }
     parse_video_links(html, fallback, base_url, "?v=jav")
@@ -2471,6 +3213,7 @@ fn parse_video_links(html: &str, fallback: &str, base_url: &str, marker: &str) -
             },
             poster_url,
             source_url: absolute_url(base_url, &href).unwrap_or(href),
+            release_date: extract_iso_date(anchor),
         });
         if items.len() >= 40 {
             break;
@@ -2640,6 +3383,7 @@ fn parse_javbus_search_html(html: &str, fallback: &str, base_url: &str) -> Vec<S
             title,
             poster_url,
             source_url,
+            release_date: extract_iso_date(card),
         });
         if items.len() >= 40 {
             break;
@@ -2655,6 +3399,20 @@ fn absolute_url(base_url: &str, value: &str) -> Option<String> {
         .map(Into::into)
 }
 
+fn extract_iso_date(text: &str) -> Option<String> {
+    text.as_bytes().windows(10).find_map(|window| {
+        let value = std::str::from_utf8(window).ok()?;
+        (value.as_bytes()[4] == b'-'
+            && value.as_bytes()[7] == b'-'
+            && value
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+            && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok())
+        .then(|| value.to_owned())
+    })
+}
+
 async fn persist_source_media(
     state: &AppState,
     provider_key: &str,
@@ -2666,8 +3424,13 @@ async fn persist_source_media(
         .map(|code| normalize_code(&code))
         .filter(|code| !code.is_empty())
         .ok_or_else(|| anyhow::anyhow!("无法从来源条目提取真实番号"))?;
-    let row = sqlx::query("INSERT INTO media(normalized_code, title, poster_url) VALUES (?, ?, ?) ON CONFLICT(normalized_code) DO UPDATE SET title = CASE WHEN length(excluded.title) > length(media.title) THEN excluded.title ELSE media.title END, poster_url = COALESCE(excluded.poster_url, media.poster_url), updated_at = datetime('now') RETURNING id")
-        .bind(&code).bind(&item.title).bind(&item.poster_url).fetch_one(&state.pool).await?;
+    let row = sqlx::query("INSERT INTO media(normalized_code,title,poster_url,release_date) VALUES (?,?,?,?) ON CONFLICT(normalized_code) DO UPDATE SET title=CASE WHEN length(excluded.title)>length(media.title) THEN excluded.title ELSE media.title END,poster_url=COALESCE(excluded.poster_url,media.poster_url),release_date=COALESCE(excluded.release_date,media.release_date),updated_at=datetime('now') RETURNING id")
+        .bind(&code)
+        .bind(&item.title)
+        .bind(&item.poster_url)
+        .bind(&item.release_date)
+        .fetch_one(&state.pool)
+        .await?;
     let id: i64 = row.get("id");
     upsert_media_title_alias(state, id, &item.title, None, provider_key, true).await?;
     sqlx::query("INSERT INTO provider_entity_mapping(provider_key, entity_type, provider_entity_id, media_id, source_url) VALUES (?, 'media', ?, ?, ?) ON CONFLICT(provider_key, entity_type, provider_entity_id) DO UPDATE SET media_id = excluded.media_id, source_url = excluded.source_url, last_seen_at = datetime('now')")
@@ -2943,6 +3706,7 @@ async fn refresh_source_media(state: &AppState, media_id: i64) -> anyhow::Result
                     &provider,
                     &provider_id,
                     source_url.as_deref().unwrap_or_default(),
+                    true,
                 )
                 .await
             }
@@ -2953,6 +3717,7 @@ async fn refresh_source_media(state: &AppState, media_id: i64) -> anyhow::Result
                     &provider,
                     &provider_id,
                     source_url.as_deref().unwrap_or_default(),
+                    true,
                 )
                 .await
             }
@@ -2975,6 +3740,7 @@ async fn refresh_javbus_media(
     provider: &SourceProviderConfig,
     provider_id: &str,
     source_url: &str,
+    include_resources: bool,
 ) -> anyhow::Result<usize> {
     let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
     let url = reqwest::Url::parse(source_url)
@@ -3000,7 +3766,11 @@ async fn refresh_javbus_media(
         upsert_media_title_alias(state, media_id, title, None, &provider.key, true).await?;
     }
     persist_source_actors(state, media_id, &provider.key, &html, "/star/").await?;
-    let magnets = fetch_javbus_magnets(state, provider, media_id, provider_id, &url, &html).await?;
+    let magnets = if include_resources {
+        fetch_javbus_magnets(state, provider, media_id, provider_id, &url, &html).await?
+    } else {
+        Vec::new()
+    };
     for (index, (url, label)) in magnets.iter().enumerate() {
         let info_hash = magnet_hash(url);
         let (score, reasons) = rank_resource(label, None, "", &provider.display_name);
@@ -3017,6 +3787,7 @@ async fn refresh_generic_source_media(
     provider: &SourceProviderConfig,
     provider_id: &str,
     source_url: &str,
+    include_resources: bool,
 ) -> anyhow::Result<usize> {
     let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
     let url = reqwest::Url::parse(source_url).or_else(|_| match provider.adapter.as_str() {
@@ -3040,7 +3811,16 @@ async fn refresh_generic_source_media(
     } else {
         "/star/"
     };
-    persist_source_detail_html(state, media_id, provider, provider_id, &html, actor_marker).await
+    persist_source_detail_html(
+        state,
+        media_id,
+        provider,
+        provider_id,
+        &html,
+        actor_marker,
+        include_resources,
+    )
+    .await
 }
 
 async fn persist_source_detail_html(
@@ -3050,6 +3830,7 @@ async fn persist_source_detail_html(
     provider_id: &str,
     html: &str,
     actor_marker: &str,
+    include_resources: bool,
 ) -> anyhow::Result<usize> {
     let title = meta_content(html, "og:title")
         .or_else(|| extract_tag_text_after(html, "panel-heading"))
@@ -3064,7 +3845,11 @@ async fn persist_source_detail_html(
         upsert_media_title_alias(state, media_id, title, None, &provider.key, true).await?;
     }
     persist_source_actors(state, media_id, &provider.key, html, actor_marker).await?;
-    let magnets = parse_magnets(html);
+    let magnets = if include_resources {
+        parse_magnets(html)
+    } else {
+        Vec::new()
+    };
     for (index, (url, label)) in magnets.iter().enumerate() {
         let info_hash = magnet_hash(url);
         let (score, reasons) = rank_resource(label, None, "", &provider.display_name);
@@ -4273,13 +5058,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_can_pause_and_resume_from_its_checkpoint() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO provider_config(provider_key,provider_type,display_name,enabled,base_url,config_json) VALUES ('mock-bootstrap','source','Mock Bootstrap',1,'https://example.test','{\"adapter\":\"javbus\"}')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let temp = std::env::temp_dir().join(format!("luma-bootstrap-{}", chrono_like_nonce()));
+        let state = AppState {
+            pool: pool.clone(),
+            scrape_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            crawler_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            asset_root: temp.join("assets"),
+            script_root: temp.join("scripts"),
+            events: tokio::sync::broadcast::channel(32).0,
+            fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
+            provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
+            snapshot_repository: std::sync::Arc::new(crate::ingestion::SnapshotRepository::new(
+                pool.clone(),
+                temp.join("source-cache"),
+            )),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool),
+        };
+
+        let started = bootstrap_provider(
+            State(state.clone()),
+            AxumPath("mock-bootstrap".into()),
+            Json(BootstrapInput {
+                from: "2024-01-01".into(),
+                to: "2026-08-10".into(),
+                include_resources: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let paused =
+            pause_provider_bootstrap(State(state.clone()), AxumPath("mock-bootstrap".into()))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(paused.run_id, started.run_id);
+        assert_eq!(paused.status, "pausing");
+        let paused_flag: i64 = sqlx::query_scalar(
+            "SELECT bootstrap_paused FROM source_sync_state WHERE provider_key='mock-bootstrap'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(paused_flag, 1);
+
+        let resumed =
+            resume_provider_bootstrap(State(state.clone()), AxumPath("mock-bootstrap".into()))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(resumed.run_id, started.run_id);
+        assert_eq!(resumed.status, "running");
+        let state_row = sqlx::query("SELECT bootstrap_paused,cursor_json FROM source_sync_state WHERE provider_key='mock-bootstrap'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(state_row.get::<i64, _>("bootstrap_paused"), 0);
+        let cursor: Value =
+            serde_json::from_str(&state_row.get::<String, _>("cursor_json")).unwrap();
+        assert_eq!(cursor["includeResources"], false);
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ingestion_job WHERE job_type='discovery' AND status='pending'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(queued, 1, "resume must reuse the pending checkpoint job");
+
+        state
+            .ingestion_queue
+            .claim("worker-before-restart", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        state.ingestion_queue.recover_startup().await.unwrap();
+        recover_interrupted_source_syncs(&state).await.unwrap();
+        let recovered_run_status: String =
+            sqlx::query_scalar("SELECT status FROM source_sync_run WHERE id=?")
+                .bind(started.run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let recovered_job_status: String = sqlx::query_scalar(
+            "SELECT status FROM ingestion_job WHERE job_type='discovery' LIMIT 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(recovered_run_status, "running");
+        assert_eq!(recovered_job_status, "pending");
+    }
+
+    #[tokio::test]
     async fn persistent_worker_sync_populates_the_local_search_index() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buffer = vec![0_u8; 4096];
                 let read = socket.read(&mut buffer).await.unwrap();
@@ -4321,20 +5205,21 @@ mod tests {
             )),
             ingestion_queue: crate::ingestion::IngestionQueue::new(pool),
         };
-        crate::ingestion::start_workers(state.clone());
-        let job_id = enqueue_source_sync(&state, "mock-javbus", true)
+        crate::ingestion::start_workers(state.clone())
             .await
             .unwrap();
-        server.await.unwrap();
+        let first_run_id = start_incremental_run(&state, "mock-javbus", true)
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let status: String =
-                    sqlx::query_scalar("SELECT status FROM ingestion_job WHERE id=?")
-                        .bind(job_id)
+                    sqlx::query_scalar("SELECT status FROM source_sync_run WHERE id=?")
+                        .bind(first_run_id)
                         .fetch_one(&state.pool)
                         .await
                         .unwrap();
-                if status == "succeeded" {
+                if status == "success" {
                     break;
                 }
                 assert_ne!(status, "failed");
@@ -4357,6 +5242,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resource_count, 1);
+        let second_run_id = start_incremental_run(&state, "mock-javbus", true)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status: String =
+                    sqlx::query_scalar("SELECT status FROM source_sync_run WHERE id=?")
+                        .bind(second_run_id)
+                        .fetch_one(&state.pool)
+                        .await
+                        .unwrap();
+                if status == "success" {
+                    break;
+                }
+                assert_ne!(status, "failed");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("repeated incremental source sync did not finish");
+        server.await.unwrap();
+        let media_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let repeated_resource_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let discovery_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_discovery_item")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(media_count, 1);
+        assert_eq!(repeated_resource_count, 1);
+        assert_eq!(discovery_count, 1);
         let indexed_resources: String =
             sqlx::query_scalar("SELECT resources FROM media_search_document WHERE code='abc-123'")
                 .fetch_one(&state.pool)

@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
         )),
         ingestion_queue: ingestion::IngestionQueue::new(pool.clone()),
     };
-    ingestion::start_workers(state.clone());
+    ingestion::start_workers(state.clone()).await?;
     scheduler::start(state.clone());
     let _watcher = watcher::start(state.clone());
     asset::start_health_job(state.clone());

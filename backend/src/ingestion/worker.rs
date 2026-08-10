@@ -4,38 +4,28 @@ use serde_json::Value;
 
 use crate::AppState;
 
-use super::IngestionJob;
+use super::{IngestionJob, PRIORITY_HISTORICAL_BOOTSTRAP};
 
 const WORKER_COUNT: usize = 2;
 const LEASE_DURATION: Duration = Duration::from_secs(120);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
-pub fn start(state: AppState) {
-    tokio::spawn(async move {
-        if let Err(error) = crate::product::recover_interrupted_source_syncs(&state).await {
-            tracing::error!(%error, "could not recover interrupted source sync state");
-            return;
-        }
-        match state.ingestion_queue.recover_startup().await {
-            Ok(count) if count > 0 => {
-                tracing::warn!(
-                    count,
-                    "requeued ingestion jobs interrupted by service restart"
-                )
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::error!(%error, "could not recover interrupted ingestion jobs");
-                return;
-            }
-        }
-        for index in 0..WORKER_COUNT {
-            let worker_state = state.clone();
-            tokio::spawn(async move {
-                run_worker(worker_state, index).await;
-            });
-        }
-    });
+pub async fn start(state: AppState) -> anyhow::Result<()> {
+    let count = state.ingestion_queue.recover_startup().await?;
+    if count > 0 {
+        tracing::warn!(
+            count,
+            "requeued ingestion jobs interrupted by service restart"
+        );
+    }
+    crate::product::recover_interrupted_source_syncs(&state).await?;
+    for index in 0..WORKER_COUNT {
+        let worker_state = state.clone();
+        tokio::spawn(async move {
+            run_worker(worker_state, index).await;
+        });
+    }
+    Ok(())
 }
 
 async fn run_worker(state: AppState, index: usize) {
@@ -44,8 +34,17 @@ async fn run_worker(state: AppState, index: usize) {
         std::process::id(),
         uuid::Uuid::new_v4()
     );
+    let minimum_priority = if index == 0 {
+        PRIORITY_HISTORICAL_BOOTSTRAP
+    } else {
+        super::job::PRIORITY_RECENT_REPAIR
+    };
     loop {
-        let job = match state.ingestion_queue.claim(&owner, LEASE_DURATION).await {
+        let job = match state
+            .ingestion_queue
+            .claim_at_or_above(&owner, LEASE_DURATION, minimum_priority)
+            .await
+        {
             Ok(Some(job)) => job,
             Ok(None) => {
                 state
@@ -93,7 +92,12 @@ async fn run_claimed_job(state: &AppState, owner: &str, job: IngestionJob) {
     };
     match outcome {
         Ok(()) => match state.ingestion_queue.complete(job.id, owner).await {
-            Ok(true) => tracing::info!(job_id = job.id, "ingestion job completed"),
+            Ok(true) => {
+                tracing::info!(job_id = job.id, "ingestion job completed");
+                if let Err(error) = crate::product::settle_ingestion_job(state, &job).await {
+                    tracing::error!(%error, job_id = job.id, "could not settle ingestion run after job completion");
+                }
+            }
             Ok(false) => tracing::error!(
                 job_id = job.id,
                 "completed ingestion job no longer owned by worker"
@@ -105,12 +109,25 @@ async fn run_claimed_job(state: &AppState, owner: &str, job: IngestionJob) {
         Err(error) => {
             let delay = retry_delay(job.attempts);
             tracing::warn!(%error, job_id = job.id, retry_seconds = delay.as_secs(), "ingestion job failed");
-            if let Err(persist_error) = state
+            match state
                 .ingestion_queue
                 .fail(job.id, owner, &error.to_string(), delay)
                 .await
             {
-                tracing::error!(%persist_error, job_id = job.id, "could not persist ingestion job failure");
+                Ok(true) => {
+                    if let Err(settle_error) =
+                        crate::product::settle_ingestion_job(state, &job).await
+                    {
+                        tracing::error!(%settle_error, job_id = job.id, "could not settle ingestion run after job failure");
+                    }
+                }
+                Ok(false) => tracing::error!(
+                    job_id = job.id,
+                    "failed ingestion job no longer owned by worker"
+                ),
+                Err(persist_error) => {
+                    tracing::error!(%persist_error, job_id = job.id, "could not persist ingestion job failure")
+                }
             }
         }
     }
@@ -125,6 +142,14 @@ async fn execute(state: &AppState, job: &IngestionJob) -> anyhow::Result<()> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             crate::product::execute_source_sync_job(state, &job.provider_key, manual, job.id).await
+        }
+        "discovery" => {
+            let payload = serde_json::from_value(job.payload.clone())?;
+            crate::product::execute_discovery_job(state, &payload).await
+        }
+        "hydrate" => {
+            let payload = serde_json::from_value(job.payload.clone())?;
+            crate::product::execute_hydration_job(state, &payload).await
         }
         job_type => anyhow::bail!("unsupported ingestion job type: {job_type}"),
     }

@@ -16,6 +16,7 @@ pub struct SourceProviderConfig {
     pub fetch_mode: FetchMode,
     pub sync_enabled: bool,
     pub sync_interval_minutes: i64,
+    pub sync_overlap_days: i64,
     pub sync_detail_limit: usize,
 }
 
@@ -58,6 +59,12 @@ impl SourceProviderConfig {
                 .or_else(|| config.get("syncIntervalMinutes").and_then(Value::as_i64))
                 .unwrap_or(1440)
                 .clamp(60, 10080),
+            sync_overlap_days: sync
+                .and_then(|value| value.get("overlapDays"))
+                .and_then(Value::as_i64)
+                .or_else(|| config.get("syncOverlapDays").and_then(Value::as_i64))
+                .unwrap_or(3)
+                .clamp(1, 30),
             sync_detail_limit: config
                 .get("syncDetailLimit")
                 .and_then(Value::as_u64)
@@ -83,6 +90,7 @@ pub struct SourceMedia {
     pub title: String,
     pub poster_url: Option<String>,
     pub source_url: String,
+    pub release_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
