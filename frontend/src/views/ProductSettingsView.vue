@@ -3,6 +3,8 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
   NAlert,
   NButton,
+  NCollapse,
+  NCollapseItem,
   NFormItem,
   NInput,
   NInputNumber,
@@ -52,6 +54,7 @@ const pageSize = ref(20)
 const providers = ref<Paged<ProviderConfig>>({ items: [], total: 0, page: 1, pageSize: 20, totalPages: 0 })
 const providerModalOpen = ref(false)
 const selectedProviderKey = ref('')
+const providerExpandedSections = ref<Array<string | number>>([])
 const providerRuntimes = reactive<Record<string, ProviderRuntime>>({})
 const browserSessions = reactive<Record<string, BrowserSession>>({})
 const secrets = reactive<Record<string, string>>({})
@@ -108,6 +111,15 @@ function sourceAdapterName(provider: ProviderConfig) {
 
 function sourceConfigText(provider: ProviderConfig, key: 'proxyUrl' | 'userAgent') {
   return typeof provider.config[key] === 'string' ? String(provider.config[key]) : ''
+}
+
+function accessConfigSummary(provider: ProviderConfig) {
+  const hasCookie = provider.hasSecret || Boolean(secrets[provider.key])
+  const hasProxy = Boolean(sourceConfigText(provider, 'proxyUrl'))
+  if (hasCookie && hasProxy) return 'Cookie、代理已配置'
+  if (hasCookie) return 'Cookie 已配置'
+  if (hasProxy) return '代理已配置'
+  return '未配置额外参数'
 }
 
 function updateSourceConfig(provider: ProviderConfig, key: 'proxyUrl' | 'userAgent', value: string) {
@@ -260,7 +272,11 @@ async function load() {
 
 function changePage(value: number) { page.value = value; load() }
 function changePageSize(value: number) { pageSize.value = value; page.value = 1; load() }
-function openProvider(key: string) { selectedProviderKey.value = key; providerModalOpen.value = true }
+function openProvider(key: string) {
+  selectedProviderKey.value = key
+  providerExpandedSections.value = []
+  providerModalOpen.value = true
+}
 watch(selectedProvider, value => {
   if (providerModalOpen.value && !value) providerModalOpen.value = false
 })
@@ -624,203 +640,223 @@ onUnmounted(() => {
                 @update:value="value => updateSourceFetchMode(provider, value)"
               />
             </n-form-item>
-            <n-form-item label="Cookie">
-              <n-input
-                v-model:value="secrets[provider.key]"
-                type="password"
-                show-password-on="click"
-                :placeholder="provider.hasSecret ? '已保存，留空保持不变' : '正常站点会话 Cookie，可留空'"
-              />
-            </n-form-item>
-            <n-form-item label="代理 URL（可选）">
-              <n-input
-                :value="sourceConfigText(provider, 'proxyUrl')"
-                placeholder="例如 http://192.168.5.1:7890；必须能从 Luma 容器访问"
-                @update:value="value => updateSourceConfig(provider, 'proxyUrl', value)"
-              />
-            </n-form-item>
-            <n-form-item label="浏览器 User-Agent（可选）">
-              <n-input
-                :value="sourceConfigText(provider, 'userAgent')"
-                type="textarea"
-                :autosize="{ minRows: 2, maxRows: 3 }"
-                placeholder="仅用于 HTTP 模式的兼容设置；Chromium 使用真实浏览器会话"
-                @update:value="value => updateSourceConfig(provider, 'userAgent', value)"
-              />
-            </n-form-item>
-            <div class="source-sync-settings">
-              <div class="compact-switch-row">
-                <div><strong>每日后台同步</strong><span>按设定间隔更新本地索引，搜索时不直接请求该网站。</span></div>
-                <n-switch
-                  :value="sourceSyncEnabled(provider)"
-                  @update:value="value => updateSourceSyncEnabled(provider, value)"
-                />
-              </div>
-              <n-form-item label="同步间隔（分钟）">
-                <n-input-number
-                  :value="sourceSyncInterval(provider)"
-                  :min="60"
-                  :max="10080"
-                  :disabled="!sourceSyncEnabled(provider)"
-                  style="width: 100%"
-                  @update:value="value => updateSourceSyncInterval(provider, value)"
-                />
-              </n-form-item>
-              <n-form-item label="每轮补全详情数">
-                <n-input-number
-                  :value="sourceSyncDetailLimit(provider)"
-                  :min="0"
-                  :max="40"
-                  :disabled="!sourceSyncEnabled(provider)"
-                  style="width: 100%"
-                  @update:value="value => updateSourceSyncDetailLimit(provider, value)"
-                />
-              </n-form-item>
-              <div class="source-priority-grid">
-                <n-form-item label="元数据优先级">
-                  <n-input-number
-                    :value="sourceConfigNumber(provider, 'metadataPriority', 100)"
-                    :min="-1000"
-                    :max="1000"
-                    style="width: 100%"
-                    @update:value="value => updateSourceConfigNumber(provider, 'metadataPriority', value, 100)"
-                  />
-                </n-form-item>
-                <n-form-item label="资源优先级">
-                  <n-input-number
-                    :value="sourceConfigNumber(provider, 'resourcePriority', 100)"
-                    :min="-1000"
-                    :max="1000"
-                    style="width: 100%"
-                    @update:value="value => updateSourceConfigNumber(provider, 'resourcePriority', value, 100)"
-                  />
-                </n-form-item>
-                <n-form-item label="资源缓存（小时）">
-                  <n-input-number
-                    :value="sourceConfigNumber(provider, 'resourceCacheTtlHours', 72)"
-                    :min="1"
-                    :max="720"
-                    style="width: 100%"
-                    @update:value="value => updateSourceConfigNumber(provider, 'resourceCacheTtlHours', value, 72)"
-                  />
-                </n-form-item>
-              </div>
-              <div class="source-sync-summary">
-                <header>
-                  <div><strong>本地索引同步</strong><small>{{ provider.syncLastMessage || '等待第一次同步' }}</small></div>
+            <n-collapse v-model:expanded-names="providerExpandedSections" class="provider-detail-sections" display-directive="show">
+              <n-collapse-item name="access" title="访问凭据与网络">
+                <template #header-extra><span class="provider-section-summary">{{ accessConfigSummary(provider) }}</span></template>
+                <div class="provider-section-body">
+                  <n-form-item label="Cookie">
+                    <n-input
+                      v-model:value="secrets[provider.key]"
+                      type="password"
+                      show-password-on="click"
+                      :placeholder="provider.hasSecret ? '已保存，留空保持不变' : '正常站点会话 Cookie，可留空'"
+                    />
+                  </n-form-item>
+                  <n-form-item label="代理 URL（可选）">
+                    <n-input
+                      :value="sourceConfigText(provider, 'proxyUrl')"
+                      placeholder="例如 http://192.168.5.1:7890；必须能从 Luma 容器访问"
+                      @update:value="value => updateSourceConfig(provider, 'proxyUrl', value)"
+                    />
+                  </n-form-item>
+                  <n-form-item label="浏览器 User-Agent（可选）">
+                    <n-input
+                      :value="sourceConfigText(provider, 'userAgent')"
+                      type="textarea"
+                      :autosize="{ minRows: 2, maxRows: 3 }"
+                      placeholder="仅用于 HTTP 模式的兼容设置；Chromium 使用真实浏览器会话"
+                      @update:value="value => updateSourceConfig(provider, 'userAgent', value)"
+                    />
+                  </n-form-item>
+                </div>
+              </n-collapse-item>
+
+              <n-collapse-item name="sync" title="本地索引同步">
+                <template #header-extra>
                   <span class="source-sync-status" :data-status="provider.syncStatus">{{ syncStatusLabel[provider.syncStatus] }}</span>
-                </header>
-                <dl>
-                  <div><dt>当前模式</dt><dd>{{ provider.syncActiveMode === 'bootstrap' ? '历史回填' : '增量同步' }}{{ provider.syncBootstrapPaused ? '，已暂停' : '' }}</dd></div>
-                  <div><dt>当前位置</dt><dd :title="syncCursor(provider)">{{ syncCursor(provider) }}</dd></div>
-                  <div><dt>最近成功</dt><dd>{{ syncDate(provider.syncLastSuccessAt, '尚未成功') }}</dd></div>
-                  <div><dt>下次执行</dt><dd>{{ sourceSyncEnabled(provider) ? syncDate(provider.syncNextRunAt, '等待安排') : '已关闭' }}</dd></div>
-                  <div><dt>发现</dt><dd>{{ provider.syncDiscoveryCount }} 项</dd></div>
-                  <div><dt>已补全</dt><dd>{{ provider.syncHydratedCount }} 项</dd></div>
-                  <div><dt>待处理</dt><dd>{{ provider.syncPendingCount }} 项</dd></div>
-                  <div><dt>补全失败</dt><dd>{{ provider.syncHydrationFailedCount }} 项</dd></div>
-                  <div><dt>数据变化</dt><dd>新增 {{ provider.syncInsertedCount }}，更新 {{ provider.syncUpdatedCount }}</dd></div>
-                  <div><dt>连续失败</dt><dd>{{ provider.syncFailureCount }} 次</dd></div>
-                </dl>
-                <n-alert v-if="provider.syncStatus === 'failed' && provider.syncLastMessage" type="error" title="最近一次同步失败">
-                  {{ provider.syncLastMessage }}
-                </n-alert>
-              </div>
-              <div class="source-bootstrap-control">
-                <n-alert type="info" :show-icon="false">为保证任务稳定，历史回填单次最多 31 天（包含开始和结束日期）。</n-alert>
-                <div class="source-bootstrap-range">
-                  <n-form-item label="历史开始日期"><n-input v-model:value="bootstrapWindow(provider).from" placeholder="2024-01-01" /></n-form-item>
-                  <n-form-item label="历史结束日期"><n-input v-model:value="bootstrapWindow(provider).to" placeholder="2026-08-10" /></n-form-item>
+                </template>
+                <div class="source-sync-settings">
+                  <div class="compact-switch-row">
+                    <div><strong>每日后台同步</strong><span>按设定间隔更新本地索引，搜索时不直接请求该网站。</span></div>
+                    <n-switch
+                      :value="sourceSyncEnabled(provider)"
+                      @update:value="value => updateSourceSyncEnabled(provider, value)"
+                    />
+                  </div>
+                  <n-form-item label="同步间隔（分钟）">
+                    <n-input-number
+                      :value="sourceSyncInterval(provider)"
+                      :min="60"
+                      :max="10080"
+                      :disabled="!sourceSyncEnabled(provider)"
+                      style="width: 100%"
+                      @update:value="value => updateSourceSyncInterval(provider, value)"
+                    />
+                  </n-form-item>
+                  <n-form-item label="每轮补全详情数">
+                    <n-input-number
+                      :value="sourceSyncDetailLimit(provider)"
+                      :min="0"
+                      :max="40"
+                      :disabled="!sourceSyncEnabled(provider)"
+                      style="width: 100%"
+                      @update:value="value => updateSourceSyncDetailLimit(provider, value)"
+                    />
+                  </n-form-item>
+                  <div class="source-priority-grid">
+                    <n-form-item label="元数据优先级">
+                      <n-input-number
+                        :value="sourceConfigNumber(provider, 'metadataPriority', 100)"
+                        :min="-1000"
+                        :max="1000"
+                        style="width: 100%"
+                        @update:value="value => updateSourceConfigNumber(provider, 'metadataPriority', value, 100)"
+                      />
+                    </n-form-item>
+                    <n-form-item label="资源优先级">
+                      <n-input-number
+                        :value="sourceConfigNumber(provider, 'resourcePriority', 100)"
+                        :min="-1000"
+                        :max="1000"
+                        style="width: 100%"
+                        @update:value="value => updateSourceConfigNumber(provider, 'resourcePriority', value, 100)"
+                      />
+                    </n-form-item>
+                    <n-form-item label="资源缓存（小时）">
+                      <n-input-number
+                        :value="sourceConfigNumber(provider, 'resourceCacheTtlHours', 72)"
+                        :min="1"
+                        :max="720"
+                        style="width: 100%"
+                        @update:value="value => updateSourceConfigNumber(provider, 'resourceCacheTtlHours', value, 72)"
+                      />
+                    </n-form-item>
+                  </div>
+                  <div class="source-sync-summary">
+                    <header>
+                      <div><strong>同步详情</strong><small>{{ provider.syncLastMessage || '等待第一次同步' }}</small></div>
+                    </header>
+                    <dl>
+                      <div><dt>当前模式</dt><dd>{{ provider.syncActiveMode === 'bootstrap' ? '历史回填' : '增量同步' }}{{ provider.syncBootstrapPaused ? '，已暂停' : '' }}</dd></div>
+                      <div><dt>当前位置</dt><dd :title="syncCursor(provider)">{{ syncCursor(provider) }}</dd></div>
+                      <div><dt>最近成功</dt><dd>{{ syncDate(provider.syncLastSuccessAt, '尚未成功') }}</dd></div>
+                      <div><dt>下次执行</dt><dd>{{ sourceSyncEnabled(provider) ? syncDate(provider.syncNextRunAt, '等待安排') : '已关闭' }}</dd></div>
+                      <div><dt>发现</dt><dd>{{ provider.syncDiscoveryCount }} 项</dd></div>
+                      <div><dt>已补全</dt><dd>{{ provider.syncHydratedCount }} 项</dd></div>
+                      <div><dt>待处理</dt><dd>{{ provider.syncPendingCount }} 项</dd></div>
+                      <div><dt>补全失败</dt><dd>{{ provider.syncHydrationFailedCount }} 项</dd></div>
+                      <div><dt>数据变化</dt><dd>新增 {{ provider.syncInsertedCount }}，更新 {{ provider.syncUpdatedCount }}</dd></div>
+                      <div><dt>连续失败</dt><dd>{{ provider.syncFailureCount }} 次</dd></div>
+                    </dl>
+                    <n-alert v-if="provider.syncStatus === 'failed' && provider.syncLastMessage" type="error" title="最近一次同步失败">
+                      {{ provider.syncLastMessage }}
+                    </n-alert>
+                  </div>
+                  <div class="source-bootstrap-control">
+                    <n-alert type="info" :show-icon="false">为保证任务稳定，历史回填单次最多 31 天（包含开始和结束日期）。</n-alert>
+                    <div class="source-bootstrap-range">
+                      <n-form-item label="历史开始日期"><n-input v-model:value="bootstrapWindow(provider).from" placeholder="2024-01-01" /></n-form-item>
+                      <n-form-item label="历史结束日期"><n-input v-model:value="bootstrapWindow(provider).to" placeholder="2026-08-10" /></n-form-item>
+                    </div>
+                    <div class="source-sync-actions">
+                      <n-button type="primary" :loading="syncing === `${provider.key}:incremental`" :disabled="!provider.enabled || provider.syncStatus === 'running'" @click="startIncremental(provider)">
+                        <template #icon><IconRefresh /></template>立即增量同步
+                      </n-button>
+                      <n-button secondary :loading="syncing === `${provider.key}:bootstrap`" :disabled="!provider.enabled || provider.syncStatus === 'running'" @click="startBootstrap(provider)">
+                        <template #icon><IconHistory /></template>历史回填
+                      </n-button>
+                      <n-button v-if="provider.syncActiveMode === 'bootstrap' && provider.syncStatus === 'running' && !provider.syncBootstrapPaused" secondary :loading="syncing === `${provider.key}:pause`" @click="pauseBootstrap(provider)">
+                        <template #icon><IconPlayerPause /></template>暂停回填
+                      </n-button>
+                      <n-button v-if="provider.syncBootstrapPaused" secondary :loading="syncing === `${provider.key}:resume`" @click="resumeBootstrap(provider)">
+                        <template #icon><IconPlayerPlay /></template>继续回填
+                      </n-button>
+                      <n-button quaternary :loading="reparsing === provider.key" @click="reparseProvider(provider)">重解析本地快照</n-button>
+                    </div>
+                  </div>
                 </div>
-                <div class="source-sync-actions">
-                  <n-button type="primary" :loading="syncing === `${provider.key}:incremental`" :disabled="!provider.enabled || provider.syncStatus === 'running'" @click="startIncremental(provider)">
-                    <template #icon><IconRefresh /></template>立即增量同步
-                  </n-button>
-                  <n-button secondary :loading="syncing === `${provider.key}:bootstrap`" :disabled="!provider.enabled || provider.syncStatus === 'running'" @click="startBootstrap(provider)">
-                    <template #icon><IconHistory /></template>历史回填
-                  </n-button>
-                  <n-button v-if="provider.syncActiveMode === 'bootstrap' && provider.syncStatus === 'running' && !provider.syncBootstrapPaused" secondary :loading="syncing === `${provider.key}:pause`" @click="pauseBootstrap(provider)">
-                    <template #icon><IconPlayerPause /></template>暂停回填
-                  </n-button>
-                  <n-button v-if="provider.syncBootstrapPaused" secondary :loading="syncing === `${provider.key}:resume`" @click="resumeBootstrap(provider)">
-                    <template #icon><IconPlayerPlay /></template>继续回填
-                  </n-button>
-                  <n-button quaternary :loading="reparsing === provider.key" @click="reparseProvider(provider)">重解析本地快照</n-button>
+              </n-collapse-item>
+
+              <n-collapse-item name="runtime" title="访问运行状态与诊断">
+                <template #header-extra>
+                  <span v-if="providerRuntimes[provider.key]" class="source-sync-status" :data-status="providerRuntimes[provider.key].state">
+                    {{ runtimeStateLabel[providerRuntimes[provider.key].state] }}
+                  </span>
+                  <span v-else class="provider-section-summary">尚未获取状态</span>
+                </template>
+                <div class="provider-section-body">
+                  <div v-if="providerRuntimes[provider.key]" class="source-runtime-summary">
+                    <header>
+                      <div><strong>运行详情</strong><small>{{ providerRuntimes[provider.key].browserProfilePath }}</small></div>
+                    </header>
+                    <dl>
+                      <div><dt>当前方式</dt><dd>{{ providerRuntimes[provider.key].activeFetchMode }}</dd></div>
+                      <div><dt>最近成功</dt><dd>{{ syncDate(providerRuntimes[provider.key].lastSuccessAt, '尚未成功') }}</dd></div>
+                      <div><dt>最近失败</dt><dd>{{ syncDate(providerRuntimes[provider.key].lastFailureAt, '无') }}</dd></div>
+                      <div><dt>连续失败</dt><dd>{{ providerRuntimes[provider.key].failureCount }} 次</dd></div>
+                    </dl>
+                    <n-alert v-if="providerRuntimes[provider.key].lastFailureMessage" type="warning" title="最近诊断">
+                      {{ providerRuntimes[provider.key].lastFailureMessage }}
+                    </n-alert>
+                  </div>
+                  <n-alert
+                    v-if="browserSessions[provider.key]"
+                    type="warning"
+                    title="交互浏览器会话正在运行"
+                  >
+                    请在新窗口完成站点正常要求的登录、年龄确认或人工验证。会话将在
+                    {{ syncDate(browserSessions[provider.key].expiresAt, '15 分钟后') }} 自动关闭；完成后点击“保存并测试”。
+                  </n-alert>
+                  <n-alert type="info" :show-icon="false">
+                    诊断会访问该 Provider 的真实页面并验证页面结构。浏览器会话仅供你完成站点要求的正常交互，保存后的 Cookie 由该来源独立复用；不会自动处理验证码。
+                  </n-alert>
+                  <div class="provider-card-actions">
+                    <n-button secondary :loading="diagnosing === provider.key" @click="diagnoseProvider(provider)">
+                      <template #icon><IconPlugConnected /></template>
+                      真实来源诊断
+                    </n-button>
+                    <n-button
+                      v-if="!browserSessions[provider.key]"
+                      secondary
+                      :loading="browserSessionBusy === provider.key"
+                      :disabled="!provider.enabled"
+                      @click="startBrowserSession(provider)"
+                    >
+                      <template #icon><IconServer /></template>
+                      建立浏览器会话
+                    </n-button>
+                    <template v-else>
+                      <n-button
+                        type="success"
+                        :loading="browserSessionBusy === provider.key"
+                        @click="completeBrowserSession(provider)"
+                      >
+                        <template #icon><IconCheck /></template>
+                        保存并测试
+                      </n-button>
+                      <n-button
+                        secondary
+                        :disabled="browserSessionBusy === provider.key"
+                        @click="cancelBrowserSession(provider)"
+                      >
+                        关闭会话
+                      </n-button>
+                    </template>
+                    <n-button
+                      quaternary
+                      type="error"
+                      :disabled="browserSessionBusy === provider.key || Boolean(browserSessions[provider.key])"
+                      @click="clearBrowserProfile(provider)"
+                    >
+                      清除浏览器 Profile
+                    </n-button>
+                  </div>
+                  <n-alert v-if="testMessages[provider.key]" :type="testMessages[provider.key].ok ? 'success' : 'error'">
+                    {{ testMessages[provider.key].text }}
+                  </n-alert>
                 </div>
-              </div>
-            </div>
-            <div v-if="providerRuntimes[provider.key]" class="source-runtime-summary">
-              <header>
-                <div><strong>访问运行状态</strong><small>{{ providerRuntimes[provider.key].browserProfilePath }}</small></div>
-                <span class="source-sync-status" :data-status="providerRuntimes[provider.key].state">
-                  {{ runtimeStateLabel[providerRuntimes[provider.key].state] }}
-                </span>
-              </header>
-              <dl>
-                <div><dt>当前方式</dt><dd>{{ providerRuntimes[provider.key].activeFetchMode }}</dd></div>
-                <div><dt>最近成功</dt><dd>{{ syncDate(providerRuntimes[provider.key].lastSuccessAt, '尚未成功') }}</dd></div>
-                <div><dt>最近失败</dt><dd>{{ syncDate(providerRuntimes[provider.key].lastFailureAt, '无') }}</dd></div>
-                <div><dt>连续失败</dt><dd>{{ providerRuntimes[provider.key].failureCount }} 次</dd></div>
-              </dl>
-              <n-alert v-if="providerRuntimes[provider.key].lastFailureMessage" type="warning" title="最近诊断">
-                {{ providerRuntimes[provider.key].lastFailureMessage }}
-              </n-alert>
-            </div>
-            <n-alert
-              v-if="browserSessions[provider.key]"
-              type="warning"
-              title="交互浏览器会话正在运行"
-            >
-              请在新窗口完成站点正常要求的登录、年龄确认或人工验证。会话将在
-              {{ syncDate(browserSessions[provider.key].expiresAt, '15 分钟后') }} 自动关闭；完成后点击“保存并测试”。
-            </n-alert>
-            <n-alert type="info" :show-icon="false">
-              诊断会访问该 Provider 的真实页面并验证页面结构。浏览器会话仅供你完成站点要求的正常交互，保存后的 Cookie 由该来源独立复用；不会自动处理验证码。
-            </n-alert>
-            <div class="provider-card-actions">
-              <n-button secondary :loading="diagnosing === provider.key" @click="diagnoseProvider(provider)">
-                <template #icon><IconPlugConnected /></template>
-                真实来源诊断
-              </n-button>
-              <n-button
-                v-if="!browserSessions[provider.key]"
-                secondary
-                :loading="browserSessionBusy === provider.key"
-                :disabled="!provider.enabled"
-                @click="startBrowserSession(provider)"
-              >
-                <template #icon><IconServer /></template>
-                建立浏览器会话
-              </n-button>
-              <template v-else>
-                <n-button
-                  type="success"
-                  :loading="browserSessionBusy === provider.key"
-                  @click="completeBrowserSession(provider)"
-                >
-                  <template #icon><IconCheck /></template>
-                  保存并测试
-                </n-button>
-                <n-button
-                  secondary
-                  :disabled="browserSessionBusy === provider.key"
-                  @click="cancelBrowserSession(provider)"
-                >
-                  关闭会话
-                </n-button>
-              </template>
-              <n-button
-                quaternary
-                type="error"
-                :disabled="browserSessionBusy === provider.key || Boolean(browserSessions[provider.key])"
-                @click="clearBrowserProfile(provider)"
-              >
-                清除浏览器 Profile
-              </n-button>
-            </div>
-            <n-alert v-if="testMessages[provider.key]" :type="testMessages[provider.key].ok ? 'success' : 'error'">
-              {{ testMessages[provider.key].text }}
-            </n-alert>
+              </n-collapse-item>
+            </n-collapse>
             </div>
           </template>
         </n-modal>
