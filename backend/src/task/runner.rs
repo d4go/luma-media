@@ -37,11 +37,7 @@ async fn run_loop(state: AppState, index: usize) {
         uuid::Uuid::new_v4()
     );
     loop {
-        let run = match state
-            .task_engine
-            .claim_next_run(&owner, RUN_LEASE, 0)
-            .await
-        {
+        let run = match state.task_engine.claim_next_run(&owner, RUN_LEASE, 0).await {
             Ok(Some(run)) => run,
             Ok(None) => {
                 state.task_engine.wait(Duration::from_secs(1)).await;
@@ -222,13 +218,12 @@ async fn execute_item(
                 return;
             }
             if item.retry_count < ITEM_MAX_RETRIES {
-                if let Err(persist_error) =
-                    ctx.retry_item(&message, ITEM_RETRY_DELAY).await
-                {
+                if let Err(persist_error) = ctx.retry_item(&message, ITEM_RETRY_DELAY).await {
                     tracing::error!(%persist_error, run_id, item_id = item.id, "could not requeue task item");
                 }
-            } else if let Err(persist_error) =
-                ctx.mark_item_failed(&message, item.checkpoint.clone()).await
+            } else if let Err(persist_error) = ctx
+                .mark_item_failed(&message, item.checkpoint.clone())
+                .await
             {
                 tracing::error!(%persist_error, run_id, item_id = item.id, "could not persist item failure");
             }

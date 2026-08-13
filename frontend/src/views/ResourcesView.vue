@@ -54,12 +54,13 @@ function changeRecentPage(value: number) { recentPage.value = value; runSearch()
 function changeRecentPageSize(value: number) { recentPageSize.value = value; recentPage.value = 1; runSearch() }
 
 async function resolveFromSources() {
-  if (!requestedCode.value) return
+  const term = query.value.trim()
+  if (!term) return
   resolving.value = true
   try {
-    const response = await api.resolveCatalog(requestedCode.value, true)
+    const response = await api.resolveCatalog(term, Boolean(requestedCode.value))
     resolveStatus.value = `已创建 ${response.jobIds.length} 个按需查找任务，完成后会自动刷新。`
-    message.success(`正在从已启用的数据源查找 ${requestedCode.value}`)
+    message.success(`正在从已启用的数据源查找 ${term}`)
   } catch (reason) {
     message.error(reason instanceof Error ? reason.message : '无法创建按需查找任务')
   } finally {
@@ -76,9 +77,11 @@ function startEvents() {
   eventSource = new EventSource(productEventUrl)
   eventSource.onmessage = async event => {
     try {
-      const payload = JSON.parse(event.data) as { event?: string; data?: { code?: string; status?: string } }
-      if (payload.event !== 'catalog-resolve' || payload.data?.code?.toUpperCase() !== requestedCode.value.toUpperCase()) return
-      if (payload.data.status === 'success') {
+      const payload = JSON.parse(event.data) as { event?: string; data?: { code?: string; query?: string; status?: string } }
+      const eventQuery = String(payload.data?.query ?? payload.data?.code ?? '').trim().toLocaleLowerCase()
+      const expectedQuery = (requestedCode.value || query.value.trim()).toLocaleLowerCase()
+      if (payload.event !== 'catalog-resolve' || eventQuery !== expectedQuery) return
+      if (payload.data?.status === 'success') {
         resolveStatus.value = '数据源查找完成，本地索引已更新。'
         await runSearch()
       }
@@ -150,11 +153,10 @@ onUnmounted(() => eventSource?.close())
         <div v-else class="quiet-empty resolve-empty">
           <IconSearch :size="28" />
           <strong>本地数据库暂无结果</strong>
-          <span v-if="requestedCode">可以创建高优先级后台任务，从所有已启用的数据源查找这个番号。</span>
-          <span v-else>请尝试完整番号、其他标题写法或演员别名。</span>
-          <n-button v-if="databaseMiss && requestedCode" type="primary" :loading="resolving" @click="resolveFromSources">
+          <span>可以创建高优先级后台任务，从所有已启用的数据源查找这个番号、标题或演员。</span>
+          <n-button v-if="databaseMiss" type="primary" :loading="resolving" @click="resolveFromSources">
             <template #icon><IconCloudDownload /></template>
-            从数据源查找 {{ requestedCode }}
+            从数据源查找 {{ query.trim() }}
           </n-button>
           <small v-if="resolveStatus" class="resolve-status">{{ resolveStatus }}</small>
         </div>

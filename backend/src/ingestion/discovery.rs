@@ -116,7 +116,9 @@ pub fn reached_window_start(items: &[SourceMedia], from: &str) -> bool {
         .iter()
         .filter_map(|item| item.release_date.as_deref())
         .collect::<Vec<_>>();
-    !dates.is_empty() && dates.iter().all(|date| *date <= from)
+    // A single release day may span multiple pages. Stop only after an entire
+    // page is strictly older than the inclusive lower bound.
+    !dates.is_empty() && dates.iter().all(|date| *date < from)
 }
 
 fn candidate_hash(item: &SourceMedia) -> String {
@@ -202,5 +204,17 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn same_day_boundary_does_not_stop_before_all_same_day_pages_are_seen() {
+        let mut exact = item("Exact boundary day");
+        exact.release_date = Some("2020-01-01".into());
+        assert!(!reached_window_start(&[exact.clone()], "2020-01-01"));
+
+        let mut older = item("Older day");
+        older.release_date = Some("2019-12-31".into());
+        assert!(reached_window_start(&[older.clone()], "2020-01-01"));
+        assert!(!reached_window_start(&[exact, older], "2020-01-01"));
     }
 }

@@ -19,7 +19,7 @@ use crate::{
         Folder, FolderInput, LogEntry, MediaItem, MetaTubeConnection, QBittorrentConnection,
         ScrapeOptions, ServiceHealth, ServiceStatus, Settings, Task, TaskDetail,
     },
-    pagination::{Paged, PageParams},
+    pagination::{PageParams, Paged},
     provider::MetaTubeClient,
     qbittorrent::QBittorrentClient,
     scanner,
@@ -107,11 +107,7 @@ async fn dashboard(
     .bind(params.offset())
     .fetch_all(&state.pool)
     .await?;
-    let recent_activity = Paged::new(
-        rows.iter().map(task_from_row).collect(),
-        task_count,
-        params,
-    );
+    let recent_activity = Paged::new(rows.iter().map(task_from_row).collect(), task_count, params);
     Ok(Json(DashboardStats {
         media_count,
         task_count,
@@ -131,11 +127,9 @@ async fn list_folders(
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_config")
         .fetch_one(&state.pool)
         .await?;
-    let rows = sqlx::query(
-        "SELECT * FROM media_config ORDER BY name ASC LIMIT ? OFFSET ?",
-    )
-    .bind(params.limit())
-    .bind(params.offset())
+    let rows = sqlx::query("SELECT * FROM media_config ORDER BY name ASC LIMIT ? OFFSET ?")
+        .bind(params.limit())
+        .bind(params.offset())
         .fetch_all(&state.pool)
         .await?;
     Ok(Json(Paged::new(
@@ -575,10 +569,11 @@ async fn list_media(
             (total, rows)
         }
         (None, None, Some(status)) => {
-            let total = sqlx::query_scalar("SELECT COUNT(*) FROM media_item mi WHERE mi.status = ?")
-                .bind(status)
-                .fetch_one(&state.pool)
-                .await?;
+            let total =
+                sqlx::query_scalar("SELECT COUNT(*) FROM media_item mi WHERE mi.status = ?")
+                    .bind(status)
+                    .fetch_one(&state.pool)
+                    .await?;
             let rows = sqlx::query(&format!(
                 "{} WHERE mi.status = ? ORDER BY mi.updated_at DESC LIMIT ? OFFSET ?",
                 storage::MEDIA_SELECT
@@ -1500,13 +1495,12 @@ async fn list_logs(
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM system_log")
         .fetch_one(&state.pool)
         .await?;
-    let rows = sqlx::query(
-        "SELECT * FROM system_log ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-    )
-        .bind(params.limit())
-        .bind(params.offset())
-        .fetch_all(&state.pool)
-        .await?;
+    let rows =
+        sqlx::query("SELECT * FROM system_log ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?")
+            .bind(params.limit())
+            .bind(params.offset())
+            .fetch_all(&state.pool)
+            .await?;
     Ok(Json(Paged::new(
         rows.iter()
             .map(|row| LogEntry {

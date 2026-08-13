@@ -36,14 +36,31 @@ impl TaskEngine {
             "idempotency key is required"
         );
         if let Some(row) = sqlx::query(
-            "SELECT * FROM job_run WHERE idempotency_key=? AND status IN ('pending','running','pausing','paused','cancelling') ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM job_run WHERE (idempotency_key=? OR instr(idempotency_key, ? || ':run:')=1) AND status IN ('pending','running','pausing','paused','cancelling') ORDER BY id DESC LIMIT 1",
         )
+        .bind(input.idempotency_key)
         .bind(input.idempotency_key)
         .fetch_optional(&self.pool)
         .await?
         {
             return Ok(job_run_from_row(&row));
         }
+        let key_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM job_run WHERE idempotency_key=? OR instr(idempotency_key, ? || ':run:')=1)",
+        )
+        .bind(input.idempotency_key)
+        .bind(input.idempotency_key)
+        .fetch_one(&self.pool)
+        .await?;
+        let stored_idempotency_key = if key_exists {
+            format!(
+                "{}:run:{}",
+                input.idempotency_key,
+                uuid::Uuid::new_v4().simple()
+            )
+        } else {
+            input.idempotency_key.to_owned()
+        };
         let config = input.config.to_string();
         let id = sqlx::query(
             "INSERT INTO job_run(job_definition_id,job_type,provider_key,status,idempotency_key,priority,config_json) VALUES (?,?,?,'pending',?,?,?) RETURNING id",
@@ -51,7 +68,7 @@ impl TaskEngine {
         .bind(input.job_definition_id)
         .bind(input.job_type)
         .bind(input.provider_key)
-        .bind(input.idempotency_key)
+        .bind(&stored_idempotency_key)
         .bind(input.priority)
         .bind(&config)
         .fetch_one(&self.pool)
@@ -160,19 +177,17 @@ impl TaskEngine {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 200);
         let offset = (page - 1) * page_size;
-        let total: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM job_event WHERE run_id=?")
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_event WHERE run_id=?")
+            .bind(run_id)
+            .fetch_one(&self.pool)
+            .await?;
+        let rows =
+            sqlx::query("SELECT * FROM job_event WHERE run_id=? ORDER BY id DESC LIMIT ? OFFSET ?")
                 .bind(run_id)
-                .fetch_one(&self.pool)
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
                 .await?;
-        let rows = sqlx::query(
-            "SELECT * FROM job_event WHERE run_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
-        )
-        .bind(run_id)
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
         Ok((rows.iter().map(job_event_from_row).collect(), total))
     }
 
@@ -301,13 +316,11 @@ impl TaskEngine {
     }
 
     /// Release a run after its worker finishes (success, failure, pause, cancel).
-    pub async fn release_run(
-        &self,
-        run_id: i64,
-        owner: &str,
-        to: JobStatus,
-    ) -> sqlx::Result<bool> {
-        let terminal = matches!(to, JobStatus::Success | JobStatus::Failed | JobStatus::Cancelled);
+    pub async fn release_run(&self, run_id: i64, owner: &str, to: JobStatus) -> sqlx::Result<bool> {
+        let terminal = matches!(
+            to,
+            JobStatus::Success | JobStatus::Failed | JobStatus::Cancelled
+        );
         let result = sqlx::query(
             "UPDATE job_run SET status=?,lease_owner=NULL,lease_expires_at=NULL,finished_at=CASE WHEN ?=1 THEN datetime('now') ELSE NULL END,updated_at=datetime('now') WHERE id=? AND lease_owner=?",
         )
@@ -440,7 +453,10 @@ impl TaskEngine {
     ) -> anyhow::Result<bool> {
         let terminal = matches!(
             status,
-            JobItemStatus::Success | JobItemStatus::Failed | JobItemStatus::Skipped | JobItemStatus::Cancelled
+            JobItemStatus::Success
+                | JobItemStatus::Failed
+                | JobItemStatus::Skipped
+                | JobItemStatus::Cancelled
         );
         let result = sqlx::query(
             "UPDATE job_item SET status=?,error_message=?,checkpoint_json=?,lease_owner=NULL,lease_expires_at=NULL,finished_at=CASE WHEN ?=1 THEN datetime('now') ELSE finished_at END,updated_at=datetime('now') WHERE id=? AND lease_owner=?",
@@ -494,11 +510,10 @@ impl TaskEngine {
         to: JobStatus,
         error_message: Option<&str>,
     ) -> anyhow::Result<JobRun> {
-        let from: String =
-            sqlx::query_scalar("SELECT status FROM job_run WHERE id=?")
-                .bind(run_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let from: String = sqlx::query_scalar("SELECT status FROM job_run WHERE id=?")
+            .bind(run_id)
+            .fetch_one(&self.pool)
+            .await?;
         let result = sqlx::query(
             "UPDATE job_run SET status=?,error_message=?,started_at=CASE WHEN ?='running' AND started_at IS NULL THEN datetime('now') ELSE started_at END,finished_at=CASE WHEN ? IN ('success','failed','cancelled') THEN datetime('now') ELSE NULL END,updated_at=datetime('now') WHERE id=?",
         )
@@ -584,7 +599,7 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
-    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;
 
@@ -612,16 +627,56 @@ mod tests {
     #[tokio::test]
     async fn create_run_is_idempotent_by_key() {
         let engine = engine().await;
-        let first = engine.create_run(input("bootstrap:javdb:2020")).await.unwrap();
-        let second = engine.create_run(input("bootstrap:javdb:2020")).await.unwrap();
+        let first = engine
+            .create_run(input("bootstrap:javdb:2020"))
+            .await
+            .unwrap();
+        let second = engine
+            .create_run(input("bootstrap:javdb:2020"))
+            .await
+            .unwrap();
         assert_eq!(first.id, second.id);
         assert_eq!(first.status, JobStatus::Pending);
     }
 
     #[tokio::test]
+    async fn completed_date_range_can_be_run_again_without_losing_active_deduplication() {
+        let engine = engine().await;
+        let first = engine
+            .create_run(input("bootstrap:javdb:2020-repeat"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE job_run SET status='success' WHERE id=?")
+            .bind(first.id)
+            .execute(engine.pool())
+            .await
+            .unwrap();
+
+        let rerun = engine
+            .create_run(input("bootstrap:javdb:2020-repeat"))
+            .await
+            .unwrap();
+        let duplicate = engine
+            .create_run(input("bootstrap:javdb:2020-repeat"))
+            .await
+            .unwrap();
+
+        assert_ne!(rerun.id, first.id);
+        assert_eq!(duplicate.id, rerun.id);
+        assert!(
+            rerun
+                .idempotency_key
+                .starts_with("bootstrap:javdb:2020-repeat:run:")
+        );
+    }
+
+    #[tokio::test]
     async fn claim_finish_item_advances_run_progress() {
         let engine = engine().await;
-        let run = engine.create_run(input("bootstrap:javdb:2021")).await.unwrap();
+        let run = engine
+            .create_run(input("bootstrap:javdb:2021"))
+            .await
+            .unwrap();
         for key in ["page-1", "page-2"] {
             engine.create_item(run.id, key, json!({})).await.unwrap();
         }
@@ -631,10 +686,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(item.item_key, "page-1");
-        assert!(engine
-            .finish_item(item.id, "worker-a", JobItemStatus::Success, None, json!({}))
-            .await
-            .unwrap());
+        assert!(
+            engine
+                .finish_item(item.id, "worker-a", JobItemStatus::Success, None, json!({}))
+                .await
+                .unwrap()
+        );
         let refreshed = engine.run_by_id(run.id).await.unwrap();
         assert_eq!(refreshed.progress_current, 1);
     }
@@ -642,8 +699,14 @@ mod tests {
     #[tokio::test]
     async fn paused_run_stops_handing_out_items_and_resumes() {
         let engine = engine().await;
-        let run = engine.create_run(input("bootstrap:javdb:2022")).await.unwrap();
-        engine.create_item(run.id, "page-1", json!({})).await.unwrap();
+        let run = engine
+            .create_run(input("bootstrap:javdb:2022"))
+            .await
+            .unwrap();
+        engine
+            .create_item(run.id, "page-1", json!({}))
+            .await
+            .unwrap();
         engine
             .transition(run.id, JobStatus::Paused, None)
             .await
@@ -671,29 +734,42 @@ mod tests {
     #[tokio::test]
     async fn cancel_marks_pending_items_cancelled() {
         let engine = engine().await;
-        let run = engine.create_run(input("bootstrap:javdb:2023")).await.unwrap();
-        engine.create_item(run.id, "page-1", json!({})).await.unwrap();
+        let run = engine
+            .create_run(input("bootstrap:javdb:2023"))
+            .await
+            .unwrap();
+        engine
+            .create_item(run.id, "page-1", json!({}))
+            .await
+            .unwrap();
         engine
             .transition(run.id, JobStatus::Cancelled, None)
             .await
             .unwrap();
-        let item = engine.item_by_id(
-            sqlx::query_scalar("SELECT id FROM job_item WHERE run_id=?")
-                .bind(run.id)
-                .fetch_one(engine.pool())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let item = engine
+            .item_by_id(
+                sqlx::query_scalar("SELECT id FROM job_item WHERE run_id=?")
+                    .bind(run.id)
+                    .fetch_one(engine.pool())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(item.status, JobItemStatus::Cancelled);
     }
 
     #[tokio::test]
     async fn startup_recovery_requeues_interrupted_work() {
         let engine = engine().await;
-        let run = engine.create_run(input("bootstrap:javdb:2024")).await.unwrap();
-        engine.create_item(run.id, "page-1", json!({})).await.unwrap();
+        let run = engine
+            .create_run(input("bootstrap:javdb:2024"))
+            .await
+            .unwrap();
+        engine
+            .create_item(run.id, "page-1", json!({}))
+            .await
+            .unwrap();
         engine
             .transition(run.id, JobStatus::Running, None)
             .await
@@ -718,8 +794,14 @@ mod tests {
     #[tokio::test]
     async fn deferred_item_keeps_retry_budget() {
         let engine = engine().await;
-        let run = engine.create_run(input("bootstrap:javdb:2025")).await.unwrap();
-        engine.create_item(run.id, "page-1", json!({})).await.unwrap();
+        let run = engine
+            .create_run(input("bootstrap:javdb:2025"))
+            .await
+            .unwrap();
+        engine
+            .create_item(run.id, "page-1", json!({}))
+            .await
+            .unwrap();
         let item = engine
             .claim_next_item(run.id, "worker-a", Duration::from_secs(60))
             .await
@@ -743,15 +825,27 @@ mod tests {
     #[tokio::test]
     async fn requeue_failed_items_resets_them_to_pending() {
         let engine = engine().await;
-        let run = engine.create_run(input("bootstrap:javdb:2026")).await.unwrap();
-        engine.create_item(run.id, "page-1", json!({})).await.unwrap();
+        let run = engine
+            .create_run(input("bootstrap:javdb:2026"))
+            .await
+            .unwrap();
+        engine
+            .create_item(run.id, "page-1", json!({}))
+            .await
+            .unwrap();
         let item = engine
             .claim_next_item(run.id, "worker-a", Duration::from_secs(60))
             .await
             .unwrap()
             .unwrap();
         engine
-            .finish_item(item.id, "worker-a", JobItemStatus::Failed, Some("boom"), json!({}))
+            .finish_item(
+                item.id,
+                "worker-a",
+                JobItemStatus::Failed,
+                Some("boom"),
+                json!({}),
+            )
             .await
             .unwrap();
         assert_eq!(engine.requeue_failed_items(run.id).await.unwrap(), 1);
@@ -763,8 +857,14 @@ mod tests {
     #[tokio::test]
     async fn retried_item_keeps_run_open() {
         let engine = engine().await;
-        let run = engine.create_run(input("bootstrap:javdb:2027")).await.unwrap();
-        engine.create_item(run.id, "page-1", json!({})).await.unwrap();
+        let run = engine
+            .create_run(input("bootstrap:javdb:2027"))
+            .await
+            .unwrap();
+        engine
+            .create_item(run.id, "page-1", json!({}))
+            .await
+            .unwrap();
         let item = engine
             .claim_next_item(run.id, "worker-a", Duration::from_secs(60))
             .await

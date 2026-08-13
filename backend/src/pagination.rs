@@ -24,7 +24,6 @@ impl PageParams {
     pub fn limit(self) -> i64 {
         self.page_size() as i64
     }
-
 }
 
 #[derive(Debug, Serialize)]

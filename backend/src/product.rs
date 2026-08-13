@@ -29,7 +29,7 @@ use crate::{
         SnapshotInput, SyncMode,
     },
     metadata::{LocalizedAlias, MetadataSourceInput, SourceActor},
-    pagination::{Paged, PageParams},
+    pagination::{PageParams, Paged},
     providers::{
         ProviderContext, ProviderMediaRef, RawProviderDocument, ResourceCandidate, SourceMedia,
         SourceProviderConfig,
@@ -42,6 +42,7 @@ use crate::{
 const ACTIVE_STATES: &str = "'REQUESTED','RESOURCE_RESOLVING','QUEUED','DOWNLOADING','DOWNLOADED','PROCESSING','METADATA','LIBRARY_COMMIT'";
 const RESOLVE_QBIT_ATTENTION: &str = "UPDATE attention_item SET status = 'resolved', resolved_at = datetime('now'), updated_at = datetime('now'), resolution_json = '{\"action\":\"qbit_reconciled\"}' WHERE acquisition_id = ? AND status = 'open' AND kind IN ('provider_unavailable','qbit_task_missing')";
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "avi", "mov", "wmv", "m4v", "ts", "webm"];
+const HISTORICAL_MAX_PAGES: i64 = 200_000;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -288,6 +289,8 @@ struct ProviderReport {
 pub(crate) struct CatalogResolveJobPayload {
     pub code: String,
     pub include_resources: bool,
+    #[serde(default = "default_true")]
+    pub exact_code: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,6 +305,7 @@ struct CatalogResolveInput {
 #[serde(rename_all = "camelCase")]
 struct CatalogResolveResponse {
     code: String,
+    query: String,
     media_id: Option<i64>,
     status: String,
     job_ids: Vec<i64>,
@@ -332,10 +336,10 @@ async fn home(
     let recent_rows = sqlx::query(&format!(
         "{ACQUISITION_SELECT} ORDER BY a.id DESC LIMIT ? OFFSET ?"
     ))
-        .bind(params.limit())
-        .bind(params.offset())
-        .fetch_all(&state.pool)
-        .await?;
+    .bind(params.limit())
+    .bind(params.offset())
+    .fetch_all(&state.pool)
+    .await?;
     let recent = Paged::new(
         recent_rows.iter().map(acquisition_from_row).collect(),
         recent_total,
@@ -439,14 +443,24 @@ async fn resolve_catalog_code(
     State(state): State<AppState>,
     Json(input): Json<CatalogResolveInput>,
 ) -> AppResult<Json<CatalogResolveResponse>> {
-    let code = extract_media_code(&input.code)
-        .map(|value| normalize_code(&value))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::BadRequest("请输入完整番号，例如 ABC-123".into()))?;
-    let media_id = sqlx::query_scalar::<_, i64>("SELECT id FROM media WHERE normalized_code=?")
-        .bind(&code)
-        .fetch_optional(&state.pool)
-        .await?;
+    let raw_query = input.code.trim();
+    if raw_query.is_empty() {
+        return Err(AppError::BadRequest("请输入番号、标题或演员名称".into()));
+    }
+    if raw_query.chars().count() > 200 {
+        return Err(AppError::BadRequest("搜索内容不能超过 200 个字符".into()));
+    }
+    let extracted_code = extract_media_code(raw_query).map(|value| normalize_code(&value));
+    let exact_code = extracted_code.is_some();
+    let query = extracted_code.unwrap_or_else(|| raw_query.to_owned());
+    let media_id = if exact_code {
+        sqlx::query_scalar::<_, i64>("SELECT id FROM media WHERE normalized_code=?")
+            .bind(&query)
+            .fetch_optional(&state.pool)
+            .await?
+    } else {
+        None
+    };
     let rows = sqlx::query("SELECT * FROM provider_config WHERE provider_type='source' AND enabled=1 ORDER BY COALESCE(json_extract(config_json,'$.metadataPriority'),100) DESC,provider_key")
         .fetch_all(&state.pool)
         .await?;
@@ -457,12 +471,18 @@ async fn resolve_catalog_code(
         .collect::<Vec<_>>();
     if providers.is_empty() {
         return Err(AppError::BadRequest(
-            "没有已启用且支持按番号查找的数据源".into(),
+            "没有已启用且支持在线搜索的数据源".into(),
         ));
     }
     let mut job_ids = Vec::with_capacity(providers.len());
     for provider in providers {
-        let dedupe_key = format!("catalog-resolve:{}:{code}", provider.key);
+        let query_key = if exact_code {
+            normalize_code(&query)
+        } else {
+            normalize_alias(&query)
+        };
+        let mode = if exact_code { "code" } else { "keyword" };
+        let dedupe_key = format!("catalog-resolve:{}:{mode}:{query_key}", provider.key);
         let job = state
             .ingestion_queue
             .enqueue(EnqueueJob {
@@ -470,8 +490,9 @@ async fn resolve_catalog_code(
                 job_type: "catalog_resolve",
                 priority: PRIORITY_USER_ON_DEMAND,
                 payload: serde_json::to_value(CatalogResolveJobPayload {
-                    code: code.clone(),
+                    code: query.clone(),
                     include_resources: input.include_resources,
+                    exact_code,
                 })
                 .map_err(anyhow::Error::from)?,
                 max_attempts: 2,
@@ -483,10 +504,11 @@ async fn resolve_catalog_code(
     emit(
         &state,
         "catalog-resolve",
-        json!({"code":code,"status":"queued","jobIds":job_ids}),
+        json!({"code":query,"query":query,"exactCode":exact_code,"status":"queued","jobIds":job_ids}),
     );
     Ok(Json(CatalogResolveResponse {
-        code,
+        code: query.clone(),
+        query,
         media_id,
         status: "queued".into(),
         job_ids,
@@ -559,10 +581,11 @@ async fn media_detail(
     .fetch_optional(&state.pool)
     .await?
     .flatten();
-    let source_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM metadata_source_record WHERE media_id=?")
-        .bind(id)
-        .fetch_one(&state.pool)
-        .await?;
+    let source_total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_source_record WHERE media_id=?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?;
     let source_rows = sqlx::query("SELECT id,provider_key,provider_entity_id,source_url,record_kind,evidence_level,priority,title,original_title,summary,release_date,duration_minutes,poster_url,backdrop_url,actors_json,aliases_json,tags_json,first_seen_at,last_seen_at,updated_at FROM metadata_source_record WHERE media_id=? ORDER BY priority DESC,provider_key LIMIT ? OFFSET ?")
         .bind(id)
         .bind(query.limit())
@@ -573,28 +596,28 @@ async fn media_detail(
         source_rows
             .iter()
             .map(|row| {
-            json!({
-                "id": row.get::<i64, _>("id"),
-                "providerKey": row.get::<String, _>("provider_key"),
-                "providerEntityId": row.get::<String, _>("provider_entity_id"),
-                "sourceUrl": row.get::<Option<String>, _>("source_url"),
-                "recordKind": row.get::<String, _>("record_kind"),
-                "evidenceLevel": row.get::<i64, _>("evidence_level"),
-                "priority": row.get::<i64, _>("priority"),
-                "title": row.get::<Option<String>, _>("title"),
-                "originalTitle": row.get::<Option<String>, _>("original_title"),
-                "summary": row.get::<Option<String>, _>("summary"),
-                "releaseDate": row.get::<Option<String>, _>("release_date"),
-                "durationMinutes": row.get::<Option<i64>, _>("duration_minutes"),
-                "posterUrl": row.get::<Option<String>, _>("poster_url"),
-                "backdropUrl": row.get::<Option<String>, _>("backdrop_url"),
-                "actors": parse_json(&row.get::<String, _>("actors_json"), json!([])),
-                "aliases": parse_json(&row.get::<String, _>("aliases_json"), json!([])),
-                "tags": parse_json(&row.get::<String, _>("tags_json"), json!([])),
-                "firstSeenAt": row.get::<String, _>("first_seen_at"),
-                "lastSeenAt": row.get::<String, _>("last_seen_at"),
-                "updatedAt": row.get::<String, _>("updated_at"),
-            })
+                json!({
+                    "id": row.get::<i64, _>("id"),
+                    "providerKey": row.get::<String, _>("provider_key"),
+                    "providerEntityId": row.get::<String, _>("provider_entity_id"),
+                    "sourceUrl": row.get::<Option<String>, _>("source_url"),
+                    "recordKind": row.get::<String, _>("record_kind"),
+                    "evidenceLevel": row.get::<i64, _>("evidence_level"),
+                    "priority": row.get::<i64, _>("priority"),
+                    "title": row.get::<Option<String>, _>("title"),
+                    "originalTitle": row.get::<Option<String>, _>("original_title"),
+                    "summary": row.get::<Option<String>, _>("summary"),
+                    "releaseDate": row.get::<Option<String>, _>("release_date"),
+                    "durationMinutes": row.get::<Option<i64>, _>("duration_minutes"),
+                    "posterUrl": row.get::<Option<String>, _>("poster_url"),
+                    "backdropUrl": row.get::<Option<String>, _>("backdrop_url"),
+                    "actors": parse_json(&row.get::<String, _>("actors_json"), json!([])),
+                    "aliases": parse_json(&row.get::<String, _>("aliases_json"), json!([])),
+                    "tags": parse_json(&row.get::<String, _>("tags_json"), json!([])),
+                    "firstSeenAt": row.get::<String, _>("first_seen_at"),
+                    "lastSeenAt": row.get::<String, _>("last_seen_at"),
+                    "updatedAt": row.get::<String, _>("updated_at"),
+                })
             })
             .collect::<Vec<_>>(),
         source_total,
@@ -845,10 +868,10 @@ async fn list_acquisitions(
         sqlx::query(&format!(
             "{ACQUISITION_SELECT} ORDER BY a.id DESC LIMIT ? OFFSET ?"
         ))
-            .bind(params.limit())
-            .bind(params.offset())
-            .fetch_all(&state.pool)
-            .await?
+        .bind(params.limit())
+        .bind(params.offset())
+        .fetch_all(&state.pool)
+        .await?
     } else {
         sqlx::query(&format!(
             "{ACQUISITION_SELECT} WHERE a.state = ? ORDER BY a.id DESC LIMIT ? OFFSET ?"
@@ -1034,11 +1057,7 @@ async fn delete_acquisition(
         return Err(AppError::NotFound);
     }
     tx.commit().await?;
-    emit(
-        &state,
-        "acquisition.deleted",
-        json!({"acquisitionId": id}),
-    );
+    emit(&state, "acquisition.deleted", json!({"acquisitionId": id}));
     storage::log(
         &state.pool,
         "info",
@@ -2414,6 +2433,7 @@ async fn bootstrap_provider(
     let provider = source_provider_by_key(&state, &key)
         .await?
         .ok_or(AppError::NotFound)?;
+    let page_url = source_catalogue_start_url(&provider, true)?;
     let run_id = start_discovery_run(
         &state,
         &provider,
@@ -2421,9 +2441,9 @@ async fn bootstrap_provider(
         &input.from,
         &input.to,
         input.include_resources,
-        &provider.base_url,
+        &page_url,
         1,
-        5,
+        HISTORICAL_MAX_PAGES,
         true,
     )
     .await?;
@@ -3013,6 +3033,30 @@ pub(crate) async fn execute_discovery_job(
     Ok(())
 }
 
+pub(crate) fn source_catalogue_start_url(
+    provider: &SourceProviderConfig,
+    historical: bool,
+) -> anyhow::Result<String> {
+    if !historical {
+        return Ok(provider.base_url.clone());
+    }
+    let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    match provider.adapter.as_str() {
+        // JavDB's default page is sorted by magnet update time. Historical
+        // ranges must use its release-date catalogue or old dates can never
+        // be reached monotonically.
+        "javdb" => {
+            let mut url = base.join("/")?;
+            url.query_pairs_mut().append_pair("vft", "0");
+            Ok(url.into())
+        }
+        // Make page identity explicit so the hidden #next link can advance
+        // deterministically through the release-date ordered catalogue.
+        "javbus" => Ok(base.join("/page/1")?.into()),
+        _ => Ok(provider.base_url.clone()),
+    }
+}
+
 /// Enqueue hydration (and incremental resource refresh) jobs for the
 /// candidates discovered on one catalogue page. Shared by the legacy
 /// discovery queue and the unified task engine bootstrap handler.
@@ -3166,6 +3210,9 @@ pub(crate) async fn execute_catalog_resolve_job(
     provider_key: &str,
     payload: &CatalogResolveJobPayload,
 ) -> anyhow::Result<()> {
+    if !payload.exact_code {
+        return execute_catalog_keyword_job(state, provider_key, payload).await;
+    }
     let outcome = async {
         let provider = source_provider_by_key(state, provider_key)
             .await?
@@ -3248,7 +3295,7 @@ pub(crate) async fn execute_catalog_resolve_job(
             emit(
                 state,
                 "catalog-resolve",
-                json!({"code":payload.code,"providerKey":provider_key,"mediaId":media_id,"status":"success"}),
+                json!({"code":payload.code,"query":payload.code,"providerKey":provider_key,"mediaId":media_id,"status":"success"}),
             );
             Ok(())
         }
@@ -3256,11 +3303,192 @@ pub(crate) async fn execute_catalog_resolve_job(
             emit(
                 state,
                 "catalog-resolve",
-                json!({"code":payload.code,"providerKey":provider_key,"status":"failed","message":error.to_string()}),
+                json!({"code":payload.code,"query":payload.code,"providerKey":provider_key,"status":"failed","message":error.to_string()}),
             );
             Err(error)
         }
     }
+}
+
+async fn execute_catalog_keyword_job(
+    state: &AppState,
+    provider_key: &str,
+    payload: &CatalogResolveJobPayload,
+) -> anyhow::Result<()> {
+    let outcome = async {
+        let provider = source_provider_by_key(state, provider_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("source provider {provider_key} no longer exists"))?;
+        let sources = fetch_provider_keyword_candidates(state, &provider, &payload.code).await?;
+        if sources.is_empty() {
+            anyhow::bail!(
+                "{} did not return results for {}",
+                provider.display_name,
+                payload.code
+            );
+        }
+        let discovered =
+            crate::ingestion::upsert_candidates(&state.pool, &provider.key, sources.clone())
+                .await?;
+        let mut media_ids = Vec::new();
+        let mut detail_failures = Vec::new();
+        for (source, discovered) in sources.iter().zip(discovered.iter()) {
+            let media_id = match persist_source_media(state, &provider, source).await {
+                Ok(media_id) => media_id,
+                Err(error) => {
+                    detail_failures.push(error.to_string());
+                    continue;
+                }
+            };
+            let detail = match provider.adapter.as_str() {
+                "javbus" => {
+                    refresh_javbus_media(
+                        state,
+                        media_id,
+                        &provider,
+                        &source.provider_id,
+                        &source.source_url,
+                        payload.include_resources,
+                        true,
+                    )
+                    .await
+                }
+                "javdb" | "jav321" | "javlibrary" => {
+                    refresh_generic_source_media(
+                        state,
+                        media_id,
+                        &provider,
+                        &source.provider_id,
+                        &source.source_url,
+                        payload.include_resources,
+                        true,
+                    )
+                    .await
+                }
+                adapter => anyhow::bail!("unsupported source adapter: {adapter}"),
+            };
+            match detail {
+                Ok(_) => {
+                    crate::ingestion::finish_hydration(
+                        &state.pool,
+                        discovered.id,
+                        media_id,
+                        &discovered.content_hash,
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    crate::ingestion::fail_hydration(
+                        &state.pool,
+                        discovered.id,
+                        &error.to_string(),
+                    )
+                    .await?;
+                    detail_failures.push(error.to_string());
+                }
+            }
+            refresh_media_search_document(state, media_id).await?;
+            media_ids.push(media_id);
+        }
+        anyhow::ensure!(
+            !media_ids.is_empty(),
+            "{} returned candidates but none contained a usable code",
+            provider.display_name
+        );
+        anyhow::Ok((media_ids, detail_failures))
+    }
+    .await;
+    match outcome {
+        Ok((media_ids, detail_failures)) => {
+            emit(
+                state,
+                "catalog-resolve",
+                json!({
+                    "code": payload.code,
+                    "query": payload.code,
+                    "providerKey": provider_key,
+                    "mediaIds": media_ids,
+                    "resultCount": media_ids.len(),
+                    "detailFailureCount": detail_failures.len(),
+                    "status": "success"
+                }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            emit(
+                state,
+                "catalog-resolve",
+                json!({"code":payload.code,"query":payload.code,"providerKey":provider_key,"status":"failed","message":error.to_string()}),
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn fetch_provider_keyword_candidates(
+    state: &AppState,
+    provider: &SourceProviderConfig,
+    query: &str,
+) -> anyhow::Result<Vec<SourceMedia>> {
+    let base = reqwest::Url::parse(provider.base_url.trim_end_matches('/'))?;
+    let mut url = match provider.adapter.as_str() {
+        "javbus" => {
+            let mut url = base.join("/search/")?;
+            url.path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("invalid JavBus base URL"))?
+                .push(query);
+            url
+        }
+        "javdb" | "jav321" => base.join("/search")?,
+        "javlibrary" => base.join("/cn/vl_searchbyword.php")?,
+        adapter => anyhow::bail!("unsupported source adapter: {adapter}"),
+    };
+    match provider.adapter.as_str() {
+        "javdb" => {
+            url.query_pairs_mut()
+                .append_pair("q", query)
+                .append_pair("f", "all");
+        }
+        "jav321" => {
+            url.query_pairs_mut().append_pair("sn", query);
+        }
+        "javlibrary" => {
+            url.query_pairs_mut().append_pair("keyword", query);
+        }
+        _ => {}
+    }
+    let response = if provider.adapter == "javbus" {
+        javbus_request(state, provider, url).await?
+    } else {
+        source_fetch(state, provider, url).await?
+    };
+    ensure_provider_content(state, provider, &response, "keyword-search", None, None).await?;
+    let mut candidates = match provider.adapter.as_str() {
+        "javbus" => parse_javbus_search_html(&response.body, query, &provider.base_url),
+        "javdb" => parse_javdb_search_html(&response.body, query, &provider.base_url),
+        "jav321" => parse_jav321_html(
+            &response.body,
+            query,
+            &provider.base_url,
+            &response.final_url,
+        ),
+        "javlibrary" => parse_javlibrary_html(
+            &response.body,
+            query,
+            &provider.base_url,
+            &response.final_url,
+        ),
+        _ => Vec::new(),
+    };
+    candidates.retain(|candidate| {
+        extract_media_code(&candidate.code)
+            .or_else(|| extract_media_code(&candidate.title))
+            .or_else(|| extract_media_code(&candidate.provider_id))
+            .is_some()
+    });
+    candidates.truncate(8);
+    Ok(candidates)
 }
 
 async fn fetch_provider_code_candidate(
@@ -3629,6 +3857,7 @@ fn extract_next_page_url(
     let document = Html::parse_document(&response.body);
     for selector in [
         "a[rel='next']",
+        "a#next",
         "a.next",
         "li.next a",
         "a.pagination-next",
@@ -3938,7 +4167,7 @@ fn parse_javdb_search_html(html: &str, fallback: &str, base_url: &str) -> Vec<So
             title,
             poster_url,
             source_url: absolute_url(base_url, href).unwrap_or_else(|| href.to_owned()),
-            release_date: extract_iso_date(tail),
+            release_date: extract_catalogue_date(tail),
         });
         if items.len() >= 40 {
             break;
@@ -4307,6 +4536,16 @@ fn extract_iso_date(text: &str) -> Option<String> {
                 .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
             && chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok())
         .then(|| value.to_owned())
+    })
+}
+
+fn extract_catalogue_date(text: &str) -> Option<String> {
+    extract_iso_date(text).or_else(|| {
+        text.as_bytes().windows(10).find_map(|window| {
+            let value = std::str::from_utf8(window).ok()?;
+            let date = chrono::NaiveDate::parse_from_str(value, "%m/%d/%Y").ok()?;
+            Some(date.format("%Y-%m-%d").to_string())
+        })
     })
 }
 
@@ -6115,6 +6354,65 @@ mod tests {
         let payload: Value = serde_json::from_str(&row.get::<String, _>("payload_json")).unwrap();
         assert_eq!(payload["code"], "abc-123");
         assert_eq!(payload["includeResources"], true);
+        assert_eq!(payload["exactCode"], true);
+    }
+
+    #[tokio::test]
+    async fn title_or_actor_resolve_queues_keyword_jobs_for_enabled_sources() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE provider_config SET enabled=CASE WHEN provider_key='javdb' THEN 1 ELSE 0 END WHERE provider_type='source'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let temp = std::env::temp_dir().join(format!(
+            "luma-catalog-keyword-resolve-{}",
+            chrono_like_nonce()
+        ));
+        let state = AppState {
+            pool: pool.clone(),
+            scrape_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            crawler_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            asset_root: temp.join("assets"),
+            script_root: temp.join("scripts"),
+            events: tokio::sync::broadcast::channel(32).0,
+            fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
+            provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
+            snapshot_repository: std::sync::Arc::new(crate::ingestion::SnapshotRepository::new(
+                pool.clone(),
+                temp.join("source-cache"),
+            )),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool.clone()),
+            task_engine: crate::task::TaskEngine::new(pool.clone()),
+            handler_registry: std::sync::Arc::new(crate::task::handler::HandlerRegistry::new()),
+        };
+
+        let queued = resolve_catalog_code(
+            State(state.clone()),
+            Json(CatalogResolveInput {
+                code: "美園和花".into(),
+                include_resources: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(queued.query, "美園和花");
+        assert_eq!(queued.code, "美園和花");
+        assert_eq!(queued.job_ids.len(), 1);
+        let payload_json: String =
+            sqlx::query_scalar("SELECT payload_json FROM ingestion_job WHERE id=?")
+                .bind(queued.job_ids[0])
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(payload["code"], "美園和花");
+        assert_eq!(payload["includeResources"], false);
+        assert_eq!(payload["exactCode"], false);
     }
 
     #[test]
@@ -6137,6 +6435,65 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].provider_id, "abc");
         assert_eq!(items[0].title, "ABC-123 Title");
+    }
+
+    #[test]
+    fn javdb_catalogue_normalizes_us_release_dates() {
+        let html = r#"<a href="/v/abc"><strong class="uid">ABC-123</strong><div class="video-title">Example title</div><div class="meta">01/01/2020</div></a>"#;
+        let items = parse_javdb_search_html(html, "", "https://javdb.com");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].code, "abc-123");
+        assert_eq!(items[0].release_date.as_deref(), Some("2020-01-01"));
+    }
+
+    #[test]
+    fn historical_catalogues_use_release_order_and_follow_javbus_hidden_next_link() {
+        fn provider(adapter: &str, base_url: &str) -> SourceProviderConfig {
+            SourceProviderConfig {
+                key: adapter.into(),
+                display_name: adapter.into(),
+                base_url: base_url.into(),
+                secret: String::new(),
+                adapter: adapter.into(),
+                proxy_url: String::new(),
+                user_agent: String::new(),
+                fetch_mode: crate::fetch::FetchMode::Http,
+                sync_enabled: true,
+                sync_interval_minutes: 1440,
+                sync_overlap_days: 3,
+                sync_detail_limit: 8,
+                metadata_priority: 100,
+                resource_priority: 100,
+                resource_cache_ttl_hours: 72,
+                resource_hydration_recent_days: 180,
+            }
+        }
+
+        let javdb = provider("javdb", "https://javdb.com");
+        assert_eq!(
+            source_catalogue_start_url(&javdb, true).unwrap(),
+            "https://javdb.com/?vft=0"
+        );
+
+        let javbus = provider("javbus", "https://www.javbus.com");
+        assert_eq!(
+            source_catalogue_start_url(&javbus, true).unwrap(),
+            "https://www.javbus.com/page/1"
+        );
+        let response = FetchResponse {
+            final_url: reqwest::Url::parse("https://www.javbus.com/page/1").unwrap(),
+            status: Some(200),
+            content_type: Some("text/html".into()),
+            headers: reqwest::header::HeaderMap::new(),
+            body: r#"<a id="next" href="/page/2" style="display:none">下一頁</a>"#.into(),
+            fetched_at: chrono::Utc::now(),
+            fetch_mode: crate::fetch::FetchMode::Http,
+            elapsed_ms: 1,
+        };
+        assert_eq!(
+            extract_next_page_url(&javbus, &response).as_deref(),
+            Some("https://www.javbus.com/page/2")
+        );
     }
 
     #[tokio::test]

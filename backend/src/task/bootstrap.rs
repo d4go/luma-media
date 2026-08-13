@@ -56,16 +56,14 @@ impl JobHandler for BootstrapHandler {
         let checkpoint: PageCheckpoint = serde_json::from_value(ctx.item_checkpoint().await?)?;
         let provider = crate::product::source_provider_by_key(ctx.state, &config.provider_key)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("source provider {} no longer exists", config.provider_key))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("source provider {} no longer exists", config.provider_key)
+            })?;
 
-        let page = crate::product::fetch_source_catalogue_page(
-            ctx.state,
-            &provider,
-            &checkpoint.page_url,
-        )
-        .await?;
-        let reached_start =
-            crate::ingestion::reached_window_start(&page.items, &checkpoint.from);
+        let page =
+            crate::product::fetch_source_catalogue_page(ctx.state, &provider, &checkpoint.page_url)
+                .await?;
+        let reached_start = crate::ingestion::reached_window_start(&page.items, &checkpoint.from);
         let candidates = crate::ingestion::upsert_candidates(
             &ctx.state.pool,
             &provider.key,

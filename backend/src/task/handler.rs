@@ -53,13 +53,24 @@ impl JobContext<'_> {
     pub async fn save_checkpoint(&self, checkpoint: Value) -> anyhow::Result<()> {
         let run = self.engine.run_by_id(self.run_id).await?;
         self.engine
-            .report_progress(self.run_id, run.progress_current, run.progress_total, checkpoint)
+            .report_progress(
+                self.run_id,
+                run.progress_current,
+                run.progress_total,
+                checkpoint,
+            )
             .await
     }
 
     pub async fn mark_item_success(&self, checkpoint: Value) -> anyhow::Result<()> {
         self.engine
-            .finish_item(self.item_id, self.owner, JobItemStatus::Success, None, checkpoint)
+            .finish_item(
+                self.item_id,
+                self.owner,
+                JobItemStatus::Success,
+                None,
+                checkpoint,
+            )
             .await?;
         Ok(())
     }

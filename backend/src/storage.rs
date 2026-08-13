@@ -12,7 +12,7 @@ use crate::{
         Folder, MediaItem, MediaResourceState, MediaResources, Settings, Task, TaskDetail,
         TaskFolder, TaskMedia, TaskRecord,
     },
-    pagination::{Paged, PageParams},
+    pagination::{PageParams, Paged},
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -885,14 +885,22 @@ mod tests {
     #[tokio::test]
     async fn applies_sqlite_reliability_pragmas() {
         let pool = connect("sqlite::memory:").await.unwrap();
-        let journal_mode: String =
-            sqlx::query_scalar("PRAGMA journal_mode").fetch_one(&pool).await.unwrap();
-        let synchronous: i64 =
-            sqlx::query_scalar("PRAGMA synchronous").fetch_one(&pool).await.unwrap();
-        let foreign_keys: i64 =
-            sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(&pool).await.unwrap();
-        let busy_timeout: i64 =
-            sqlx::query_scalar("PRAGMA busy_timeout").fetch_one(&pool).await.unwrap();
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(journal_mode, "memory");
         assert_eq!(synchronous, 1);
         assert_eq!(foreign_keys, 1);

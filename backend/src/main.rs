@@ -95,7 +95,12 @@ async fn main() -> anyhow::Result<()> {
 
     let api_router = api::router()
         .route("/health", get(|| async { (StatusCode::OK, "ok") }))
-        .fallback(|| async { (StatusCode::NOT_FOUND, Json(json!({ "message": "not found" }))) });
+        .fallback(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "message": "not found" })),
+            )
+        });
 
     let mut app = Router::new()
         .route("/asset/poster/{media_id}", get(asset::poster))

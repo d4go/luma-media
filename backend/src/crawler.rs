@@ -9,7 +9,7 @@ use crate::{
     AppState,
     error::{AppError, AppResult},
     models::{CrawlerResult, CrawlerRun, CrawlerScript},
-    pagination::{Paged, PageParams},
+    pagination::{PageParams, Paged},
     product::{self, AcquireInput},
     storage,
 };
@@ -31,10 +31,10 @@ pub async fn list_scripts(
     let rows = sqlx::query(&format!(
         "{SCRIPT_SELECT} ORDER BY cs.name, cs.id LIMIT ? OFFSET ?"
     ))
-        .bind(params.limit())
-        .bind(params.offset())
-        .fetch_all(pool)
-        .await?;
+    .bind(params.limit())
+    .bind(params.offset())
+    .fetch_all(pool)
+    .await?;
     Ok(Paged::new(
         rows.iter().map(script_from_row).collect(),
         total,
@@ -77,12 +77,14 @@ pub async fn list_runs(
             .await?
     };
     let rows = if let Some(script_id) = script_id {
-        sqlx::query("SELECT * FROM crawler_run WHERE script_id = ? ORDER BY id DESC LIMIT ? OFFSET ?")
-            .bind(script_id)
-            .bind(params.limit())
-            .bind(params.offset())
-            .fetch_all(pool)
-            .await?
+        sqlx::query(
+            "SELECT * FROM crawler_run WHERE script_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(script_id)
+        .bind(params.limit())
+        .bind(params.offset())
+        .fetch_all(pool)
+        .await?
     } else {
         sqlx::query("SELECT * FROM crawler_run ORDER BY id DESC LIMIT ? OFFSET ?")
             .bind(params.limit())

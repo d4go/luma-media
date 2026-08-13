@@ -55,7 +55,7 @@ function pageQuery(page: number, pageSize: number, extra: Record<string, string>
 export const api = {
   home: (page = 1, pageSize = 6) => request<HomeData>(`/home${pageQuery(page, pageSize)}`),
   search: (q: string, page = 1, pageSize = 20) => request<SearchResponse>(`/search${pageQuery(page, pageSize, { q })}`),
-  resolveCatalog: (code: string, includeResources = true) => request<CatalogResolveResponse>('/catalog/resolve', { method: 'POST', body: JSON.stringify({ code, includeResources }) }),
+  resolveCatalog: (query: string, includeResources = true) => request<CatalogResolveResponse>('/catalog/resolve', { method: 'POST', body: JSON.stringify({ code: query, includeResources }) }),
   catalogMedia: (q = '', page = 1, pageSize = 20) => request<Paged<ProductMedia>>(`/catalog/media${pageQuery(page, pageSize, q ? { q } : {})}`),
   mediaDetail: (id: number, page = 1, pageSize = 20) => request<MediaDetail>(`/catalog/media/${id}${pageQuery(page, pageSize)}`),
   refreshMediaResources: (id: number) => request<ResourceRefreshResponse>(`/catalog/media/${id}/resources/refresh`, { method: 'POST' }),

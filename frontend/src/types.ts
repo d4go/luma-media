@@ -388,7 +388,7 @@ export interface BrowserSession {
   expiresAt: string
 }
 export interface SyncRunResponse { runId: number; mode: 'incremental' | 'bootstrap'; status: string }
-export interface CatalogResolveResponse { code: string; mediaId: number | null; status: string; jobIds: number[] }
+export interface CatalogResolveResponse { code: string; query: string; mediaId: number | null; status: string; jobIds: number[] }
 export interface ResourceRefreshResponse { mediaId: number; status: string; jobIds: number[] }
 export interface LibraryExportReport { mediaId: number; libraryItemId: number | null; nfoPath: string; posterPath: string | null; metadataUpdatedAt: string }
 export interface LibraryExportResponse { export: LibraryExportReport; message: string }
