@@ -41,7 +41,7 @@ import PaginationBar from '../components/PaginationBar.vue'
 const message = useMessage()
 const dialog = useDialog()
 const loading = ref(true)
-const saving = ref(false)
+const savingSection = ref('')
 const creatingSource = ref(false)
 const showNewSource = ref(false)
 const testing = ref('')
@@ -340,10 +340,10 @@ async function persistProvider(provider: ProviderConfig) {
   secrets[provider.key] = ''
 }
 
-async function save() {
-  saving.value = true
+async function saveSources() {
+  savingSection.value = 'sources'
   try {
-    for (const provider of providers.value.items) {
+    for (const provider of sourceProviders.value) {
       await api.updateProvider(provider.key, {
         displayName: provider.displayName,
         baseUrl: provider.baseUrl,
@@ -351,31 +351,73 @@ async function save() {
         config: provider.config,
       })
     }
-    legacy.metatubeUrl = providerMap.value.metatube?.baseUrl ?? legacy.metatubeUrl
-    legacy.metatubeToken = secrets.metatube ?? ''
-    legacy.qbittorrentUrl = providerMap.value.qbittorrent?.baseUrl ?? legacy.qbittorrentUrl
-    legacy.qbittorrentPassword = secrets.qbittorrent ?? ''
-    await Promise.all([
-      api.updateSettings({ ...legacy }),
-      api.updateProductSettings({ ...product }),
-      api.updateAiSettings({
-        enabled: ai.enabled,
-        providerKind: ai.providerKind,
-        baseUrl: ai.baseUrl,
-        apiKey: ai.apiKey,
-        model: ai.model,
-        temperature: ai.temperature,
-        timeoutSecs: ai.timeoutSecs,
-        maxTokens: ai.maxTokens,
-      }),
-    ])
-    message.success('设置已保存，留空的凭据保持不变')
+    message.success('内容来源已保存')
     Object.keys(secrets).forEach(key => { secrets[key] = '' })
     await load()
   } catch (reason) {
     message.error(reason instanceof Error ? reason.message : '保存失败')
   } finally {
-    saving.value = false
+    savingSection.value = ''
+  }
+}
+
+async function saveServices() {
+  savingSection.value = 'services'
+  try {
+    const metatube = providerMap.value.metatube
+    const qbittorrent = providerMap.value.qbittorrent
+    legacy.metatubeUrl = metatube?.baseUrl ?? legacy.metatubeUrl
+    legacy.metatubeToken = secrets.metatube ?? ''
+    legacy.qbittorrentUrl = qbittorrent?.baseUrl ?? legacy.qbittorrentUrl
+    legacy.qbittorrentPassword = secrets.qbittorrent ?? ''
+    const updates: Promise<unknown>[] = [api.updateSettings({ ...legacy })]
+    if (metatube) updates.push(api.updateProvider('metatube', { displayName: metatube.displayName, baseUrl: metatube.baseUrl, secret: secrets.metatube ?? '' }))
+    if (qbittorrent) updates.push(api.updateProvider('qbittorrent', { displayName: qbittorrent.displayName, baseUrl: qbittorrent.baseUrl, secret: secrets.qbittorrent ?? '' }))
+    await Promise.all(updates)
+    message.success('处理服务已保存')
+    secrets.metatube = ''
+    secrets.qbittorrent = ''
+    await load()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '保存失败')
+  } finally {
+    savingSection.value = ''
+  }
+}
+
+async function saveAi() {
+  savingSection.value = 'ai'
+  try {
+    await api.updateAiSettings({
+      enabled: ai.enabled,
+      providerKind: ai.providerKind,
+      baseUrl: ai.baseUrl,
+      apiKey: ai.apiKey,
+      model: ai.model,
+      temperature: ai.temperature,
+      timeoutSecs: ai.timeoutSecs,
+      maxTokens: ai.maxTokens,
+    })
+    message.success('AI 接入已保存')
+    ai.apiKey = ''
+    await load()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '保存失败')
+  } finally {
+    savingSection.value = ''
+  }
+}
+
+async function savePaths() {
+  savingSection.value = 'paths'
+  try {
+    await api.updateProductSettings({ ...product })
+    message.success('入库与路径已保存')
+    await load()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '保存失败')
+  } finally {
+    savingSection.value = ''
   }
 }
 
@@ -621,12 +663,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <PageHeader title="设置" description="Provider 负责外部能力，来源可以独立扩展、停用与测试，凭据不会返回明文。">
-    <n-button type="primary" :loading="saving" @click="save">
-      <template #icon><IconDeviceFloppy /></template>
-      保存全部
-    </n-button>
-  </PageHeader>
+  <PageHeader title="设置" description="Provider 负责外部能力，来源可以独立扩展、停用与测试，凭据不会返回明文；每个分区独立保存。" />
 
   <n-spin :show="loading">
     <div class="product-settings">
@@ -637,10 +674,16 @@ onUnmounted(() => {
             <h2>内容来源</h2>
             <p>来源在后台定时采集并去重写入本地索引；前台搜索只查询本地数据，不会因外部站点超时或拒绝访问而中断。</p>
           </div>
-          <n-button secondary @click="showNewSource = !showNewSource">
-            <template #icon><IconPlus /></template>
-            添加来源
-          </n-button>
+          <div class="section-actions">
+            <n-button type="primary" :loading="savingSection === 'sources'" @click="saveSources">
+              <template #icon><IconDeviceFloppy /></template>
+              保存来源
+            </n-button>
+            <n-button secondary @click="showNewSource = !showNewSource">
+              <template #icon><IconPlus /></template>
+              添加来源
+            </n-button>
+          </div>
         </header>
 
         <article v-if="showNewSource" class="new-source-card panel">
@@ -924,10 +967,18 @@ onUnmounted(() => {
       </section>
 
       <section class="settings-group">
-        <header>
-          <span class="eyebrow">SERVICES</span>
-          <h2>处理服务</h2>
-          <p>元数据和下载服务拥有各自的连接与处理边界。</p>
+        <header class="settings-group-heading">
+          <div>
+            <span class="eyebrow">SERVICES</span>
+            <h2>处理服务</h2>
+            <p>元数据和下载服务拥有各自的连接与处理边界。</p>
+          </div>
+          <div class="section-actions">
+            <n-button type="primary" :loading="savingSection === 'services'" @click="saveServices">
+              <template #icon><IconDeviceFloppy /></template>
+              保存服务
+            </n-button>
+          </div>
         </header>
         <div class="provider-card-grid service-provider-grid">
           <article v-if="providerMap.metatube" class="provider-card">
@@ -975,7 +1026,19 @@ onUnmounted(() => {
       </section>
 
       <section class="settings-group">
-        <header><span class="eyebrow">AI</span><h2>AI 接入</h2><p>接入一个 OpenAI 兼容的 chat/completions 服务，把自然语言编译成自动化规则。支持 OpenAI、DeepSeek、阿里云百炼和本地 Ollama。</p></header>
+        <header class="settings-group-heading">
+          <div>
+            <span class="eyebrow">AI</span>
+            <h2>AI 接入</h2>
+            <p>接入一个 OpenAI 兼容的 chat/completions 服务，把自然语言编译成自动化规则。支持 OpenAI、DeepSeek、阿里云百炼和本地 Ollama。</p>
+          </div>
+          <div class="section-actions">
+            <n-button type="primary" :loading="savingSection === 'ai'" @click="saveAi">
+              <template #icon><IconDeviceFloppy /></template>
+              保存 AI
+            </n-button>
+          </div>
+        </header>
         <div class="luma-settings-card panel">
           <div class="form-grid">
             <n-form-item label="服务类型">
@@ -997,7 +1060,19 @@ onUnmounted(() => {
       </section>
 
       <section class="settings-group">
-        <header><span class="eyebrow">LUMA</span><h2>入库与路径</h2><p>这些路径必须与 Docker 挂载保持一致，文件只能在允许的下载根目录和媒体根目录之间处理。</p></header>
+        <header class="settings-group-heading">
+          <div>
+            <span class="eyebrow">LUMA</span>
+            <h2>入库与路径</h2>
+            <p>这些路径必须与 Docker 挂载保持一致，文件只能在允许的下载根目录和媒体根目录之间处理。</p>
+          </div>
+          <div class="section-actions">
+            <n-button type="primary" :loading="savingSection === 'paths'" @click="savePaths">
+              <template #icon><IconDeviceFloppy /></template>
+              保存路径
+            </n-button>
+          </div>
+        </header>
         <div class="luma-settings-card panel">
           <div class="form-grid">
             <n-form-item label="Luma 下载根目录"><n-input v-model:value="product.downloadRoot" /></n-form-item>
