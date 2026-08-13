@@ -10,6 +10,16 @@ WORKDIR /app/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
 RUN mkdir src && printf 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
 COPY backend/migrations ./migrations
+# Git archives created by the Windows deployment host may materialize later
+# migrations as CRLF even though production originally applied them as LF.
+# SQLx includes line endings in migration checksums, so keep the historical
+# 001/002 files untouched and canonicalize every subsequent migration to LF.
+RUN for file in migrations/*.sql; do \
+      case "$(basename "$file")" in \
+        001_*|002_*) ;; \
+        *) tr -d '\r' < "$file" > "$file.lf" && mv "$file.lf" "$file" ;; \
+      esac; \
+    done
 COPY backend/src ./src
 RUN touch src/main.rs && cargo build --release
 
