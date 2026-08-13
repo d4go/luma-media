@@ -24,7 +24,7 @@ const AI_SETTING_KEY: &str = "ai_config";
 
 /// 编译用的系统提示词：要求模型只输出一个严格符合 AutomationInput 结构的 JSON 对象。
 const COMPILE_SYSTEM_PROMPT: &str = r#"你是 Luma（家庭 NAS 媒体获取与入库系统）的自动化规则编译器。
-你的唯一任务：把用户的自然语言需求翻译成一条自动化规则，并只输出一个 JSON 对象，不要输出任何解释、前后缀或 Markdown 代码块。
+你的唯一任务：把用户的自然语言需求翻译成一条自动化规则，并只输出一个 json 对象，不要输出任何解释、前后缀或 Markdown 代码块。
 
 自动化规则由三部分组成：
 1. WHEN（triggerType 触发器）—— 决定何时检查资源：
@@ -217,7 +217,12 @@ async fn test_ai(
     if settings.base_url.trim().is_empty() {
         return Err(AppError::BadRequest("请先配置 AI 接入地址".into()));
     }
-    let (reply, latency) = chat_completion(&settings, "你是一个连接测试助手。", "请只回复两个字：正常").await?;
+    let (reply, latency) = chat_completion(
+        &settings,
+        "你是一个连接测试助手，请始终用 json 格式回复。",
+        "请回复一个 json 对象：{\"ok\": true}，不要输出其他内容。",
+    )
+    .await?;
     Ok(Json(json!({
         "ok": true,
         "message": format!("连接成功，模型 {} 响应：{}", settings.model, reply.trim()),
