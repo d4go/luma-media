@@ -31,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .merge(crate::task::api::router())
         .merge(crate::product::router())
         .merge(crate::providers::router())
+        .merge(crate::ai::router())
         .route("/dashboard", get(dashboard))
         .route("/folders", get(list_folders).post(create_folder))
         .route("/folders/{id}", put(update_folder).delete(delete_folder))

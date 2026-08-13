@@ -12,8 +12,11 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post, put},
 };
+use chrono::{DateTime, Local, NaiveDateTime};
+use cron::Schedule;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use serde_json::{Value, json};
 use sqlx::{Row, Sqlite, Transaction};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
@@ -1255,12 +1258,48 @@ pub async fn run_automations(state: &AppState) -> anyhow::Result<()> {
     let rules = sqlx::query("SELECT * FROM automation_rule WHERE enabled = 1 ORDER BY id")
         .fetch_all(&state.pool)
         .await?;
+    let now = Local::now();
     for rule in rules {
         let rule_id: i64 = rule.get("id");
         let trigger_type: String = rule.get("trigger_type");
         let last_run: Option<String> = rule.get("last_run_at");
+        let trigger_config = parse_json(&rule.get::<String, _>("trigger_config_json"), json!({}));
         let conditions = parse_json(&rule.get::<String, _>("conditions_json"), json!({}));
         let mode: String = rule.get("mode");
+
+        // 定时触发器：只有 cron 到期时才检查，并顺带算出下一次触发时间。
+        let mut next_run_at: Option<String> = None;
+        if trigger_type == "SCHEDULE" {
+            let expression = trigger_config
+                .get("cron")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            let schedule = match Schedule::from_str(expression) {
+                Ok(schedule) => schedule,
+                Err(error) => {
+                    tracing::warn!(rule_id, %error, "invalid cron expression; skipping automation");
+                    continue;
+                }
+            };
+            let stored_next = rule
+                .get::<Option<String>, _>("next_run_at")
+                .and_then(|text| parse_local_datetime(&text));
+            match stored_next {
+                Some(next) if next > now => continue, // 还没到点
+                Some(_) => {
+                    next_run_at = schedule.after(&now).next().map(format_local_datetime);
+                }
+                None => {
+                    // 首次创建：只初始化 last_run 与 next_run，避免把历史资源一次性全扫进来。
+                    next_run_at = schedule.after(&now).next().map(format_local_datetime);
+                    sqlx::query("UPDATE automation_rule SET last_run_at=datetime('now'), next_run_at=?, updated_at=datetime('now') WHERE id=?")
+                        .bind(&next_run_at).bind(rule_id).execute(&state.pool).await?;
+                    continue;
+                }
+            }
+        }
+
         let rows = if trigger_type == "FOLLOWED_ACTOR_UPDATE" {
             sqlx::query("SELECT DISTINCT r.id AS resource_id, r.media_id, r.score, r.provider_key, r.title, r.subtitle_languages_json FROM resource r JOIN media_actor ma ON ma.media_id = r.media_id JOIN actor a ON a.id = ma.actor_id WHERE a.followed = 1 AND r.created_at > COALESCE(?, '1970-01-01') ORDER BY r.id LIMIT 100")
                 .bind(&last_run).fetch_all(&state.pool).await?
@@ -1322,9 +1361,20 @@ pub async fn run_automations(state: &AppState) -> anyhow::Result<()> {
                 _ => {}
             }
         }
-        sqlx::query("UPDATE automation_rule SET last_run_at=datetime('now'), next_run_at=datetime('now','+5 minutes'), updated_at=datetime('now') WHERE id=?").bind(rule_id).execute(&state.pool).await?;
+        sqlx::query("UPDATE automation_rule SET last_run_at=datetime('now'), next_run_at=?, updated_at=datetime('now') WHERE id=?").bind(&next_run_at).bind(rule_id).execute(&state.pool).await?;
     }
     Ok(())
+}
+
+fn format_local_datetime(value: DateTime<Local>) -> String {
+    value.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn parse_local_datetime(value: &str) -> Option<DateTime<Local>> {
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .ok()?
+        .and_local_timezone(Local)
+        .single()
 }
 
 fn automation_matches(conditions: &Value, row: &sqlx::sqlite::SqliteRow) -> bool {
@@ -2061,21 +2111,21 @@ async fn attention_action(
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AutomationInput {
-    name: String,
+pub(crate) struct AutomationInput {
+    pub(crate) name: String,
     #[serde(default = "enabled_default")]
-    enabled: bool,
-    trigger_type: String,
+    pub(crate) enabled: bool,
+    pub(crate) trigger_type: String,
     #[serde(default)]
-    trigger_config: Value,
+    pub(crate) trigger_config: Value,
     #[serde(default)]
-    conditions: Value,
+    pub(crate) conditions: Value,
     #[serde(default = "acquire_action")]
-    action_type: String,
+    pub(crate) action_type: String,
     #[serde(default)]
-    action_config: Value,
+    pub(crate) action_config: Value,
     #[serde(default = "confirm_mode")]
-    mode: String,
+    pub(crate) mode: String,
 }
 fn enabled_default() -> bool {
     true
@@ -2166,7 +2216,7 @@ async fn set_automation_enabled(
     automation_by_id(&state, id).await
 }
 
-fn validate_automation(input: &AutomationInput) -> AppResult<()> {
+pub(crate) fn validate_automation(input: &AutomationInput) -> AppResult<()> {
     if input.name.trim().is_empty() {
         return Err(AppError::BadRequest("规则名称不能为空".into()));
     }
@@ -2177,6 +2227,29 @@ fn validate_automation(input: &AutomationInput) -> AppResult<()> {
     }
     if input.trigger_type.trim().is_empty() {
         return Err(AppError::BadRequest("WHEN 触发器不能为空".into()));
+    }
+    if !matches!(
+        input.trigger_type.as_str(),
+        "NEW_RESOURCE" | "FOLLOWED_ACTOR_UPDATE" | "SCHEDULE"
+    ) {
+        return Err(AppError::BadRequest(
+            "triggerType 必须是 NEW_RESOURCE、FOLLOWED_ACTOR_UPDATE 或 SCHEDULE".into(),
+        ));
+    }
+    if input.trigger_type == "SCHEDULE" {
+        let cron_expr = input
+            .trigger_config
+            .get("cron")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if cron_expr.is_empty() {
+            return Err(AppError::BadRequest(
+                "SCHEDULE 触发器需要在 triggerConfig.cron 提供 cron 表达式".into(),
+            ));
+        }
+        cron::Schedule::from_str(cron_expr)
+            .map_err(|error| AppError::BadRequest(format!("无效的 cron 表达式：{error}")))?;
     }
     Ok(())
 }
