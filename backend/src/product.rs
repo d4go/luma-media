@@ -4543,6 +4543,16 @@ fn extract_catalogue_date(text: &str) -> Option<String> {
     extract_iso_date(text).or_else(|| {
         text.as_bytes().windows(10).find_map(|window| {
             let value = std::str::from_utf8(window).ok()?;
+            let bytes = value.as_bytes();
+            if bytes[2] != b'/'
+                || bytes[5] != b'/'
+                || !bytes
+                    .iter()
+                    .enumerate()
+                    .all(|(index, byte)| matches!(index, 2 | 5) || byte.is_ascii_digit())
+            {
+                return None;
+            }
             let date = chrono::NaiveDate::parse_from_str(value, "%m/%d/%Y").ok()?;
             Some(date.format("%Y-%m-%d").to_string())
         })
@@ -6439,7 +6449,7 @@ mod tests {
 
     #[test]
     fn javdb_catalogue_normalizes_us_release_dates() {
-        let html = r#"<a href="/v/abc"><strong class="uid">ABC-123</strong><div class="video-title">Example title</div><div class="meta">01/01/2020</div></a>"#;
+        let html = r#"<a href="/v/abc"><strong class="uid">ABC-123</strong><div class="video-title">Example title</div><div class="meta"> 01/01/2020</div></a>"#;
         let items = parse_javdb_search_html(html, "", "https://javdb.com");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].code, "abc-123");
@@ -6493,6 +6503,22 @@ mod tests {
         assert_eq!(
             extract_next_page_url(&javbus, &response).as_deref(),
             Some("https://www.javbus.com/page/2")
+        );
+
+        let javdb_response = FetchResponse {
+            final_url: reqwest::Url::parse("https://javdb.com/?vft=0").unwrap(),
+            status: Some(200),
+            content_type: Some("text/html".into()),
+            headers: reqwest::header::HeaderMap::new(),
+            body: r#"<a rel="next" class="pagination-next" href="/?page=2&amp;vft=0">Next</a>"#
+                .into(),
+            fetched_at: chrono::Utc::now(),
+            fetch_mode: crate::fetch::FetchMode::Http,
+            elapsed_ms: 1,
+        };
+        assert_eq!(
+            extract_next_page_url(&javdb, &javdb_response).as_deref(),
+            Some("https://javdb.com/?page=2&vft=0")
         );
     }
 
