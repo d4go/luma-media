@@ -34,7 +34,7 @@ import {
 } from '@tabler/icons-vue'
 import { api } from '../api'
 import { formatDate, inclusiveDateRangeDays } from '../format'
-import type { BrowserSession, Paged, ProductSettings, ProviderConfig, ProviderFetchMode, ProviderRuntime, Settings } from '../types'
+import type { AiProviderKind, AiSettings, BrowserSession, Paged, ProductSettings, ProviderConfig, ProviderFetchMode, ProviderRuntime, Settings } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 import PaginationBar from '../components/PaginationBar.vue'
 
@@ -93,6 +93,51 @@ const product = reactive<ProductSettings>({
   organizerMovieTemplate: '{code}/{code}.{ext}',
   organizerConflictPolicy: 'attention',
 })
+const ai = reactive<AiSettings>({
+  enabled: true,
+  providerKind: 'openai',
+  baseUrl: '',
+  apiKey: '',
+  hasApiKey: false,
+  model: 'gpt-4o-mini',
+  temperature: 0.2,
+  timeoutSecs: 60,
+  maxTokens: 2000,
+})
+const aiPreset = ref('openai')
+const aiTesting = ref(false)
+const aiTestMessage = ref<{ ok: boolean; text: string } | null>(null)
+const aiPresets: { label: string; value: string; kind: AiProviderKind; baseUrl: string; model: string }[] = [
+  { label: 'OpenAI', value: 'openai', kind: 'openai', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  { label: 'DeepSeek', value: 'deepseek', kind: 'openai', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+  { label: '阿里云百炼 (DashScope)', value: 'bailian', kind: 'openai', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+  { label: '本地 Ollama', value: 'ollama', kind: 'ollama', baseUrl: 'http://localhost:11434/v1', model: 'llama3.1' },
+  { label: '自定义（OpenAI 兼容）', value: 'custom', kind: 'custom', baseUrl: '', model: '' },
+]
+function selectAiPreset(value: string) {
+  aiPreset.value = value
+  const preset = aiPresets.find(item => item.value === value)
+  if (!preset) return
+  ai.providerKind = preset.kind
+  ai.baseUrl = preset.baseUrl
+  ai.model = preset.model
+}
+function inferAiPreset() {
+  const preset = aiPresets.find(item => item.baseUrl && ai.baseUrl.startsWith(item.baseUrl))
+  aiPreset.value = preset?.value ?? 'custom'
+}
+async function testAi() {
+  aiTesting.value = true
+  aiTestMessage.value = null
+  try {
+    const result = await api.testAi({ ...ai })
+    aiTestMessage.value = { ok: result.ok, text: result.message }
+  } catch (reason) {
+    aiTestMessage.value = { ok: false, text: reason instanceof Error ? reason.message : '测试失败' }
+  } finally {
+    aiTesting.value = false
+  }
+}
 
 const providerMap = computed(() => Object.fromEntries(providers.value.items.map(item => [item.key, item])))
 const sourceProviders = computed(() => providers.value.items.filter(item => item.type === 'source'))
@@ -247,10 +292,11 @@ function scheduleSyncPoll() {
 async function load() {
   loading.value = true
   try {
-    const [providerData, legacyData, productData] = await Promise.all([
+    const [providerData, legacyData, productData, aiData] = await Promise.all([
       api.providers(page.value, pageSize.value),
       api.settings(),
       api.productSettings(),
+      api.aiSettings(),
     ])
     providers.value = providerData
     providerData.items.filter(provider => provider.type === 'source').forEach(bootstrapWindow)
@@ -262,6 +308,8 @@ async function load() {
     })
     Object.assign(legacy, legacyData)
     Object.assign(product, productData)
+    Object.assign(ai, aiData, { apiKey: '' })
+    inferAiPreset()
     scheduleSyncPoll()
   } catch (reason) {
     message.error(reason instanceof Error ? reason.message : '设置加载失败')
@@ -307,7 +355,20 @@ async function save() {
     legacy.metatubeToken = secrets.metatube ?? ''
     legacy.qbittorrentUrl = providerMap.value.qbittorrent?.baseUrl ?? legacy.qbittorrentUrl
     legacy.qbittorrentPassword = secrets.qbittorrent ?? ''
-    await Promise.all([api.updateSettings({ ...legacy }), api.updateProductSettings({ ...product })])
+    await Promise.all([
+      api.updateSettings({ ...legacy }),
+      api.updateProductSettings({ ...product }),
+      api.updateAiSettings({
+        enabled: ai.enabled,
+        providerKind: ai.providerKind,
+        baseUrl: ai.baseUrl,
+        apiKey: ai.apiKey,
+        model: ai.model,
+        temperature: ai.temperature,
+        timeoutSecs: ai.timeoutSecs,
+        maxTokens: ai.maxTokens,
+      }),
+    ])
     message.success('设置已保存，留空的凭据保持不变')
     Object.keys(secrets).forEach(key => { secrets[key] = '' })
     await load()
@@ -910,6 +971,28 @@ onUnmounted(() => {
             <n-button secondary :loading="testing === 'qbittorrent'" @click="testProvider('qbittorrent')"><template #icon><IconPlugConnected /></template>测试下载服务</n-button>
             <n-alert v-if="testMessages.qbittorrent" :type="testMessages.qbittorrent.ok ? 'success' : 'error'">{{ testMessages.qbittorrent.text }}</n-alert>
           </article>
+        </div>
+      </section>
+
+      <section class="settings-group">
+        <header><span class="eyebrow">AI</span><h2>AI 接入</h2><p>接入一个 OpenAI 兼容的 chat/completions 服务，把自然语言编译成自动化规则。支持 OpenAI、DeepSeek、阿里云百炼和本地 Ollama。</p></header>
+        <div class="luma-settings-card panel">
+          <div class="form-grid">
+            <n-form-item label="服务类型">
+              <n-select :value="aiPreset" :options="aiPresets" @update:value="selectAiPreset" />
+            </n-form-item>
+            <n-form-item label="模型名称"><n-input v-model:value="ai.model" placeholder="gpt-4o-mini / deepseek-chat / qwen-plus" /></n-form-item>
+            <n-form-item label="Base URL" class="wide"><n-input v-model:value="ai.baseUrl" placeholder="https://api.openai.com/v1 或 http://localhost:11434/v1" /></n-form-item>
+            <n-form-item label="API Key"><n-input v-model:value="ai.apiKey" type="password" show-password-on="click" :placeholder="ai.hasApiKey ? '已保存，留空保持不变' : 'Ollama 可留空'" /></n-form-item>
+            <n-form-item label="Temperature"><n-input-number v-model:value="ai.temperature" :min="0" :max="2" :step="0.1" style="width:100%" /></n-form-item>
+            <n-form-item label="超时（秒）"><n-input-number v-model:value="ai.timeoutSecs" :min="5" :max="600" style="width:100%" /></n-form-item>
+            <n-form-item label="最大 Token"><n-input-number v-model:value="ai.maxTokens" :min="256" :max="8192" style="width:100%" /></n-form-item>
+            <n-form-item label="启用 AI 助手"><n-switch v-model:value="ai.enabled" /></n-form-item>
+          </div>
+          <div class="provider-card-actions">
+            <n-button secondary :loading="aiTesting" @click="testAi"><template #icon><IconPlugConnected /></template>测试连接</n-button>
+          </div>
+          <n-alert v-if="aiTestMessage" :type="aiTestMessage.ok ? 'success' : 'error'">{{ aiTestMessage.text }}</n-alert>
         </div>
       </section>
 

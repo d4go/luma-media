@@ -3,6 +3,7 @@ import type {
   DashboardStats, DownloadItem, Folder, FolderInput, MediaItem, MetaTubeConnection, QBittorrentConnection,
   ScrapeOptions, ServiceStatus, Settings, Task, TaskDetail,
   Acquisition, AcquisitionDetail, Actor, AttentionItem, AutomationRule, BrowserSession, CatalogResolveResponse, HomeData, JobEvent, JobItem, JobRun, JobRunDetail, LibraryExportResponse, LibraryItem, LibraryRematchResponse, MediaDetail, Paged, ProductMedia, ProductSettings, ProviderConfig, ProviderDiagnoseResponse, ProviderReparseResponse, ProviderRuntime, ResourceRefreshResponse, SearchResponse, SyncRunResponse,
+  AiSettings, AiTestResult, AiCompileResult,
 } from './types'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
@@ -79,6 +80,10 @@ export const api = {
   updateAutomation: (id: number, input: Partial<AutomationRule>) => request<AutomationRule>(`/automations/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
   deleteAutomation: (id: number) => request<void>(`/automations/${id}`, { method: 'DELETE' }),
   setAutomationEnabled: (id: number, enabled: boolean) => request<AutomationRule>(`/automations/${id}/enabled`, { method: 'POST', body: JSON.stringify({ enabled }) }),
+  aiSettings: () => request<AiSettings>('/ai/settings'),
+  updateAiSettings: (input: AiSettings) => request<AiSettings>('/ai/settings', { method: 'PUT', body: JSON.stringify(input) }),
+  testAi: (input: AiSettings) => request<AiTestResult>('/ai/test', { method: 'POST', body: JSON.stringify(input) }),
+  compileAi: (prompt: string) => request<AiCompileResult>('/ai/compile', { method: 'POST', body: JSON.stringify({ prompt }) }),
   providers: (page = 1, pageSize = 20) => request<Paged<ProviderConfig>>(`/providers${pageQuery(page, pageSize)}`),
   createProvider: (input: { displayName: string; baseUrl: string; secret?: string; adapter?: string; config?: Record<string, unknown> }) => request<ProviderConfig>('/providers', { method: 'POST', body: JSON.stringify(input) }),
   updateProvider: (key: string, input: { displayName?: string; baseUrl: string; secret?: string; config?: Record<string, unknown> }) => request<ProviderConfig>(`/providers/${key}`, { method: 'PUT', body: JSON.stringify(input) }),

@@ -396,3 +396,8 @@ export interface LibraryRematchResponse { item: LibraryItem; message: string }
 export interface ProviderReparseResponse { provider: string; parserVersion: string; scanned: number; valid: number; invalid: number; failed: number; networkRequests: number }
 export interface ProductSettings { downloadRoot: string; mediaRoot: string; qbittorrentSavePath: string; qbittorrentCategory: string; qbittorrentTags: string; organizerMode: 'hardlink' | 'copy'; organizerMovieTemplate: string; organizerConflictPolicy: string }
 export interface AutomationRule { id: number; name: string; enabled: boolean; triggerType: string; triggerConfig: Record<string, unknown>; conditions: Record<string, unknown>; actionType: string; actionConfig: Record<string, unknown>; mode: 'AUTO' | 'CONFIRM' | 'NOTIFY'; lastRunAt: string | null; nextRunAt: string | null; lastStatus: string | null; lastExplanation: string | null; createdAt: string }
+export type AiProviderKind = 'openai' | 'ollama' | 'custom'
+export interface AiSettings { enabled: boolean; providerKind: AiProviderKind; baseUrl: string; apiKey?: string; hasApiKey?: boolean; model: string; temperature: number; timeoutSecs: number; maxTokens: number }
+export interface AiTestResult { ok: boolean; message: string; latencyMs: number; model: string }
+export type AutomationInput = Omit<AutomationRule, 'id' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastExplanation' | 'createdAt'>
+export interface AiCompileResult { rule: AutomationInput; explanation: string; rawContent: string }
