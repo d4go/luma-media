@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
-  NButton, NDataTable, NDrawer, NDrawerContent, NInput, NModal, NSelect, NSpin, NTag,
+  NAlert, NButton, NDataTable, NDrawer, NDrawerContent, NInput, NModal, NSelect, NSpin, NTag,
   useDialog, useMessage, type DataTableColumns,
 } from 'naive-ui'
 import {
@@ -12,7 +12,7 @@ import PageHeader from '../components/PageHeader.vue'
 import EmptyState from '../components/EmptyState.vue'
 import PaginationBar from '../components/PaginationBar.vue'
 import { api } from '../api'
-import { formatDate } from '../format'
+import { formatDate, inclusiveDateRangeDays } from '../format'
 import type { JobEvent, JobItem, JobItemStatus, JobRun, JobRunDetail, JobStatus, ProviderConfig } from '../types'
 
 const message = useMessage()
@@ -176,8 +176,10 @@ function openCreate() {
 
 async function createRun() {
   if (!createForm.providerKey) return message.warning('请选择数据源')
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(createForm.from) || !/^\d{4}-\d{2}-\d{2}$/.test(createForm.to)) return message.warning('日期格式应为 YYYY-MM-DD')
-  if (createForm.from > createForm.to) return message.warning('开始日期不能晚于结束日期')
+  const rangeDays = inclusiveDateRangeDays(createForm.from, createForm.to)
+  if (rangeDays == null) return message.warning('日期格式应为 YYYY-MM-DD，且必须是真实日期')
+  if (rangeDays < 1) return message.warning('开始日期不能晚于结束日期')
+  if (createForm.mode === 'bootstrap' && rangeDays > 31) return message.warning('历史回填单次最多 31 天（包含开始和结束日期）')
   creating.value = true
   try {
     const input = { providerKey: createForm.providerKey, from: createForm.from, to: createForm.to, includeResources: createForm.includeResources }
@@ -320,6 +322,7 @@ onUnmounted(() => window.clearInterval(poller))
         <n-form-item label="开始日期"><n-input v-model:value="createForm.from" placeholder="YYYY-MM-DD" /></n-form-item>
         <n-form-item label="结束日期"><n-input v-model:value="createForm.to" placeholder="YYYY-MM-DD" /></n-form-item>
       </div>
+      <n-alert v-if="createForm.mode === 'bootstrap'" type="info" :show-icon="false">历史回填单次最多 31 天（包含开始和结束日期）。</n-alert>
       <n-form-item label="同步下载资源"><n-switch v-model:value="createForm.includeResources" /></n-form-item>
     </n-form>
     <template #footer><div class="modal-actions"><n-button @click="createOpen = false">取消</n-button><n-button type="primary" :loading="creating" @click="createRun"><template #icon><IconHistory /></template>创建任务</n-button></div></template>

@@ -28,8 +28,6 @@ const requestedCode = computed(() => {
   const match = query.value.trim().toUpperCase().match(/(?:FC2[-_ ]?PPV[-_ ]?\d{4,8}|[A-Z]{2,12}[-_ ]?\d{2,7})/)
   return match?.[0].replace(/[ _]+/g, '-').replace(/^(FC2)-?(PPV)-?/, '$1-$2-') ?? ''
 })
-const databaseMiss = computed(() => Boolean(result.value && !result.value.media.items.length && !result.value.actors.items.length))
-
 async function runSearch() {
   const q = query.value.trim()
   await router.replace({ query: q ? { q } : {} })
@@ -94,6 +92,7 @@ function startEvents() {
 watch(() => route.query.q, value => {
   if (String(value ?? '') !== query.value) loadRoute()
 })
+watch(query, () => { resolveStatus.value = '' })
 onMounted(() => {
   startEvents()
   loadRoute()
@@ -119,6 +118,18 @@ onUnmounted(() => eventSource?.close())
 
   <n-spin :show="loading">
     <div v-if="result" class="search-results">
+      <div class="online-resolve-bar">
+        <div>
+          <strong>继续在线补充</strong>
+          <span>无论本地已有多少结果，都可以从所有已启用的数据源继续查找这个番号、标题或演员。</span>
+          <small v-if="resolveStatus" class="resolve-status">{{ resolveStatus }}</small>
+        </div>
+        <n-button type="primary" :loading="resolving" @click="resolveFromSources">
+          <template #icon><IconCloudDownload /></template>
+          从数据源查找 {{ query.trim() }}
+        </n-button>
+      </div>
+
       <section v-if="result.actors.items.length" class="result-section">
         <header class="product-section-head">
           <div><h2>演员</h2><span>别名会一起参与本地匹配</span></div>
@@ -153,12 +164,7 @@ onUnmounted(() => eventSource?.close())
         <div v-else class="quiet-empty resolve-empty">
           <IconSearch :size="28" />
           <strong>本地数据库暂无结果</strong>
-          <span>可以创建高优先级后台任务，从所有已启用的数据源查找这个番号、标题或演员。</span>
-          <n-button v-if="databaseMiss" type="primary" :loading="resolving" @click="resolveFromSources">
-            <template #icon><IconCloudDownload /></template>
-            从数据源查找 {{ query.trim() }}
-          </n-button>
-          <small v-if="resolveStatus" class="resolve-status">{{ resolveStatus }}</small>
+          <span>可以使用上方“从数据源查找”创建高优先级后台任务。</span>
         </div>
         <PaginationBar :page="page" :page-size="pageSize" :total="result.media.total" @update:page="changeSearchPage" @update:page-size="changeSearchPageSize" />
       </section>

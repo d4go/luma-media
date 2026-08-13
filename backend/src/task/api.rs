@@ -110,7 +110,11 @@ async fn create_run_with_mode(
         } else {
             (input.from.trim().to_owned(), input.to.trim().to_owned())
         };
-    validate_date_range(&from, &to)?;
+    if mode == "bootstrap" {
+        validate_bootstrap_date_range(&from, &to)?;
+    } else {
+        validate_date_range(&from, &to)?;
+    }
     // v2 deliberately invalidates historical runs created before catalogue
     // pagination/release-date ordering was fixed. Otherwise SQLite's unique
     // idempotency key would keep returning the old zero-result run.
@@ -151,22 +155,40 @@ async fn create_run_with_mode(
 }
 
 fn validate_date_range(from: &str, to: &str) -> AppResult<()> {
-    let valid = |value: &str| {
-        value.len() == 10
-            && value.as_bytes()[4] == b'-'
-            && value.as_bytes()[7] == b'-'
-            && value
-                .bytes()
-                .enumerate()
-                .all(|(index, byte)| byte.is_ascii_digit() || index == 4 || index == 7)
-    };
-    if !valid(from) || !valid(to) {
-        return Err(AppError::BadRequest("日期格式应为 YYYY-MM-DD".into()));
-    }
-    if from > to {
+    let from_date = chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d")
+        .map_err(|_| AppError::BadRequest("日期格式应为 YYYY-MM-DD".into()))?;
+    let to_date = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d")
+        .map_err(|_| AppError::BadRequest("日期格式应为 YYYY-MM-DD".into()))?;
+    if from_date > to_date {
         return Err(AppError::BadRequest("开始日期不能晚于结束日期".into()));
     }
     Ok(())
+}
+
+fn validate_bootstrap_date_range(from: &str, to: &str) -> AppResult<()> {
+    validate_date_range(from, to)?;
+    let from_date = chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d")
+        .map_err(|_| AppError::BadRequest("日期格式应为 YYYY-MM-DD".into()))?;
+    let to_date = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d")
+        .map_err(|_| AppError::BadRequest("日期格式应为 YYYY-MM-DD".into()))?;
+    if (to_date - from_date).num_days() > 30 {
+        return Err(AppError::BadRequest(
+            "历史回填单次最多 31 天（包含开始和结束日期）".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod date_range_tests {
+    use super::validate_bootstrap_date_range;
+
+    #[test]
+    fn bootstrap_date_range_is_limited_to_31_inclusive_days() {
+        assert!(validate_bootstrap_date_range("2026-08-01", "2026-08-31").is_ok());
+        assert!(validate_bootstrap_date_range("2026-08-01", "2026-09-01").is_err());
+        assert!(validate_bootstrap_date_range("2026-02-30", "2026-03-01").is_err());
+    }
 }
 
 async fn run_detail(State(state): State<AppState>, Path(id): Path<i64>) -> AppResult<Json<Value>> {

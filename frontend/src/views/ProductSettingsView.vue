@@ -30,7 +30,7 @@ import {
   IconTrash,
 } from '@tabler/icons-vue'
 import { api } from '../api'
-import { formatDate } from '../format'
+import { formatDate, inclusiveDateRangeDays } from '../format'
 import type { BrowserSession, Paged, ProductSettings, ProviderConfig, ProviderFetchMode, ProviderRuntime, Settings } from '../types'
 import PageHeader from '../components/PageHeader.vue'
 import PaginationBar from '../components/PaginationBar.vue'
@@ -185,7 +185,7 @@ function syncDate(value: string | null, fallback: string) {
 function defaultBootstrapWindow() {
   const to = new Date()
   const from = new Date(to)
-  from.setFullYear(from.getFullYear() - 2)
+  from.setUTCDate(from.getUTCDate() - 30)
   return { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) }
 }
 
@@ -470,10 +470,14 @@ async function startIncremental(provider: ProviderConfig) {
 }
 
 async function startBootstrap(provider: ProviderConfig) {
+  const range = bootstrapWindow(provider)
+  const rangeDays = inclusiveDateRangeDays(range.from, range.to)
+  if (rangeDays == null) return message.warning('日期格式应为 YYYY-MM-DD，且必须是真实日期')
+  if (rangeDays < 1) return message.warning('历史开始日期不能晚于结束日期')
+  if (rangeDays > 31) return message.warning('历史回填单次最多 31 天（包含开始和结束日期）')
   syncing.value = `${provider.key}:bootstrap`
   try {
     await persistProvider(provider)
-    const range = bootstrapWindow(provider)
     const result = await api.bootstrapProvider(provider.key, range.from, range.to, true)
     message.success(`${provider.displayName} 历史回填已开始，任务 #${result.runId}`)
     await load()
@@ -580,7 +584,7 @@ onUnmounted(() => {
         </article>
 
         <div class="source-provider-list">
-          <button v-for="provider in sourceProviders" :key="provider.key" type="button" class="source-provider-row" @click="openProvider(provider.key)">
+          <article v-for="provider in sourceProviders" :key="provider.key" class="source-provider-row">
             <span class="provider-icon"><IconDatabase /></span>
             <span class="source-row-copy"><strong>{{ provider.displayName }}</strong><small>{{ sourceAdapterName(provider) }} · {{ provider.key }}</small></span>
             <span class="source-row-status">
@@ -588,8 +592,11 @@ onUnmounted(() => {
               <span v-if="providerRuntimes[provider.key]" class="source-sync-status" :data-status="providerRuntimes[provider.key].state">{{ runtimeStateLabel[providerRuntimes[provider.key].state] }}</span>
             </span>
             <span class="source-row-meta">{{ sourceSyncEnabled(provider) ? `下次执行 ${syncDate(provider.syncNextRunAt, '等待安排')}` : '同步已关闭' }}</span>
-            <IconArrowRight :size="16" class="source-row-arrow" />
-          </button>
+            <n-button size="small" secondary class="source-detail-button" @click="openProvider(provider.key)">
+              查看详情
+              <template #icon><IconArrowRight :size="15" /></template>
+            </n-button>
+          </article>
           <div v-if="!sourceProviders.length" class="quiet-empty compact"><IconDatabase :size="24" /><strong>还没有内容来源</strong><span>点击右上角“添加来源”开始建立本地索引。</span></div>
         </div>
         <PaginationBar v-if="providers.total > 0" :page="page" :page-size="pageSize" :total="providers.total" @update:page="changePage" @update:page-size="changePageSize" />
@@ -719,6 +726,7 @@ onUnmounted(() => {
                 </n-alert>
               </div>
               <div class="source-bootstrap-control">
+                <n-alert type="info" :show-icon="false">为保证任务稳定，历史回填单次最多 31 天（包含开始和结束日期）。</n-alert>
                 <div class="source-bootstrap-range">
                   <n-form-item label="历史开始日期"><n-input v-model:value="bootstrapWindow(provider).from" placeholder="2024-01-01" /></n-form-item>
                   <n-form-item label="历史结束日期"><n-input v-model:value="bootstrapWindow(provider).to" placeholder="2026-08-10" /></n-form-item>

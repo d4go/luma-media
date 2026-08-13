@@ -2429,7 +2429,7 @@ async fn bootstrap_provider(
     AxumPath(key): AxumPath<String>,
     Json(input): Json<BootstrapInput>,
 ) -> AppResult<Json<SyncRunResponse>> {
-    validate_sync_window(&input.from, &input.to)?;
+    validate_bootstrap_window(&input.from, &input.to)?;
     let provider = source_provider_by_key(&state, &key)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -2774,6 +2774,20 @@ fn validate_sync_window(from: &str, to: &str) -> AppResult<()> {
         .map_err(|_| AppError::BadRequest("to 必须是 YYYY-MM-DD".into()))?;
     if from_date > to_date {
         return Err(AppError::BadRequest("from 不能晚于 to".into()));
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_window(from: &str, to: &str) -> AppResult<()> {
+    validate_sync_window(from, to)?;
+    let from_date = chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d")
+        .map_err(|_| AppError::BadRequest("from 必须是 YYYY-MM-DD".into()))?;
+    let to_date = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d")
+        .map_err(|_| AppError::BadRequest("to 必须是 YYYY-MM-DD".into()))?;
+    if (to_date - from_date).num_days() > 30 {
+        return Err(AppError::BadRequest(
+            "历史回填单次最多 31 天（包含开始和结束日期）".into(),
+        ));
     }
     Ok(())
 }
@@ -6426,6 +6440,12 @@ mod tests {
     }
 
     #[test]
+    fn legacy_bootstrap_date_range_is_limited_to_31_inclusive_days() {
+        assert!(validate_bootstrap_window("2026-08-01", "2026-08-31").is_ok());
+        assert!(validate_bootstrap_window("2026-08-01", "2026-09-01").is_err());
+    }
+
+    #[test]
     fn historical_bootstrap_only_calls_resource_endpoint_for_recent_titles() {
         let today = chrono::Utc::now().date_naive();
         let recent = (today - chrono::Duration::days(30))
@@ -6553,7 +6573,7 @@ mod tests {
             State(state.clone()),
             AxumPath("mock-bootstrap".into()),
             Json(BootstrapInput {
-                from: "2024-01-01".into(),
+                from: "2026-08-01".into(),
                 to: "2026-08-10".into(),
                 include_resources: false,
             }),
@@ -6626,7 +6646,7 @@ mod tests {
             .execute(&state.pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE source_sync_state SET bootstrap_paused=1,cursor_json='{\"mode\":\"bootstrap\",\"nextUrl\":null,\"page\":2,\"from\":\"2024-01-01\",\"to\":\"2026-08-10\",\"includeResources\":false,\"hasMore\":false}' WHERE provider_key='mock-bootstrap'")
+        sqlx::query("UPDATE source_sync_state SET bootstrap_paused=1,cursor_json='{\"mode\":\"bootstrap\",\"nextUrl\":null,\"page\":2,\"from\":\"2026-08-01\",\"to\":\"2026-08-10\",\"includeResources\":false,\"hasMore\":false}' WHERE provider_key='mock-bootstrap'")
             .execute(&state.pool)
             .await
             .unwrap();
