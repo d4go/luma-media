@@ -46,11 +46,20 @@ const services = computed(() => [
   { key: 'qbittorrent', name: 'qBittorrent', health: status.value?.qbittorrent },
 ])
 const themeOverrides = computed<GlobalThemeOverrides>(() => ({
-  common: { primaryColor: '#e15836', primaryColorHover: '#ee6948', primaryColorPressed: '#bd452a', primaryColorSuppl: '#e15836', infoColor: '#e15836', borderRadius: '9px', borderRadiusSmall: '7px', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif' },
-  Button: { fontWeight: '650', borderRadiusMedium: '9px' }, Card: { borderRadius: '13px' },
+  common: {
+    primaryColor: isDark.value ? '#2997ff' : '#0071e3',
+    primaryColorHover: isDark.value ? '#4ba5ff' : '#0077ed',
+    primaryColorPressed: isDark.value ? '#1f7fdd' : '#0060c9',
+    primaryColorSuppl: isDark.value ? '#2997ff' : '#0071e3',
+    infoColor: isDark.value ? '#2997ff' : '#0071e3',
+    borderRadius: '10px',
+    borderRadiusSmall: '8px',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif',
+  },
+  Button: { fontWeight: '600', borderRadiusMedium: '10px' }, Card: { borderRadius: '14px' },
   Menu: isDark.value
-    ? { itemTextColor: '#aaaeb5', itemTextColorHover: '#f6f6f7', itemTextColorActive: '#ffffff', itemIconColor: '#80858d', itemIconColorHover: '#ffffff', itemIconColorActive: '#ffffff', itemColorHover: 'rgba(255,255,255,.06)', itemColorActive: 'rgba(225,88,54,.18)', itemColorActiveHover: 'rgba(225,88,54,.22)', itemBorderRadius: '8px' }
-    : { itemTextColor: '#555b64', itemTextColorHover: '#17191c', itemTextColorActive: '#b74428', itemIconColor: '#737983', itemIconColorHover: '#30343a', itemIconColorActive: '#d65333', itemColorHover: 'rgba(24,28,34,.05)', itemColorActive: 'rgba(225,88,54,.11)', itemColorActiveHover: 'rgba(225,88,54,.15)', itemBorderRadius: '8px' },
+    ? { itemTextColor: '#a1a1a6', itemTextColorHover: '#f5f5f7', itemTextColorActive: '#ffffff', itemIconColor: '#86868b', itemIconColorHover: '#f5f5f7', itemIconColorActive: '#ffffff', itemColorHover: 'rgba(255,255,255,.08)', itemColorActive: 'rgba(41,151,255,.28)', itemColorActiveHover: 'rgba(41,151,255,.32)', itemBorderRadius: '10px' }
+    : { itemTextColor: '#6e6e73', itemTextColorHover: '#1d1d1f', itemTextColorActive: '#0071e3', itemIconColor: '#86868b', itemIconColorHover: '#3a3a3c', itemIconColorActive: '#0071e3', itemColorHover: 'rgba(0,0,0,.05)', itemColorActive: 'rgba(0,113,227,.12)', itemColorActiveHover: 'rgba(0,113,227,.16)', itemBorderRadius: '10px' },
 }))
 
 function unavailable(message: string): ServiceHealth { return { connected: false, message, latencyMs: null } }
