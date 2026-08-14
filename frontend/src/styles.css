@@ -935,3 +935,52 @@ body.luma-dark .state-chip { color:var(--text-secondary); background:var(--surfa
   .library-rematch-form,.source-priority-grid,.source-bootstrap-range { grid-template-columns:1fr; }
   .resource-section-head { align-items:flex-start; flex-direction:column; }
 }
+
+/* ── Interaction layer ─────────────────────────────────────────────────── */
+
+/* Page transition */
+.page-enter-active { transition: opacity .18s ease, transform .18s ease; }
+.page-leave-active { transition: opacity .1s ease; }
+.page-enter-from { opacity: 0; transform: translateY(8px); }
+.page-leave-to { opacity: 0; }
+
+/* Command palette */
+.search-kbd { padding: 3px 7px; color: var(--text-secondary); background: var(--surface-muted); border: 1px solid var(--hairline); border-radius: 6px; font-family: inherit; font-size: 10px; font-weight: 650; cursor: pointer; }
+.search-kbd:hover { color: var(--text); border-color: color-mix(in srgb, var(--accent) 40%, var(--hairline)); }
+.command-palette { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: center; align-items: flex-start; padding: 14vh 20px 0; background: rgba(0, 0, 0, .22); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.command-palette-panel { width: min(600px, 100%); overflow: hidden; background: var(--surface); border: 1px solid var(--hairline); border-radius: 16px; box-shadow: 0 24px 70px rgba(0, 0, 0, .18); }
+.command-input { display: flex; align-items: center; gap: 10px; padding: 15px 18px; color: var(--text-secondary); border-bottom: 1px solid var(--hairline); }
+.command-input input { flex: 1; min-width: 0; color: var(--text); background: transparent; border: 0; outline: 0; font: inherit; font-size: 15px; }
+.command-results { padding: 8px; max-height: 46vh; overflow-y: auto; }
+.command-row { width: 100%; padding: 10px 12px; display: flex; align-items: center; gap: 12px; color: var(--text); background: transparent; border: 0; border-radius: 10px; font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.command-row.active { color: var(--accent-strong); background: var(--accent-soft); }
+.command-row-icon { display: grid; place-items: center; color: var(--text-secondary); }
+.command-row.active .command-row-icon { color: var(--accent); }
+.command-row-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.command-row-hint { margin-left: auto; color: var(--text-secondary); font-size: 10px; }
+.command-empty { padding: 26px 12px; color: var(--text-secondary); font-size: 12px; text-align: center; }
+.command-foot { padding: 10px 16px; display: flex; gap: 16px; color: var(--text-secondary); font-size: 10px; border-top: 1px solid var(--hairline); }
+.palette-enter-active, .palette-leave-active { transition: opacity .16s ease; }
+.palette-enter-active .command-palette-panel, .palette-leave-active .command-palette-panel { transition: transform .18s cubic-bezier(.2, .7, .2, 1), opacity .16s ease; }
+.palette-enter-from, .palette-leave-to { opacity: 0; }
+.palette-enter-from .command-palette-panel, .palette-leave-to .command-palette-panel { opacity: 0; transform: translateY(-10px) scale(.985); }
+
+/* Skeleton loading */
+.home-skeleton { display: grid; gap: 18px; }
+.skeleton-block { border-radius: 14px; background: linear-gradient(100deg, var(--surface-muted) 40%, color-mix(in srgb, var(--surface-muted) 55%, var(--page)) 50%, var(--surface-muted) 60%); background-size: 200% 100%; animation: skeleton-wave 1.3s ease-in-out infinite; }
+.skeleton-hero { height: 240px; }
+.skeleton-metrics { height: 72px; }
+.skeleton-workspace { height: 340px; }
+@keyframes skeleton-wave { to { background-position: -200% 0; } }
+
+/* Home staged reveal */
+.home-hero, .home-metrics, .home-workspace { animation: rise-in .32s cubic-bezier(.2, .7, .2, 1) both; }
+.home-metrics { animation-delay: .04s; }
+.home-workspace { animation-delay: .08s; }
+@keyframes rise-in { from { opacity: 0; transform: translateY(8px); } }
+
+/* Press feedback on clickable cards */
+.automation-list article:active, .source-provider-row:active, .flow-mini-card:active, .home-recent-row:active, .home-quick-starts nav > a:active { transform: scale(.995); }
+@media (prefers-reduced-motion: reduce) {
+  .page-enter-active, .page-leave-active, .palette-enter-active, .palette-leave-active, .home-hero, .home-metrics, .home-workspace, .skeleton-block { animation: none; transition: none; }
+}

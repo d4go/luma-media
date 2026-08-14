@@ -6,11 +6,14 @@ import { IconAutomation, IconBooks, IconDownload, IconHome, IconList, IconMenu2,
 import { api } from './api'
 import { serviceStatusKey } from './service-status'
 import type { ServiceHealth, ServiceStatus } from './types'
+import CommandPalette from './components/CommandPalette.vue'
 
 const route = useRoute()
 const router = useRouter()
 const mobileOpen = ref(false)
 const searchText = ref('')
+const searchInput = ref<{ focus: () => void } | null>(null)
+const paletteOpen = ref(false)
 const refreshing = ref(false)
 const status = ref<ServiceStatus | null>(null)
 const prefersDark = window.matchMedia('(prefers-color-scheme: dark)')
@@ -78,12 +81,23 @@ function submitSearch() {
 }
 function toggleTheme() { isDark.value = !isDark.value; localStorage.setItem('luma-theme', isDark.value ? 'dark' : 'light') }
 function onSystemTheme(event: MediaQueryListEvent) { if (!localStorage.getItem('luma-theme')) isDark.value = event.matches }
+function onKeydown(event: KeyboardEvent) {
+  const target = event.target as HTMLElement | null
+  const typing = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+    event.preventDefault()
+    paletteOpen.value = !paletteOpen.value
+  } else if (event.key === '/' && !typing && !paletteOpen.value) {
+    event.preventDefault()
+    searchInput.value?.focus()
+  }
+}
 
 provide(serviceStatusKey, { status, refreshing, refresh: refreshStatus })
 watch(isDark, dark => document.body.classList.toggle('luma-dark', dark), { immediate: true })
 watch(() => route.path, () => { mobileOpen.value = false })
-onMounted(() => { prefersDark.addEventListener('change', onSystemTheme); refreshStatus(); statusTimer = window.setInterval(refreshStatus, 10000) })
-onUnmounted(() => { prefersDark.removeEventListener('change', onSystemTheme); window.clearInterval(statusTimer); document.body.classList.remove('luma-dark') })
+onMounted(() => { prefersDark.addEventListener('change', onSystemTheme); window.addEventListener('keydown', onKeydown); refreshStatus(); statusTimer = window.setInterval(refreshStatus, 10000) })
+onUnmounted(() => { prefersDark.removeEventListener('change', onSystemTheme); window.removeEventListener('keydown', onKeydown); window.clearInterval(statusTimer); document.body.classList.remove('luma-dark') })
 </script>
 
 <template>
@@ -112,13 +126,20 @@ onUnmounted(() => { prefersDark.removeEventListener('change', onSystemTheme); wi
         <main class="main-panel">
           <header class="topbar">
             <n-button class="mobile-menu" quaternary circle aria-label="打开菜单" @click="mobileOpen = true"><template #icon><IconMenu2 /></template></n-button>
-            <div class="global-search"><IconSearch :size="17" /><n-input v-model:value="searchText" :bordered="false" clearable placeholder="搜索番号、标题或演员" aria-label="全局搜索" @keyup.enter="submitSearch" /></div>
+            <div class="global-search"><IconSearch :size="17" /><n-input ref="searchInput" v-model:value="searchText" :bordered="false" clearable placeholder="搜索番号、标题或演员" aria-label="全局搜索" @keyup.enter="submitSearch" /><button type="button" class="search-kbd" aria-label="打开命令面板" @click="paletteOpen = true">⌘K</button></div>
             <span class="topbar-service"><i class="status-dot" :class="{ online: status?.luma.connected }" />{{ status?.luma.connected ? '系统正常' : '连接异常' }}</span>
             <n-button quaternary circle :aria-label="isDark ? '切换到浅色模式' : '切换到深色模式'" @click="toggleTheme"><template #icon><IconSun v-if="isDark" /><IconMoon v-else /></template></n-button>
           </header>
-          <div class="page-container"><router-view /></div>
+          <div class="page-container">
+            <router-view v-slot="{ Component }">
+              <transition name="page" mode="out-in">
+                <component :is="Component" />
+              </transition>
+            </router-view>
+          </div>
         </main>
       </div>
+      <CommandPalette :show="paletteOpen" :is-dark="isDark" @close="paletteOpen = false" @toggle-theme="toggleTheme" @refresh-status="refreshStatus" />
     </n-loading-bar-provider></n-dialog-provider></n-message-provider>
   </n-config-provider>
 </template>

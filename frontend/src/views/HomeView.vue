@@ -31,7 +31,12 @@ onMounted(() => { load(); events = new EventSource('/api/v1/events'); events.onm
 onUnmounted(() => events?.close())
 </script>
 <template>
-  <n-spin :show="loading">
+  <div v-if="loading && !data" class="home-skeleton" aria-hidden="true">
+    <div class="skeleton-block skeleton-hero" />
+    <div class="skeleton-block skeleton-metrics" />
+    <div class="skeleton-block skeleton-workspace" />
+  </div>
+  <n-spin v-else :show="loading">
     <div class="product-home">
       <section class="home-hero">
         <div class="hero-copy"><span class="eyebrow">LUMA MEDIA</span><h1>今天想把什么<br>带回媒体库？</h1><p>搜索作品，选择资源，剩下的下载、整理和入库交给 Luma。</p><div class="hero-actions"><n-button type="primary" size="large"><RouterLink to="/resources"><IconSearch :size="18" />搜索资源</RouterLink></n-button><n-button secondary size="large"><RouterLink to="/library">打开媒体库<IconArrowRight :size="17" /></RouterLink></n-button></div></div>
