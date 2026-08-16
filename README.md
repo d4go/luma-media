@@ -125,6 +125,7 @@ npm run dev
 | `LUMA_CHROMIUM_PATH` | `/usr/bin/chromium` | Chromium 可执行文件路径 |
 | `LUMA_BROWSER_DATA_DIR` | `/data/browser-profiles` | 浏览器用户数据目录 |
 | `LUMA_BROWSER_HEADLESS` | `true` | 无头模式 |
+| `LUMA_BROWSER_IDLE_SECONDS` | `300` | 每个 provider 的 Chromium 空闲超过该秒数后回收（释放进程与渲染进程） |
 | `LUMA_BROWSER_SESSION_PORT` | `6080` | 浏览器会话调试端口（VNC） |
 | `RUST_LOG` | `luma_server=info,tower_http=info` | 日志级别 |
 

@@ -125,6 +125,7 @@ Open `http://localhost:5173`. Vite proxies `/api` to `http://localhost:3000`.
 | `LUMA_CHROMIUM_PATH` | `/usr/bin/chromium` | Path to the Chromium executable |
 | `LUMA_BROWSER_DATA_DIR` | `/data/browser-profiles` | Browser user-data directory |
 | `LUMA_BROWSER_HEADLESS` | `true` | Headless mode |
+| `LUMA_BROWSER_IDLE_SECONDS` | `300` | Reap each provider's Chromium after this many seconds of inactivity (frees the browser process and its renderers) |
 | `LUMA_BROWSER_SESSION_PORT` | `6080` | Browser session debug port (VNC) |
 | `RUST_LOG` | `luma_server=info,tower_http=info` | Log level |
 

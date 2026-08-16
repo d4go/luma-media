@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -24,6 +27,9 @@ use super::model::{
 const INTERACTIVE_SESSION_MINUTES: i64 = 15;
 const CHROMIUM_PROFILE_LOCK_FILES: [&str; 3] =
     ["SingletonLock", "SingletonSocket", "SingletonCookie"];
+const BROWSER_IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const BROWSER_CLOSE_GRACE: Duration = Duration::from_secs(5);
+const PROCESS_TREE_SIGNAL_PAUSE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub struct BrowserSettings {
@@ -31,6 +37,8 @@ pub struct BrowserSettings {
     pub executable: PathBuf,
     pub data_dir: PathBuf,
     pub headless: bool,
+    /// How long a per-provider Chromium may sit unused before it is reaped.
+    pub browser_idle: Duration,
     pub session_port: u16,
 }
 
@@ -45,6 +53,11 @@ impl BrowserSettings {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("data/browser-profiles")),
             headless: env_bool("LUMA_BROWSER_HEADLESS", true),
+            browser_idle: std::env::var("LUMA_BROWSER_IDLE_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(300)),
             session_port: std::env::var("LUMA_BROWSER_SESSION_PORT")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -100,13 +113,19 @@ impl InteractiveSession {
     }
 }
 
+struct BrowserEntry {
+    browser: Arc<Mutex<Browser>>,
+    last_used: Instant,
+}
+
 #[derive(Clone)]
 pub struct BrowserManager {
     settings: BrowserSettings,
-    browsers: Arc<Mutex<HashMap<String, Arc<Mutex<Browser>>>>>,
+    browsers: Arc<Mutex<HashMap<String, BrowserEntry>>>,
     provider_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     interactive: Arc<Mutex<Option<InteractiveSession>>>,
     interactive_start: Arc<Mutex<()>>,
+    reaper_started: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for BrowserManager {
@@ -126,6 +145,7 @@ impl BrowserManager {
             provider_locks: Arc::new(Mutex::new(HashMap::new())),
             interactive: Arc::new(Mutex::new(None)),
             interactive_start: Arc::new(Mutex::new(())),
+            reaper_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -439,8 +459,9 @@ impl BrowserManager {
         provider_key: &str,
         timeout: Duration,
     ) -> Result<Arc<Mutex<Browser>>, FetchError> {
-        if let Some(browser) = self.browsers.lock().await.get(provider_key).cloned() {
-            return Ok(browser);
+        if let Some(entry) = self.browsers.lock().await.get_mut(provider_key) {
+            entry.last_used = Instant::now();
+            return Ok(entry.browser.clone());
         }
         let profile_path = self.profile_path(provider_key)?;
         tokio::fs::create_dir_all(&profile_path)
@@ -490,24 +511,97 @@ impl BrowserManager {
             }
         });
         let browser = Arc::new(Mutex::new(browser));
-        self.browsers
-            .lock()
-            .await
-            .insert(provider_key.to_owned(), browser.clone());
+        {
+            let mut browsers = self.browsers.lock().await;
+            browsers.insert(
+                provider_key.to_owned(),
+                BrowserEntry {
+                    browser: browser.clone(),
+                    last_used: Instant::now(),
+                },
+            );
+        }
+        self.ensure_reaper();
         Ok(browser)
     }
 
+    /// Close a per-provider Chromium and reap the whole process tree.
+    ///
+    /// The graceful `close` + `wait` path lets Chromium tear its own renderer
+    /// children down. If the process is unresponsive, `kill_process_tree`
+    /// SIGKILLs every descendant (renderers, GPU, zygote, utilities) rather
+    /// than only the top-level browser process — killing the browser alone
+    /// orphans its renderers and is the source of the "renderer leak".
     async fn close_provider(&self, provider_key: &str) {
-        let Some(browser) = self.browsers.lock().await.remove(provider_key) else {
+        let Some(entry) = self.browsers.lock().await.remove(provider_key) else {
             return;
         };
-        let mut browser = browser.lock().await;
-        let _ = browser.close().await;
-        if tokio::time::timeout(Duration::from_secs(5), browser.wait())
+        let mut browser = entry.browser.lock().await;
+        let process_id = browser
+            .get_mut_child()
+            .and_then(|child| child.as_mut_inner().id());
+        let _ = tokio::time::timeout(BROWSER_CLOSE_GRACE, browser.close()).await;
+        let exited = tokio::time::timeout(BROWSER_CLOSE_GRACE, browser.wait())
             .await
-            .is_err()
-        {
-            let _ = browser.kill().await;
+            .is_ok();
+        if !exited {
+            if let Some(process_id) = process_id {
+                kill_process_tree(process_id).await;
+            } else {
+                let _ = browser.kill().await;
+            }
+            let _ = tokio::time::timeout(BROWSER_CLOSE_GRACE, browser.wait()).await;
+        }
+    }
+
+    /// Spawn the idle-reaper task exactly once for the lifetime of the manager.
+    fn ensure_reaper(&self) {
+        if self.reaper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager.reap_loop().await;
+        });
+    }
+
+    async fn reap_loop(&self) {
+        let mut interval = tokio::time::interval(BROWSER_IDLE_CHECK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            self.reap_idle_browsers().await;
+        }
+    }
+
+    async fn reap_idle_browsers(&self) {
+        let idle_keys: Vec<String> = {
+            let browsers = self.browsers.lock().await;
+            browsers
+                .iter()
+                .filter(|(_, entry)| entry.last_used.elapsed() >= self.settings.browser_idle)
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        for key in idle_keys {
+            // Skip providers that are mid-fetch: a `try_acquire` never blocks the
+            // reaper, and a held permit means the browser is in use right now.
+            let semaphore = self.provider_lock(&key).await;
+            let Ok(_permit) = semaphore.try_acquire_owned() else {
+                continue;
+            };
+            let still_idle = {
+                let browsers = self.browsers.lock().await;
+                browsers
+                    .get(&key)
+                    .map(|entry| entry.last_used.elapsed() >= self.settings.browser_idle)
+                    .unwrap_or(false)
+            };
+            if still_idle {
+                tracing::info!(provider_key = %key, "reaping idle Chromium browser");
+                self.close_provider(&key).await;
+            }
+            // `_permit` drops here and releases the provider lock.
         }
     }
 
@@ -629,22 +723,71 @@ fn spawn_silent(command: &mut Command) -> Result<Child, FetchError> {
 async fn stop_children(mut children: Vec<Child>) {
     for child in children.iter_mut().rev() {
         if let Some(process_id) = child.id() {
-            let _ = Command::new("kill")
-                .args(["-TERM", &process_id.to_string()])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
+            signal_process(process_id, "TERM").await;
         }
         if tokio::time::timeout(Duration::from_secs(3), child.wait())
             .await
             .is_err()
         {
-            let _ = child.kill().await;
+            match child.id() {
+                Some(process_id) => kill_process_tree(process_id).await,
+                None => {
+                    let _ = child.kill().await;
+                }
+            }
             let _ = child.wait().await;
         }
     }
+}
+
+/// Send a signal (`TERM`/`KILL`) to a single process via the `kill` binary.
+async fn signal_process(process_id: u32, signal: &str) {
+    let _ = Command::new("kill")
+        .args([format!("-{signal}"), process_id.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+/// Collect every descendant PID of `root` by walking `/proc/<pid>/task/<pid>/children`.
+async fn descendant_process_ids(root: u32) -> Vec<u32> {
+    let mut ids = Vec::new();
+    let mut pending = vec![root];
+    while let Some(pid) = pending.pop() {
+        let children_file = format!("/proc/{pid}/task/{pid}/children");
+        if let Ok(contents) = tokio::fs::read_to_string(&children_file).await {
+            for token in contents.split_whitespace() {
+                if let Ok(child) = token.parse::<u32>() {
+                    ids.push(child);
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Kill a process and all of its descendants, renderer children included.
+///
+/// Chromium is a multi-process browser: the process we spawn is only the
+/// top-level shell, which forks `--type=renderer`, `--type=gpu`,
+/// `--type=zygote` and `--type=utility` children. A plain SIGKILL on the shell
+/// orphans those children (the literal "chromium renderer leak"), so we signal
+/// the whole tree — a TERM pass first to give the browser a chance to reap its
+/// own children, then a KILL pass for any survivors.
+async fn kill_process_tree(root: u32) {
+    let descendants = descendant_process_ids(root).await;
+    for pid in descendants.iter().rev() {
+        signal_process(*pid, "TERM").await;
+    }
+    signal_process(root, "TERM").await;
+    tokio::time::sleep(PROCESS_TREE_SIGNAL_PAUSE).await;
+    for pid in descendants.iter().rev() {
+        signal_process(*pid, "KILL").await;
+    }
+    signal_process(root, "KILL").await;
 }
 
 fn browser_error(provider_key: &str, error: impl std::fmt::Display) -> FetchError {
@@ -721,6 +864,7 @@ mod tests {
             executable: PathBuf::from("chromium"),
             data_dir: PathBuf::from("/data/browser-profiles"),
             headless: true,
+            browser_idle: Duration::from_secs(300),
             session_port: 6080,
         }
     }
