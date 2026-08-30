@@ -131,9 +131,11 @@ onUnmounted(() => { prefersDark.removeEventListener('change', onSystemTheme); wi
             <n-button quaternary circle :aria-label="isDark ? '切换到浅色模式' : '切换到深色模式'" @click="toggleTheme"><template #icon><IconSun v-if="isDark" /><IconMoon v-else /></template></n-button>
           </header>
           <div class="page-container">
-            <router-view v-slot="{ Component }">
+            <router-view v-slot="{ Component, route }">
               <transition name="page" mode="out-in">
-                <component :is="Component" />
+                <div class="page-view" :key="route.path">
+                  <component :is="Component" />
+                </div>
               </transition>
             </router-view>
           </div>
