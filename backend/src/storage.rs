@@ -12,6 +12,7 @@ use crate::{
         Folder, MediaItem, MediaResourceState, MediaResources, Settings, Task, TaskDetail,
         TaskFolder, TaskMedia, TaskRecord,
     },
+    pagination::{PageParams, Paged},
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -46,16 +47,56 @@ pub struct TaskRun {
 pub async fn connect(database_url: &str) -> anyhow::Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
+        .after_connect(|connection, _meta| {
+            Box::pin(async move {
+                // SQLite reliability settings for every pooled connection:
+                // WAL keeps readers from blocking writers, NORMAL sync is safe
+                // with WAL, foreign keys are enforced, and short busy waits are
+                // absorbed instead of surfacing as "database is locked".
+                sqlx::query("PRAGMA journal_mode = WAL")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("PRAGMA synchronous = NORMAL")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("PRAGMA busy_timeout = 10000")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(database_url)
         .await?;
     run_migrations_with_legacy_repair(&pool).await?;
+    recover_interrupted_crawler_work(&pool).await?;
     Ok(pool)
+}
+
+async fn recover_interrupted_crawler_work(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE crawler_run SET status = 'failed', \
+         error_message = 'execution interrupted by service restart', finished_at = datetime('now') \
+         WHERE status IN ('pending', 'running')",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE crawler_result SET download_status = 'failed', \
+         error_message = 'qBittorrent submission interrupted by service restart' \
+         WHERE download_status = 'downloading'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn run_migrations_with_legacy_repair(pool: &SqlitePool) -> anyhow::Result<()> {
     match MIGRATOR.run(pool).await {
         Ok(()) => Ok(()),
-        Err(MigrateError::VersionMismatch(version)) if matches!(version, 1 | 2) => {
+        Err(MigrateError::VersionMismatch(version)) if matches!(version, 1..=5) => {
             validate_legacy_schema(pool, version).await?;
             let migration = MIGRATOR
                 .iter()
@@ -139,8 +180,108 @@ async fn validate_legacy_schema(pool: &SqlitePool, version: i64) -> anyhow::Resu
             ),
             ("app_setting", &["key", "value", "updated_at"]),
         ]
-    } else {
+    } else if version == 2 {
         vec![("app_setting", &["key", "value", "updated_at"] as &[&str])]
+    } else if version == 3 {
+        vec![
+            (
+                "scrape_task",
+                &[
+                    "id",
+                    "media_id",
+                    "folder_id",
+                    "task_type",
+                    "status",
+                    "progress",
+                    "error_message",
+                    "created_at",
+                    "updated_at",
+                    "finished_at",
+                ] as &[&str],
+            ),
+            (
+                "task_record",
+                &[
+                    "id",
+                    "task_id",
+                    "status",
+                    "progress",
+                    "error_message",
+                    "created_at",
+                    "finished_at",
+                ],
+            ),
+        ]
+    } else if version == 4 {
+        vec![(
+            "media_asset",
+            &[
+                "id",
+                "media_id",
+                "asset_type",
+                "source",
+                "url",
+                "local_path",
+                "status",
+                "checked_at",
+                "created_at",
+                "updated_at",
+            ] as &[&str],
+        )]
+    } else {
+        vec![
+            (
+                "crawler_script",
+                &[
+                    "id",
+                    "name",
+                    "website_url",
+                    "file_name",
+                    "file_path",
+                    "interval_minutes",
+                    "enabled",
+                    "auto_download",
+                    "last_started_at",
+                    "last_finished_at",
+                    "next_run_at",
+                    "created_at",
+                    "updated_at",
+                ] as &[&str],
+            ),
+            (
+                "crawler_run",
+                &[
+                    "id",
+                    "script_id",
+                    "status",
+                    "stdout",
+                    "stderr",
+                    "result_count",
+                    "error_message",
+                    "created_at",
+                    "started_at",
+                    "finished_at",
+                ],
+            ),
+            (
+                "crawler_result",
+                &[
+                    "id",
+                    "run_id",
+                    "script_id",
+                    "title",
+                    "download_url",
+                    "trackers_json",
+                    "raw_json",
+                    "download_status",
+                    "qbit_hash",
+                    "error_message",
+                    "created_at",
+                    "downloaded_at",
+                ],
+            ),
+            ("app_setting", &["key", "value", "updated_at"]),
+        ]
     };
 
     for (table, expected_columns) in required_tables {
@@ -183,17 +324,31 @@ pub async fn task_by_id(pool: &SqlitePool, id: i64) -> AppResult<Task> {
     Ok(task_from_row(&row))
 }
 
-pub async fn task_detail_by_id(pool: &SqlitePool, id: i64) -> AppResult<TaskDetail> {
+pub async fn task_detail_by_id(
+    pool: &SqlitePool,
+    id: i64,
+    params: PageParams,
+) -> AppResult<TaskDetail> {
     let task = task_by_id(pool, id).await?;
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_record WHERE task_id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
     let rows = sqlx::query(
-        "SELECT * FROM task_record WHERE task_id = ? ORDER BY created_at DESC, id DESC",
+        "SELECT * FROM task_record WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
     )
     .bind(id)
+    .bind(params.limit())
+    .bind(params.offset())
     .fetch_all(pool)
     .await?;
     Ok(TaskDetail {
         task,
-        records: rows.iter().map(task_record_from_row).collect(),
+        records: Paged::new(
+            rows.iter().map(task_record_from_row).collect(),
+            total,
+            params,
+        ),
     })
 }
 
@@ -435,13 +590,21 @@ pub async fn load_settings(pool: &SqlitePool) -> AppResult<Settings> {
         .fetch_all(pool)
         .await?;
     let mut settings = Settings {
-        metatube_url: "http://metatube:8080".into(),
+        metatube_url: "auto".into(),
         metatube_token: String::new(),
         output_format: "nfo".into(),
         scan_interval: 60,
         overwrite_policy: "missing".into(),
         log_level: "info".into(),
+        qbittorrent_url: "http://127.0.0.1:8080".into(),
+        qbittorrent_username: "admin".into(),
+        qbittorrent_password: String::new(),
+        qbittorrent_auto_update_trackers: false,
+        qbittorrent_tracker_source_url:
+            "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt".into(),
+        qbittorrent_tracker_update_interval: 1440,
     };
+    let mut inferred_metatube_url = None;
     for row in rows {
         let key: String = row.get("key");
         let value: String = row.get("value");
@@ -452,10 +615,42 @@ pub async fn load_settings(pool: &SqlitePool) -> AppResult<Settings> {
             "scan_interval" => settings.scan_interval = value.parse().unwrap_or(60),
             "overwrite_policy" => settings.overwrite_policy = value,
             "log_level" => settings.log_level = value,
+            "deployment_metatube_url" => inferred_metatube_url = Some(value),
+            "qbittorrent_url" => settings.qbittorrent_url = value,
+            "qbittorrent_username" => settings.qbittorrent_username = value,
+            "qbittorrent_password" => settings.qbittorrent_password = value,
+            "qbittorrent_auto_update_trackers" => {
+                settings.qbittorrent_auto_update_trackers = value == "true"
+            }
+            "qbittorrent_tracker_source_url" => settings.qbittorrent_tracker_source_url = value,
+            "qbittorrent_tracker_update_interval" => {
+                settings.qbittorrent_tracker_update_interval = value.parse().unwrap_or(1440)
+            }
             _ => {}
         }
     }
+    if settings.metatube_url == "auto" {
+        settings.metatube_url = std::env::var("LUMA_METATUBE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or(inferred_metatube_url)
+            .unwrap_or_else(local_metatube_url);
+    }
     Ok(settings)
+}
+
+fn local_metatube_url() -> String {
+    let ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("8.8.8.8:80")?;
+            socket.local_addr()
+        })
+        .map(|address| address.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    match ip {
+        std::net::IpAddr::V4(ip) => format!("http://{ip}:8080"),
+        std::net::IpAddr::V6(ip) => format!("http://[{ip}]:8080"),
+    }
 }
 
 pub fn folder_from_row(row: &sqlx::sqlite::SqliteRow) -> Folder {
@@ -639,10 +834,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "luma-media-resource-test-{}-{nonce}",
-            std::process::id()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("luma-resource-test-{}-{nonce}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let media = directory.join("Example.MKV");
         let nfo = directory.join("EXAMPLE.NFO");
@@ -659,30 +852,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repairs_valid_legacy_migration_checksum() {
+    async fn repairs_valid_legacy_migration_checksums() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
         MIGRATOR.run(&pool).await.unwrap();
-        sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = 1")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        run_migrations_with_legacy_repair(&pool).await.unwrap();
-
-        let actual: Vec<u8> =
-            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
-                .fetch_one(&pool)
+        for version in [1_i64, 3_i64, 4_i64, 5_i64] {
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = ?")
+                .bind(version)
+                .execute(&pool)
                 .await
                 .unwrap();
-        let expected = MIGRATOR
-            .iter()
-            .find(|migration| migration.version == 1)
+
+            run_migrations_with_legacy_repair(&pool).await.unwrap();
+
+            let actual: Vec<u8> =
+                sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?")
+                    .bind(version)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let expected = MIGRATOR
+                .iter()
+                .find(|migration| migration.version == version)
+                .unwrap();
+            assert_eq!(actual, expected.checksum.as_ref());
+        }
+    }
+
+    #[tokio::test]
+    async fn applies_sqlite_reliability_pragmas() {
+        let pool = connect("sqlite::memory:").await.unwrap();
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
             .unwrap();
-        assert_eq!(actual, expected.checksum.as_ref());
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(journal_mode, "memory");
+        assert_eq!(synchronous, 1);
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(busy_timeout, 10000);
     }
 
     #[tokio::test]
@@ -762,10 +984,19 @@ mod tests {
         assert_eq!(retry.task.record_count, 2);
         assert_eq!(retry.task.media.as_ref().unwrap().title, "Example");
 
-        let detail = task_detail_by_id(&pool, retry.task.id).await.unwrap();
-        assert_eq!(detail.records.len(), 2);
-        assert_eq!(detail.records[0].status, "pending");
-        assert_eq!(detail.records[1].status, "failed");
+        let detail = task_detail_by_id(
+            &pool,
+            retry.task.id,
+            crate::pagination::PageParams {
+                page: 1,
+                page_size: 20,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.records.items.len(), 2);
+        assert_eq!(detail.records.items[0].status, "pending");
+        assert_eq!(detail.records.items[1].status, "failed");
     }
 
     #[tokio::test]
@@ -829,5 +1060,56 @@ mod tests {
         assert_eq!(task_count, 1);
         assert_eq!(record_count, 3);
         assert_eq!(status, "success");
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_interrupted_crawler_work() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+        let script_id = sqlx::query(
+            "INSERT INTO crawler_script (name, website_url, file_name, file_path) \
+             VALUES ('Crawler', 'https://example.com', 'crawler.py', '/crawler.py')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let run_id =
+            sqlx::query("INSERT INTO crawler_run (script_id, status) VALUES (?, 'running')")
+                .bind(script_id)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO crawler_result \
+             (run_id, script_id, title, download_url, raw_json, download_status) \
+             VALUES (?, ?, 'Result', 'magnet:?xt=urn:btih:A', '{}', 'downloading')",
+        )
+        .bind(run_id)
+        .bind(script_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        recover_interrupted_crawler_work(&pool).await.unwrap();
+
+        let run_status: String = sqlx::query_scalar("SELECT status FROM crawler_run WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let download_status: String =
+            sqlx::query_scalar("SELECT download_status FROM crawler_result WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(run_status, "failed");
+        assert_eq!(download_status, "failed");
     }
 }

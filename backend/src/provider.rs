@@ -276,6 +276,7 @@ mod tests {
             scan_interval: 60,
             overwrite_policy: "missing".into(),
             log_level: "info".into(),
+            ..Settings::default()
         };
         let client = MetaTubeClient::new(&settings).unwrap();
 

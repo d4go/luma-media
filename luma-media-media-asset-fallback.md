@@ -1,8 +1,8 @@
-# Luma Media - Media Asset Fallback 设计文档
+# Luma - Media Asset Fallback 设计文档
 
 ## 1. 背景
 
-当前 luma-media 使用 MetaTube 作为媒体元数据来源。
+当前 Luma 使用 MetaTube 作为媒体元数据来源。
 
 MetaTube 返回：
 - 标题
@@ -33,7 +33,7 @@ failed to download poster image
 
 ## 2. 目标
 
-在 luma-media 增加媒体资源健康检查机制：
+在 Luma 增加媒体资源健康检查机制：
 
 1. 不直接信任第三方 poster URL
 2. 返回给客户端之前验证图片可用性
@@ -47,7 +47,7 @@ failed to download poster image
 Jellyfin
     |
     |
-luma-media
+Luma
     |
     +---- Asset Resolver
               |
@@ -255,7 +255,7 @@ data/assets/poster/
 返回：
 
 ```
-http://luma-media/assets/poster/FC2PPV-4792609.jpg
+http://luma/assets/poster/FC2PPV-4792609.jpg
 ```
 
 不要长期依赖第三方 CDN。
@@ -370,7 +370,7 @@ to=FC2PPVDB
 - Jellyfin
 - Emby
 
-luma-media 作为媒体中间层负责：
+Luma 作为媒体中间层负责：
 
 - 元数据聚合
 - 图片稳定化
@@ -437,7 +437,7 @@ poster为空
 
                 |
 
-           luma-media
+           Luma
 
                 |
 

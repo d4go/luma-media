@@ -8,13 +8,16 @@ import { IconPencil, IconPlus, IconRefresh, IconTrash } from '@tabler/icons-vue'
 import PageHeader from '../components/PageHeader.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { api } from '../api'
-import type { Folder, FolderInput } from '../types'
+import type { Folder, FolderInput, Paged } from '../types'
+import PaginationBar from '../components/PaginationBar.vue'
 
 const message = useMessage()
 const dialog = useDialog()
 const loading = ref(true)
 const saving = ref(false)
-const folders = ref<Folder[]>([])
+const page = ref(1)
+const pageSize = ref(20)
+const folders = ref<Paged<Folder>>({ items: [], total: 0, page: 1, pageSize: 20, totalPages: 0 })
 const modalOpen = ref(false)
 const editingId = ref<number | null>(null)
 const formRef = ref<FormInst | null>(null)
@@ -45,10 +48,12 @@ const columns: DataTableColumns<Folder> = [
 
 async function load() {
   loading.value = true
-  try { folders.value = await api.folders() }
+  try { folders.value = await api.folders(page.value, pageSize.value) }
   catch (reason) { message.error(reason instanceof Error ? reason.message : '目录加载失败') }
   finally { loading.value = false }
 }
+function changePage(value: number) { page.value = value; load() }
+function changePageSize(value: number) { pageSize.value = value; page.value = 1; load() }
 
 function resetForm() {
   Object.assign(form, { name: '', path: '', type: 'movie', outputFormat: 'nfo', scanMode: 'manual', enabled: true })
@@ -102,10 +107,11 @@ onMounted(load)
 
   <section class="panel">
     <div v-if="loading" style="padding: 20px"><n-skeleton text :repeat="7" /></div>
-    <EmptyState v-else-if="!folders.length" title="还没有媒体目录" description="添加一个服务器路径，Luma Media 就可以开始建立索引。">
+    <EmptyState v-else-if="!folders.items.length" title="还没有媒体目录" description="添加一个服务器路径，Luma 就可以开始建立索引。">
       <n-button type="primary" @click="openCreate"><template #icon><IconPlus /></template>添加目录</n-button>
     </EmptyState>
-    <div v-else class="table-wrap"><n-data-table :columns="columns" :data="folders" :bordered="false" :single-line="false" /></div>
+    <div v-else class="table-wrap"><n-data-table :columns="columns" :data="folders.items" :bordered="false" :single-line="false" /></div>
+    <PaginationBar v-if="folders.total > 0" :page="page" :page-size="pageSize" :total="folders.total" @update:page="changePage" @update:page-size="changePageSize" />
   </section>
 
   <n-modal v-model:show="modalOpen" preset="card" :title="editingId ? '编辑媒体目录' : '添加媒体目录'" style="width: min(620px, calc(100vw - 32px))" :bordered="false">

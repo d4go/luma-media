@@ -524,7 +524,19 @@ mod tests {
         let state = AppState {
             pool: pool.clone(),
             scrape_limiter: Arc::new(Semaphore::new(8)),
+            crawler_limiter: Arc::new(Semaphore::new(2)),
             asset_root: asset_root.clone(),
+            script_root: std::env::temp_dir().join(format!("luma-crawler-test-{nonce}")),
+            events: tokio::sync::broadcast::channel(32).0,
+            fetch_manager: Arc::new(crate::fetch::FetchManager::default()),
+            provider_registry: Arc::new(crate::providers::ProviderRegistry::default()),
+            snapshot_repository: Arc::new(crate::ingestion::SnapshotRepository::new(
+                pool.clone(),
+                asset_root.join("source-cache"),
+            )),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool.clone()),
+            task_engine: crate::task::TaskEngine::new(pool.clone()),
+            handler_registry: Arc::new(crate::task::handler::HandlerRegistry::new()),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -575,6 +587,7 @@ mod tests {
             scan_interval: 60,
             overwrite_policy: "missing".into(),
             log_level: "info".into(),
+            ..crate::models::Settings::default()
         };
         let client = MetaTubeClient::new(&settings).unwrap();
         let media = storage::media_by_id(&pool, media_id).await.unwrap();

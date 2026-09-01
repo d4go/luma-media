@@ -1,0 +1,1099 @@
+<script setup lang="ts">
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import {
+  NAlert,
+  NButton,
+  NCollapse,
+  NCollapseItem,
+  NFormItem,
+  NInput,
+  NInputNumber,
+  NModal,
+  NSelect,
+  NSpin,
+  NSwitch,
+  useDialog,
+  useMessage,
+} from 'naive-ui'
+import {
+  IconArrowRight,
+  IconBrandPython,
+  IconCheck,
+  IconDatabase,
+  IconDeviceFloppy,
+  IconDownload,
+  IconFolder,
+  IconHistory,
+  IconPlayerPause,
+  IconPlayerPlay,
+  IconPlus,
+  IconPlugConnected,
+  IconRefresh,
+  IconServer,
+  IconTrash,
+} from '@tabler/icons-vue'
+import { api } from '../api'
+import { formatDate, inclusiveDateRangeDays } from '../format'
+import type { AiProviderKind, AiSettings, BrowserSession, Paged, ProductSettings, ProviderConfig, ProviderFetchMode, ProviderRuntime, Settings } from '../types'
+import PageHeader from '../components/PageHeader.vue'
+import PaginationBar from '../components/PaginationBar.vue'
+
+const message = useMessage()
+const dialog = useDialog()
+const loading = ref(true)
+const savingSection = ref('')
+const creatingSource = ref(false)
+const showNewSource = ref(false)
+const testing = ref('')
+const syncing = ref('')
+const reparsing = ref('')
+const diagnosing = ref('')
+const browserSessionBusy = ref('')
+const page = ref(1)
+const pageSize = ref(20)
+const providers = ref<Paged<ProviderConfig>>({ items: [], total: 0, page: 1, pageSize: 20, totalPages: 0 })
+const providerModalOpen = ref(false)
+const selectedProviderKey = ref('')
+const providerExpandedSections = ref<Array<string | number>>([])
+const providerRuntimes = reactive<Record<string, ProviderRuntime>>({})
+const browserSessions = reactive<Record<string, BrowserSession>>({})
+const secrets = reactive<Record<string, string>>({})
+const testMessages = reactive<Record<string, { ok: boolean; text: string }>>({})
+const bootstrapWindows = reactive<Record<string, { from: string; to: string }>>({})
+const sourceAdapterOptions = [
+  { label: 'Jav321（当前可直连）', value: 'jav321', name: 'Jav321', baseUrl: 'https://www.jav321.com', hint: '搜索番号时可直接返回作品信息和磁力资源。' },
+  { label: 'JavDB', value: 'javdb', name: 'JavDB', baseUrl: 'https://javdb.com', hint: '默认通过 Chromium 持久会话访问；需要正常站点交互时会明确提示。' },
+  { label: 'JavBus', value: 'javbus', name: 'JavBus', baseUrl: 'https://www.javbus.com', hint: '支持 HTTP 或 Chromium；年龄确认状态保存在该来源的浏览器 Profile。' },
+  { label: 'JavLibrary', value: 'javlibrary', name: 'JavLibrary', baseUrl: 'https://www.javlibrary.com', hint: '适合作为补充元数据来源，访问受限时不会影响本地搜索。' },
+]
+const newSource = reactive({ adapter: 'jav321', displayName: 'Jav321', baseUrl: 'https://www.jav321.com', secret: '', config: { fetchMode: 'http', proxyUrl: '', userAgent: '', syncEnabled: true, syncIntervalMinutes: 1440, syncDetailLimit: 8 } })
+let syncPollTimer: ReturnType<typeof setTimeout> | undefined
+
+const legacy = reactive<Settings>({
+  metatubeUrl: '',
+  metatubeToken: '',
+  outputFormat: 'nfo',
+  scanInterval: 60,
+  overwritePolicy: 'missing',
+  logLevel: 'info',
+  qbittorrentUrl: '',
+  qbittorrentUsername: 'admin',
+  qbittorrentPassword: '',
+  qbittorrentAutoUpdateTrackers: false,
+  qbittorrentTrackerSourceUrl: '',
+  qbittorrentTrackerUpdateInterval: 1440,
+})
+const product = reactive<ProductSettings>({
+  downloadRoot: '/downloads',
+  mediaRoot: '/media',
+  qbittorrentSavePath: '/downloads',
+  qbittorrentCategory: 'luma',
+  qbittorrentTags: 'luma',
+  organizerMode: 'hardlink',
+  organizerMovieTemplate: '{code}/{code}.{ext}',
+  organizerConflictPolicy: 'attention',
+})
+const ai = reactive<AiSettings>({
+  enabled: true,
+  providerKind: 'openai',
+  baseUrl: '',
+  apiKey: '',
+  hasApiKey: false,
+  model: 'gpt-4o-mini',
+  temperature: 0.2,
+  timeoutSecs: 60,
+  maxTokens: 2000,
+})
+const aiPreset = ref('openai')
+const aiTesting = ref(false)
+const aiTestMessage = ref<{ ok: boolean; text: string } | null>(null)
+const aiPresets: { label: string; value: string; kind: AiProviderKind; baseUrl: string; model: string }[] = [
+  { label: 'OpenAI', value: 'openai', kind: 'openai', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  { label: 'DeepSeek', value: 'deepseek', kind: 'openai', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+  { label: '阿里云百炼 (DashScope)', value: 'bailian', kind: 'openai', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+  { label: '本地 Ollama', value: 'ollama', kind: 'ollama', baseUrl: 'http://localhost:11434/v1', model: 'llama3.1' },
+  { label: '自定义（OpenAI 兼容）', value: 'custom', kind: 'custom', baseUrl: '', model: '' },
+]
+function selectAiPreset(value: string) {
+  aiPreset.value = value
+  const preset = aiPresets.find(item => item.value === value)
+  if (!preset) return
+  ai.providerKind = preset.kind
+  ai.baseUrl = preset.baseUrl
+  ai.model = preset.model
+}
+function inferAiPreset() {
+  const preset = aiPresets.find(item => item.baseUrl && ai.baseUrl.startsWith(item.baseUrl))
+  aiPreset.value = preset?.value ?? 'custom'
+}
+async function testAi() {
+  aiTesting.value = true
+  aiTestMessage.value = null
+  try {
+    const result = await api.testAi({ ...ai })
+    aiTestMessage.value = { ok: result.ok, text: result.message }
+  } catch (reason) {
+    aiTestMessage.value = { ok: false, text: reason instanceof Error ? reason.message : '测试失败' }
+  } finally {
+    aiTesting.value = false
+  }
+}
+
+const providerMap = computed(() => Object.fromEntries(providers.value.items.map(item => [item.key, item])))
+const sourceProviders = computed(() => providers.value.items.filter(item => item.type === 'source'))
+const selectedProvider = computed(() => (selectedProviderKey.value ? providerMap.value[selectedProviderKey.value] ?? null : null))
+const providerModalTitle = computed(() => selectedProvider.value?.displayName ?? '来源详情')
+const selectedSourceAdapter = computed(() => sourceAdapterOptions.find(item => item.value === newSource.adapter) ?? sourceAdapterOptions[0])
+
+function sourceAdapter(provider: ProviderConfig) {
+  return String(provider.config.adapter ?? provider.key.split('-')[0] ?? 'source')
+}
+
+function sourceAdapterName(provider: ProviderConfig) {
+  const adapter = sourceAdapter(provider)
+  return sourceAdapterOptions.find(item => item.value === adapter)?.name ?? adapter
+}
+
+function sourceConfigText(provider: ProviderConfig, key: 'proxyUrl' | 'userAgent') {
+  return typeof provider.config[key] === 'string' ? String(provider.config[key]) : ''
+}
+
+function accessConfigSummary(provider: ProviderConfig) {
+  const hasCookie = provider.hasSecret || Boolean(secrets[provider.key])
+  const hasProxy = Boolean(sourceConfigText(provider, 'proxyUrl'))
+  if (hasCookie && hasProxy) return 'Cookie、代理已配置'
+  if (hasCookie) return 'Cookie 已配置'
+  if (hasProxy) return '代理已配置'
+  return '未配置额外参数'
+}
+
+function updateSourceConfig(provider: ProviderConfig, key: 'proxyUrl' | 'userAgent', value: string) {
+  provider.config = { ...provider.config, [key]: value }
+}
+
+const fetchModeOptions = [
+  { label: '自动选择', value: 'auto' },
+  { label: 'HTTP', value: 'http' },
+  { label: 'Chromium', value: 'browser' },
+]
+
+function sourceFetchMode(provider: ProviderConfig): ProviderFetchMode {
+  const value = provider.config.fetchMode
+  return value === 'browser' || value === 'auto' ? value : 'http'
+}
+
+function updateSourceFetchMode(provider: ProviderConfig, value: ProviderFetchMode) {
+  provider.config = { ...provider.config, fetchMode: value }
+}
+
+const runtimeStateLabel: Record<ProviderRuntime['state'], string> = {
+  ready: '可用',
+  degraded: '降级',
+  cooldown: '冷却中',
+  interaction_required: '需要建立会话',
+  unavailable: '不可用',
+}
+
+function sourceSyncEnabled(provider: ProviderConfig) {
+  return typeof provider.config.syncEnabled === 'boolean' ? provider.config.syncEnabled : true
+}
+
+function sourceSyncInterval(provider: ProviderConfig) {
+  const value = Number(provider.config.syncIntervalMinutes)
+  return Number.isFinite(value) ? value : 1440
+}
+
+function updateSourceSyncEnabled(provider: ProviderConfig, value: boolean) {
+  provider.config = { ...provider.config, syncEnabled: value }
+}
+
+function updateSourceSyncInterval(provider: ProviderConfig, value: number | null) {
+  provider.config = { ...provider.config, syncIntervalMinutes: value ?? 1440 }
+}
+
+function sourceSyncDetailLimit(provider: ProviderConfig) {
+  const value = Number(provider.config.syncDetailLimit)
+  return Number.isFinite(value) ? value : 8
+}
+
+function updateSourceSyncDetailLimit(provider: ProviderConfig, value: number | null) {
+  provider.config = { ...provider.config, syncDetailLimit: value ?? 8 }
+}
+
+function sourceConfigNumber(provider: ProviderConfig, key: 'metadataPriority' | 'resourcePriority' | 'resourceCacheTtlHours', fallback: number) {
+  const value = Number(provider.config[key])
+  return Number.isFinite(value) ? value : fallback
+}
+
+function updateSourceConfigNumber(provider: ProviderConfig, key: 'metadataPriority' | 'resourcePriority' | 'resourceCacheTtlHours', value: number | null, fallback: number) {
+  provider.config = { ...provider.config, [key]: value ?? fallback }
+}
+
+const syncStatusLabel: Record<ProviderConfig['syncStatus'], string> = {
+  idle: '等待同步',
+  running: '同步中',
+  success: '同步成功',
+  failed: '同步失败',
+}
+
+function syncDate(value: string | null, fallback: string) {
+  return value ? formatDate(value) : fallback
+}
+
+function defaultBootstrapWindow() {
+  const to = new Date()
+  const from = new Date(to)
+  from.setUTCDate(from.getUTCDate() - 30)
+  return { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) }
+}
+
+function bootstrapWindow(provider: ProviderConfig) {
+  if (!bootstrapWindows[provider.key]) {
+    const fallback = defaultBootstrapWindow()
+    bootstrapWindows[provider.key] = {
+      from: provider.syncBootstrapFrom ?? fallback.from,
+      to: provider.syncBootstrapTo ?? fallback.to,
+    }
+  }
+  return bootstrapWindows[provider.key]
+}
+
+function syncCursor(provider: ProviderConfig) {
+  const page = Number(provider.syncCursor.page)
+  if (Number.isFinite(page) && page > 0) return `第 ${page} 页`
+  const cursor = provider.syncCursor.nextUrl ?? provider.syncCursor.cursor
+  return typeof cursor === 'string' && cursor ? cursor : '尚无 checkpoint'
+}
+
+function selectSourceAdapter(value: string) {
+  const adapter = sourceAdapterOptions.find(item => item.value === value)
+  if (!adapter) return
+  newSource.adapter = adapter.value
+  newSource.displayName = adapter.name
+  newSource.baseUrl = adapter.baseUrl
+  newSource.secret = ''
+  newSource.config = { fetchMode: adapter.value === 'javdb' ? 'browser' : 'http', proxyUrl: '', userAgent: '', syncEnabled: true, syncIntervalMinutes: 1440, syncDetailLimit: 8 }
+}
+
+function scheduleSyncPoll() {
+  if (syncPollTimer || !sourceProviders.value.some(provider => provider.syncStatus === 'running')) return
+  syncPollTimer = setTimeout(async () => {
+    syncPollTimer = undefined
+    try {
+      providers.value = await api.providers(page.value, pageSize.value)
+    } catch {
+      // Keep the current status visible and retry while a synchronization is running.
+    } finally {
+      scheduleSyncPoll()
+    }
+  }, 2000)
+}
+
+async function load() {
+  loading.value = true
+  try {
+    const [providerData, legacyData, productData, aiData] = await Promise.all([
+      api.providers(page.value, pageSize.value),
+      api.settings(),
+      api.productSettings(),
+      api.aiSettings(),
+    ])
+    providers.value = providerData
+    providerData.items.filter(provider => provider.type === 'source').forEach(bootstrapWindow)
+    const runtimeResults = await Promise.allSettled(
+      providerData.items.filter(provider => provider.type === 'source').map(provider => api.providerRuntime(provider.key)),
+    )
+    runtimeResults.forEach(result => {
+      if (result.status === 'fulfilled') providerRuntimes[result.value.providerKey] = result.value
+    })
+    Object.assign(legacy, legacyData)
+    Object.assign(product, productData)
+    Object.assign(ai, aiData, { apiKey: '' })
+    inferAiPreset()
+    scheduleSyncPoll()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '设置加载失败')
+  } finally {
+    loading.value = false
+  }
+}
+
+function changePage(value: number) { page.value = value; load() }
+function changePageSize(value: number) { pageSize.value = value; page.value = 1; load() }
+function openProvider(key: string) {
+  selectedProviderKey.value = key
+  providerExpandedSections.value = []
+  providerModalOpen.value = true
+}
+watch(selectedProvider, value => {
+  if (providerModalOpen.value && !value) providerModalOpen.value = false
+})
+
+async function persistProvider(provider: ProviderConfig) {
+  const updated = await api.updateProvider(provider.key, {
+    displayName: provider.displayName,
+    baseUrl: provider.baseUrl,
+    secret: secrets[provider.key] ?? '',
+    config: provider.config,
+  })
+  Object.assign(provider, updated)
+  secrets[provider.key] = ''
+}
+
+async function saveSources() {
+  savingSection.value = 'sources'
+  try {
+    for (const provider of sourceProviders.value) {
+      await api.updateProvider(provider.key, {
+        displayName: provider.displayName,
+        baseUrl: provider.baseUrl,
+        secret: secrets[provider.key] ?? '',
+        config: provider.config,
+      })
+    }
+    message.success('内容来源已保存')
+    Object.keys(secrets).forEach(key => { secrets[key] = '' })
+    await load()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '保存失败')
+  } finally {
+    savingSection.value = ''
+  }
+}
+
+async function saveServices() {
+  savingSection.value = 'services'
+  try {
+    const metatube = providerMap.value.metatube
+    const qbittorrent = providerMap.value.qbittorrent
+    legacy.metatubeUrl = metatube?.baseUrl ?? legacy.metatubeUrl
+    legacy.metatubeToken = secrets.metatube ?? ''
+    legacy.qbittorrentUrl = qbittorrent?.baseUrl ?? legacy.qbittorrentUrl
+    legacy.qbittorrentPassword = secrets.qbittorrent ?? ''
+    const updates: Promise<unknown>[] = [api.updateSettings({ ...legacy })]
+    if (metatube) updates.push(api.updateProvider('metatube', { displayName: metatube.displayName, baseUrl: metatube.baseUrl, secret: secrets.metatube ?? '' }))
+    if (qbittorrent) updates.push(api.updateProvider('qbittorrent', { displayName: qbittorrent.displayName, baseUrl: qbittorrent.baseUrl, secret: secrets.qbittorrent ?? '' }))
+    await Promise.all(updates)
+    message.success('处理服务已保存')
+    secrets.metatube = ''
+    secrets.qbittorrent = ''
+    await load()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '保存失败')
+  } finally {
+    savingSection.value = ''
+  }
+}
+
+async function saveAi() {
+  savingSection.value = 'ai'
+  try {
+    await api.updateAiSettings({
+      enabled: ai.enabled,
+      providerKind: ai.providerKind,
+      baseUrl: ai.baseUrl,
+      apiKey: ai.apiKey,
+      model: ai.model,
+      temperature: ai.temperature,
+      timeoutSecs: ai.timeoutSecs,
+      maxTokens: ai.maxTokens,
+    })
+    message.success('AI 接入已保存')
+    ai.apiKey = ''
+    await load()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '保存失败')
+  } finally {
+    savingSection.value = ''
+  }
+}
+
+async function savePaths() {
+  savingSection.value = 'paths'
+  try {
+    await api.updateProductSettings({ ...product })
+    message.success('入库与路径已保存')
+    await load()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '保存失败')
+  } finally {
+    savingSection.value = ''
+  }
+}
+
+async function addSource() {
+  if (!newSource.displayName.trim() || !newSource.baseUrl.trim()) {
+    message.warning('请填写来源名称和服务地址')
+    return
+  }
+  creatingSource.value = true
+  try {
+    const created = await api.createProvider({ ...newSource })
+    providers.value.items.push(created)
+    providers.value.total += 1
+    openProvider(created.key)
+    selectSourceAdapter(newSource.adapter)
+    showNewSource.value = false
+    message.success('来源已添加')
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '添加来源失败')
+  } finally {
+    creatingSource.value = false
+  }
+}
+
+function removeSource(provider: ProviderConfig) {
+  dialog.warning({
+    title: '移除来源',
+    content: `确定移除“${provider.displayName}”吗？已抓取的媒体和资源记录会保留。`,
+    positiveText: '移除',
+    negativeText: '取消',
+    async onPositiveClick() {
+      await api.deleteProvider(provider.key)
+      providers.value.items = providers.value.items.filter(item => item.key !== provider.key)
+      providers.value.total = Math.max(0, providers.value.total - 1)
+      if (selectedProviderKey.value === provider.key) providerModalOpen.value = false
+      message.success('来源已移除')
+    },
+  })
+}
+
+async function testProvider(key: string) {
+  testing.value = key
+  delete testMessages[key]
+  try {
+    const provider = providers.value.items.find(item => item.key === key)
+    if (provider?.type === 'source') {
+      await persistProvider(provider)
+    }
+    const result = await api.testProvider(key)
+    testMessages[key] = { ok: result.connected, text: `${result.message} · ${result.latencyMs} ms` }
+    await load()
+  } catch (reason) {
+    testMessages[key] = { ok: false, text: reason instanceof Error ? reason.message : '连接测试失败' }
+  } finally {
+    testing.value = ''
+  }
+}
+
+async function diagnoseProvider(provider: ProviderConfig) {
+  diagnosing.value = provider.key
+  delete testMessages[provider.key]
+  try {
+    await persistProvider(provider)
+    const result = await api.diagnoseProvider(provider.key)
+    providerRuntimes[provider.key] = result.runtime
+    const attempt = result.browser.attempted ? result.browser : result.http
+    const mode = result.browser.attempted ? 'Chromium' : 'HTTP'
+    const detail = attempt.success
+      ? `${mode} 已识别真实来源页面${attempt.elapsedMs == null ? '' : ` · ${attempt.elapsedMs} ms`}`
+      : `${mode}：${attempt.pageKind ?? 'invalid_content'}${attempt.error ? ` · ${attempt.error}` : ''}`
+    testMessages[provider.key] = { ok: attempt.success, text: detail }
+  } catch (reason) {
+    testMessages[provider.key] = { ok: false, text: reason instanceof Error ? reason.message : '来源诊断失败' }
+  } finally {
+    diagnosing.value = ''
+  }
+}
+
+function browserSessionUrl(session: BrowserSession) {
+  const query = new URLSearchParams({ autoconnect: 'true', resize: 'scale' })
+  if (session.password) query.set('password', session.password)
+  return `http://${window.location.hostname}:${session.port}/vnc.html?${query}`
+}
+
+async function startBrowserSession(provider: ProviderConfig) {
+  browserSessionBusy.value = provider.key
+  const browserWindow = window.open('about:blank', '_blank')
+  if (browserWindow) browserWindow.opener = null
+  try {
+    await persistProvider(provider)
+    const session = await api.startBrowserSession(provider.key)
+    browserSessions[provider.key] = session
+    const url = browserSessionUrl(session)
+    if (browserWindow) browserWindow.location.replace(url)
+    else window.open(url, '_blank', 'noopener,noreferrer')
+    message.success('浏览器会话已建立，请在新窗口完成站点要求的正常交互')
+  } catch (reason) {
+    browserWindow?.close()
+    message.error(reason instanceof Error ? reason.message : '浏览器会话启动失败')
+  } finally {
+    browserSessionBusy.value = ''
+  }
+}
+
+async function completeBrowserSession(provider: ProviderConfig) {
+  const session = browserSessions[provider.key]
+  if (!session) return
+  browserSessionBusy.value = provider.key
+  try {
+    await api.completeBrowserSession(provider.key, session.sessionId)
+    delete browserSessions[provider.key]
+    message.success('浏览器会话已保存，正在用同一 Profile 重新诊断')
+    await diagnoseProvider(provider)
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '保存浏览器会话失败')
+  } finally {
+    browserSessionBusy.value = ''
+  }
+}
+
+async function cancelBrowserSession(provider: ProviderConfig) {
+  const session = browserSessions[provider.key]
+  if (!session) return
+  browserSessionBusy.value = provider.key
+  try {
+    await api.cancelBrowserSession(provider.key, session.sessionId)
+    delete browserSessions[provider.key]
+    message.info('浏览器会话已关闭，现有 Profile 数据仍然保留')
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '关闭浏览器会话失败')
+  } finally {
+    browserSessionBusy.value = ''
+  }
+}
+
+function clearBrowserProfile(provider: ProviderConfig) {
+  dialog.warning({
+    title: '清除浏览器会话',
+    content: `这会永久删除 ${provider.displayName} 已保存的 Cookie、登录状态和站点设置。仅在会话损坏或需要重新建立时使用。`,
+    positiveText: '确认清除',
+    negativeText: '取消',
+    async onPositiveClick() {
+      browserSessionBusy.value = provider.key
+      try {
+        await api.clearBrowserProfile(provider.key)
+        delete browserSessions[provider.key]
+        message.success('该来源的浏览器 Profile 已清除')
+      } catch (reason) {
+        message.error(reason instanceof Error ? reason.message : '清除浏览器 Profile 失败')
+      } finally {
+        browserSessionBusy.value = ''
+      }
+    },
+  })
+}
+
+async function startIncremental(provider: ProviderConfig) {
+  syncing.value = `${provider.key}:incremental`
+  try {
+    await persistProvider(provider)
+    const result = await api.syncProviderIncremental(provider.key)
+    message.success(`${provider.displayName} 增量同步已开始，任务 #${result.runId}`)
+    await load()
+    scheduleSyncPoll()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '增量同步启动失败')
+  } finally {
+    syncing.value = ''
+  }
+}
+
+async function startBootstrap(provider: ProviderConfig) {
+  const range = bootstrapWindow(provider)
+  const rangeDays = inclusiveDateRangeDays(range.from, range.to)
+  if (rangeDays == null) return message.warning('日期格式应为 YYYY-MM-DD，且必须是真实日期')
+  if (rangeDays < 1) return message.warning('历史开始日期不能晚于结束日期')
+  if (rangeDays > 31) return message.warning('历史回填单次最多 31 天（包含开始和结束日期）')
+  syncing.value = `${provider.key}:bootstrap`
+  try {
+    await persistProvider(provider)
+    const result = await api.bootstrapProvider(provider.key, range.from, range.to, true)
+    message.success(`${provider.displayName} 历史回填已开始，任务 #${result.runId}`)
+    await load()
+    scheduleSyncPoll()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '历史回填启动失败')
+  } finally {
+    syncing.value = ''
+  }
+}
+
+async function pauseBootstrap(provider: ProviderConfig) {
+  syncing.value = `${provider.key}:pause`
+  try {
+    await api.pauseProviderBootstrap(provider.key)
+    message.success('历史回填会在当前批次结束后暂停')
+    await load()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '暂停历史回填失败')
+  } finally {
+    syncing.value = ''
+  }
+}
+
+async function resumeBootstrap(provider: ProviderConfig) {
+  syncing.value = `${provider.key}:resume`
+  try {
+    await api.resumeProviderBootstrap(provider.key)
+    message.success('历史回填已从 checkpoint 继续')
+    await load()
+    scheduleSyncPoll()
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '继续历史回填失败')
+  } finally {
+    syncing.value = ''
+  }
+}
+
+async function reparseProvider(provider: ProviderConfig) {
+  reparsing.value = provider.key
+  try {
+    const result = await api.reparseProvider(provider.key)
+    message.success(`已从本地快照重解析 ${result.scanned} 项，未发起网络请求`)
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '本地快照重解析失败')
+  } finally {
+    reparsing.value = ''
+  }
+}
+
+async function toggleProvider(provider: ProviderConfig, value: boolean) {
+  try {
+    Object.assign(provider, await api.setProviderEnabled(provider.key, value))
+  } catch (reason) {
+    message.error(reason instanceof Error ? reason.message : '更新失败')
+  }
+}
+
+onMounted(load)
+onUnmounted(() => {
+  if (syncPollTimer) clearTimeout(syncPollTimer)
+})
+</script>
+
+<template>
+  <PageHeader title="设置" description="Provider 负责外部能力，来源可以独立扩展、停用与测试，凭据不会返回明文；每个分区独立保存。" />
+
+  <n-spin :show="loading">
+    <div class="product-settings">
+      <section class="settings-group">
+        <header class="settings-group-heading">
+          <div>
+            <span class="eyebrow">SOURCE PROVIDERS</span>
+            <h2>内容来源</h2>
+            <p>来源在后台定时采集并去重写入本地索引；前台搜索只查询本地数据，不会因外部站点超时或拒绝访问而中断。</p>
+          </div>
+          <div class="section-actions">
+            <n-button type="primary" :loading="savingSection === 'sources'" @click="saveSources">
+              <template #icon><IconDeviceFloppy /></template>
+              保存来源
+            </n-button>
+            <n-button secondary @click="showNewSource = !showNewSource">
+              <template #icon><IconPlus /></template>
+              添加来源
+            </n-button>
+          </div>
+        </header>
+
+        <article v-if="showNewSource" class="new-source-card panel">
+          <div class="new-source-intro">
+            <span class="provider-icon"><IconPlus /></span>
+            <div><strong>添加内容来源</strong><small>同一种适配器可以添加多个镜像，并在后台独立同步</small></div>
+          </div>
+          <n-form-item class="new-source-adapter" label="适配器">
+            <n-select :value="newSource.adapter" :options="sourceAdapterOptions" @update:value="selectSourceAdapter" />
+          </n-form-item>
+          <n-alert class="new-source-hint" type="info" :show-icon="false">{{ selectedSourceAdapter.hint }}</n-alert>
+          <n-form-item class="new-source-name" label="来源名称"><n-input v-model:value="newSource.displayName" /></n-form-item>
+          <n-form-item class="new-source-url" label="服务地址"><n-input v-model:value="newSource.baseUrl" :placeholder="selectedSourceAdapter.baseUrl" /></n-form-item>
+          <n-form-item class="new-source-cookie" label="Cookie（可选）"><n-input v-model:value="newSource.secret" type="password" show-password-on="click" placeholder="完整复制浏览器 Cookie；普通直连来源可留空" /></n-form-item>
+          <div class="new-source-actions">
+            <n-button @click="showNewSource = false">取消</n-button>
+            <n-button type="primary" :loading="creatingSource" @click="addSource">添加来源</n-button>
+          </div>
+        </article>
+
+        <div class="source-provider-list">
+          <article v-for="provider in sourceProviders" :key="provider.key" class="source-provider-row">
+            <span class="provider-icon"><IconDatabase /></span>
+            <span class="source-row-copy"><strong>{{ provider.displayName }}</strong><small>{{ sourceAdapterName(provider) }} · {{ provider.key }}</small></span>
+            <span class="source-row-status">
+              <span class="source-sync-status" :data-status="provider.syncStatus">{{ syncStatusLabel[provider.syncStatus] }}</span>
+              <span v-if="providerRuntimes[provider.key]" class="source-sync-status" :data-status="providerRuntimes[provider.key].state">{{ runtimeStateLabel[providerRuntimes[provider.key].state] }}</span>
+            </span>
+            <span class="source-row-meta">{{ sourceSyncEnabled(provider) ? `下次执行 ${syncDate(provider.syncNextRunAt, '等待安排')}` : '同步已关闭' }}</span>
+            <n-button size="small" secondary class="source-detail-button" @click="openProvider(provider.key)">
+              查看详情
+              <template #icon><IconArrowRight :size="15" /></template>
+            </n-button>
+          </article>
+          <div v-if="!sourceProviders.length" class="quiet-empty compact"><IconDatabase :size="24" /><strong>还没有内容来源</strong><span>点击右上角“添加来源”开始建立本地索引。</span></div>
+        </div>
+        <PaginationBar v-if="providers.total > 0" :page="page" :page-size="pageSize" :total="providers.total" @update:page="changePage" @update:page-size="changePageSize" />
+
+        <n-modal v-model:show="providerModalOpen" preset="card" class="provider-detail-modal" :title="providerModalTitle" :bordered="false" style="width:min(760px,calc(100vw - 32px))">
+          <template v-for="provider in [selectedProvider]" :key="provider?.key">
+            <div v-if="provider" class="provider-card provider-card-modal">
+              <header>
+                <span class="provider-icon"><IconDatabase /></span>
+                <div><strong>{{ provider.displayName }}</strong><small>{{ sourceAdapterName(provider) }} · {{ provider.key }}</small></div>
+                <div class="provider-header-actions">
+                  <n-switch :value="provider.enabled" @update:value="value => toggleProvider(provider, value)" />
+                  <n-button quaternary circle type="error" title="移除来源" @click="removeSource(provider)">
+                    <template #icon><IconTrash /></template>
+                  </n-button>
+                </div>
+              </header>
+            <n-form-item label="来源名称"><n-input v-model:value="provider.displayName" /></n-form-item>
+            <n-form-item label="服务地址"><n-input v-model:value="provider.baseUrl" /></n-form-item>
+            <n-form-item label="访问方式">
+              <n-select
+                :value="sourceFetchMode(provider)"
+                :options="fetchModeOptions"
+                @update:value="value => updateSourceFetchMode(provider, value)"
+              />
+            </n-form-item>
+            <n-collapse v-model:expanded-names="providerExpandedSections" class="provider-detail-sections" display-directive="show">
+              <n-collapse-item name="access" title="访问凭据与网络">
+                <template #header-extra><span class="provider-section-summary">{{ accessConfigSummary(provider) }}</span></template>
+                <div class="provider-section-body">
+                  <n-form-item label="Cookie">
+                    <n-input
+                      v-model:value="secrets[provider.key]"
+                      type="password"
+                      show-password-on="click"
+                      :placeholder="provider.hasSecret ? '已保存，留空保持不变' : '正常站点会话 Cookie，可留空'"
+                    />
+                  </n-form-item>
+                  <n-form-item label="代理 URL（可选）">
+                    <n-input
+                      :value="sourceConfigText(provider, 'proxyUrl')"
+                      placeholder="例如 http://192.168.5.1:7890；必须能从 Luma 容器访问"
+                      @update:value="value => updateSourceConfig(provider, 'proxyUrl', value)"
+                    />
+                  </n-form-item>
+                  <n-form-item label="浏览器 User-Agent（可选）">
+                    <n-input
+                      :value="sourceConfigText(provider, 'userAgent')"
+                      type="textarea"
+                      :autosize="{ minRows: 2, maxRows: 3 }"
+                      placeholder="仅用于 HTTP 模式的兼容设置；Chromium 使用真实浏览器会话"
+                      @update:value="value => updateSourceConfig(provider, 'userAgent', value)"
+                    />
+                  </n-form-item>
+                </div>
+              </n-collapse-item>
+
+              <n-collapse-item name="sync" title="本地索引同步">
+                <template #header-extra>
+                  <span class="source-sync-status" :data-status="provider.syncStatus">{{ syncStatusLabel[provider.syncStatus] }}</span>
+                </template>
+                <div class="source-sync-settings">
+                  <div class="compact-switch-row">
+                    <div><strong>每日后台同步</strong><span>按设定间隔更新本地索引，搜索时不直接请求该网站。</span></div>
+                    <n-switch
+                      :value="sourceSyncEnabled(provider)"
+                      @update:value="value => updateSourceSyncEnabled(provider, value)"
+                    />
+                  </div>
+                  <n-form-item label="同步间隔（分钟）">
+                    <n-input-number
+                      :value="sourceSyncInterval(provider)"
+                      :min="60"
+                      :max="10080"
+                      :disabled="!sourceSyncEnabled(provider)"
+                      style="width: 100%"
+                      @update:value="value => updateSourceSyncInterval(provider, value)"
+                    />
+                  </n-form-item>
+                  <n-form-item label="每轮补全详情数">
+                    <n-input-number
+                      :value="sourceSyncDetailLimit(provider)"
+                      :min="0"
+                      :max="40"
+                      :disabled="!sourceSyncEnabled(provider)"
+                      style="width: 100%"
+                      @update:value="value => updateSourceSyncDetailLimit(provider, value)"
+                    />
+                  </n-form-item>
+                  <div class="source-priority-grid">
+                    <n-form-item label="元数据优先级">
+                      <n-input-number
+                        :value="sourceConfigNumber(provider, 'metadataPriority', 100)"
+                        :min="-1000"
+                        :max="1000"
+                        style="width: 100%"
+                        @update:value="value => updateSourceConfigNumber(provider, 'metadataPriority', value, 100)"
+                      />
+                    </n-form-item>
+                    <n-form-item label="资源优先级">
+                      <n-input-number
+                        :value="sourceConfigNumber(provider, 'resourcePriority', 100)"
+                        :min="-1000"
+                        :max="1000"
+                        style="width: 100%"
+                        @update:value="value => updateSourceConfigNumber(provider, 'resourcePriority', value, 100)"
+                      />
+                    </n-form-item>
+                    <n-form-item label="资源缓存（小时）">
+                      <n-input-number
+                        :value="sourceConfigNumber(provider, 'resourceCacheTtlHours', 72)"
+                        :min="1"
+                        :max="720"
+                        style="width: 100%"
+                        @update:value="value => updateSourceConfigNumber(provider, 'resourceCacheTtlHours', value, 72)"
+                      />
+                    </n-form-item>
+                  </div>
+                  <div class="source-sync-summary">
+                    <header>
+                      <div><strong>同步详情</strong><small>{{ provider.syncLastMessage || '等待第一次同步' }}</small></div>
+                    </header>
+                    <dl>
+                      <div><dt>当前模式</dt><dd>{{ provider.syncActiveMode === 'bootstrap' ? '历史回填' : '增量同步' }}{{ provider.syncBootstrapPaused ? '，已暂停' : '' }}</dd></div>
+                      <div><dt>当前位置</dt><dd :title="syncCursor(provider)">{{ syncCursor(provider) }}</dd></div>
+                      <div><dt>最近成功</dt><dd>{{ syncDate(provider.syncLastSuccessAt, '尚未成功') }}</dd></div>
+                      <div><dt>下次执行</dt><dd>{{ sourceSyncEnabled(provider) ? syncDate(provider.syncNextRunAt, '等待安排') : '已关闭' }}</dd></div>
+                      <div><dt>发现</dt><dd>{{ provider.syncDiscoveryCount }} 项</dd></div>
+                      <div><dt>已补全</dt><dd>{{ provider.syncHydratedCount }} 项</dd></div>
+                      <div><dt>待处理</dt><dd>{{ provider.syncPendingCount }} 项</dd></div>
+                      <div><dt>补全失败</dt><dd>{{ provider.syncHydrationFailedCount }} 项</dd></div>
+                      <div><dt>数据变化</dt><dd>新增 {{ provider.syncInsertedCount }}，更新 {{ provider.syncUpdatedCount }}</dd></div>
+                      <div><dt>连续失败</dt><dd>{{ provider.syncFailureCount }} 次</dd></div>
+                    </dl>
+                    <n-alert v-if="provider.syncStatus === 'failed' && provider.syncLastMessage" type="error" title="最近一次同步失败">
+                      {{ provider.syncLastMessage }}
+                    </n-alert>
+                  </div>
+                  <div class="source-bootstrap-control">
+                    <n-alert type="info" :show-icon="false">为保证任务稳定，历史回填单次最多 31 天（包含开始和结束日期）。</n-alert>
+                    <div class="source-bootstrap-range">
+                      <n-form-item label="历史开始日期"><n-input v-model:value="bootstrapWindow(provider).from" placeholder="2024-01-01" /></n-form-item>
+                      <n-form-item label="历史结束日期"><n-input v-model:value="bootstrapWindow(provider).to" placeholder="2026-08-10" /></n-form-item>
+                    </div>
+                    <div class="source-sync-actions">
+                      <n-button type="primary" :loading="syncing === `${provider.key}:incremental`" :disabled="!provider.enabled || provider.syncStatus === 'running'" @click="startIncremental(provider)">
+                        <template #icon><IconRefresh /></template>立即增量同步
+                      </n-button>
+                      <n-button secondary :loading="syncing === `${provider.key}:bootstrap`" :disabled="!provider.enabled || provider.syncStatus === 'running'" @click="startBootstrap(provider)">
+                        <template #icon><IconHistory /></template>历史回填
+                      </n-button>
+                      <n-button v-if="provider.syncActiveMode === 'bootstrap' && provider.syncStatus === 'running' && !provider.syncBootstrapPaused" secondary :loading="syncing === `${provider.key}:pause`" @click="pauseBootstrap(provider)">
+                        <template #icon><IconPlayerPause /></template>暂停回填
+                      </n-button>
+                      <n-button v-if="provider.syncBootstrapPaused" secondary :loading="syncing === `${provider.key}:resume`" @click="resumeBootstrap(provider)">
+                        <template #icon><IconPlayerPlay /></template>继续回填
+                      </n-button>
+                      <n-button quaternary :loading="reparsing === provider.key" @click="reparseProvider(provider)">重解析本地快照</n-button>
+                    </div>
+                  </div>
+                </div>
+              </n-collapse-item>
+
+              <n-collapse-item name="runtime" title="访问运行状态与诊断">
+                <template #header-extra>
+                  <span v-if="providerRuntimes[provider.key]" class="source-sync-status" :data-status="providerRuntimes[provider.key].state">
+                    {{ runtimeStateLabel[providerRuntimes[provider.key].state] }}
+                  </span>
+                  <span v-else class="provider-section-summary">尚未获取状态</span>
+                </template>
+                <div class="provider-section-body">
+                  <div v-if="providerRuntimes[provider.key]" class="source-runtime-summary">
+                    <header>
+                      <div><strong>运行详情</strong><small>{{ providerRuntimes[provider.key].browserProfilePath }}</small></div>
+                    </header>
+                    <dl>
+                      <div><dt>当前方式</dt><dd>{{ providerRuntimes[provider.key].activeFetchMode }}</dd></div>
+                      <div><dt>最近成功</dt><dd>{{ syncDate(providerRuntimes[provider.key].lastSuccessAt, '尚未成功') }}</dd></div>
+                      <div><dt>最近失败</dt><dd>{{ syncDate(providerRuntimes[provider.key].lastFailureAt, '无') }}</dd></div>
+                      <div><dt>连续失败</dt><dd>{{ providerRuntimes[provider.key].failureCount }} 次</dd></div>
+                    </dl>
+                    <n-alert v-if="providerRuntimes[provider.key].lastFailureMessage" type="warning" title="最近诊断">
+                      {{ providerRuntimes[provider.key].lastFailureMessage }}
+                    </n-alert>
+                  </div>
+                  <n-alert
+                    v-if="browserSessions[provider.key]"
+                    type="warning"
+                    title="交互浏览器会话正在运行"
+                  >
+                    请在新窗口完成站点正常要求的登录、年龄确认或人工验证。会话将在
+                    {{ syncDate(browserSessions[provider.key].expiresAt, '15 分钟后') }} 自动关闭；完成后点击“保存并测试”。
+                  </n-alert>
+                  <n-alert type="info" :show-icon="false">
+                    诊断会访问该 Provider 的真实页面并验证页面结构。浏览器会话仅供你完成站点要求的正常交互，保存后的 Cookie 由该来源独立复用；不会自动处理验证码。
+                  </n-alert>
+                  <div class="provider-card-actions">
+                    <n-button secondary :loading="diagnosing === provider.key" @click="diagnoseProvider(provider)">
+                      <template #icon><IconPlugConnected /></template>
+                      真实来源诊断
+                    </n-button>
+                    <n-button
+                      v-if="!browserSessions[provider.key]"
+                      secondary
+                      :loading="browserSessionBusy === provider.key"
+                      :disabled="!provider.enabled"
+                      @click="startBrowserSession(provider)"
+                    >
+                      <template #icon><IconServer /></template>
+                      建立浏览器会话
+                    </n-button>
+                    <template v-else>
+                      <n-button
+                        type="success"
+                        :loading="browserSessionBusy === provider.key"
+                        @click="completeBrowserSession(provider)"
+                      >
+                        <template #icon><IconCheck /></template>
+                        保存并测试
+                      </n-button>
+                      <n-button
+                        secondary
+                        :disabled="browserSessionBusy === provider.key"
+                        @click="cancelBrowserSession(provider)"
+                      >
+                        关闭会话
+                      </n-button>
+                    </template>
+                    <n-button
+                      quaternary
+                      type="error"
+                      :disabled="browserSessionBusy === provider.key || Boolean(browserSessions[provider.key])"
+                      @click="clearBrowserProfile(provider)"
+                    >
+                      清除浏览器 Profile
+                    </n-button>
+                  </div>
+                  <n-alert v-if="testMessages[provider.key]" :type="testMessages[provider.key].ok ? 'success' : 'error'">
+                    {{ testMessages[provider.key].text }}
+                  </n-alert>
+                </div>
+              </n-collapse-item>
+            </n-collapse>
+            </div>
+          </template>
+        </n-modal>
+      </section>
+
+      <section class="settings-group">
+        <header class="settings-group-heading">
+          <div>
+            <span class="eyebrow">SERVICES</span>
+            <h2>处理服务</h2>
+            <p>元数据和下载服务拥有各自的连接与处理边界。</p>
+          </div>
+          <div class="section-actions">
+            <n-button type="primary" :loading="savingSection === 'services'" @click="saveServices">
+              <template #icon><IconDeviceFloppy /></template>
+              保存服务
+            </n-button>
+          </div>
+        </header>
+        <div class="provider-card-grid service-provider-grid">
+          <article v-if="providerMap.metatube" class="provider-card">
+            <header>
+              <span class="provider-icon"><IconServer /></span>
+              <div><strong>MetaTube</strong><small>Metadata Provider · 元数据与图片</small></div>
+              <n-switch :value="providerMap.metatube.enabled" @update:value="value => toggleProvider(providerMap.metatube, value)" />
+            </header>
+            <n-form-item label="服务地址"><n-input v-model:value="providerMap.metatube.baseUrl" /></n-form-item>
+            <n-form-item label="Token"><n-input v-model:value="secrets.metatube" type="password" show-password-on="click" :placeholder="providerMap.metatube.hasSecret ? '已保存，留空保持不变' : '未启用 Token 时留空'" /></n-form-item>
+            <div class="provider-subsettings">
+              <strong>MetaTube 处理规则</strong>
+              <div class="form-grid">
+                <n-form-item label="输出格式"><n-select v-model:value="legacy.outputFormat" :options="[{ label: 'NFO', value: 'nfo' }, { label: 'JSON', value: 'json' }, { label: 'NFO + JSON', value: 'both' }]" /></n-form-item>
+                <n-form-item label="覆盖策略"><n-select v-model:value="legacy.overwritePolicy" :options="[{ label: '仅补缺失项', value: 'missing' }, { label: '始终覆盖', value: 'always' }, { label: '从不覆盖', value: 'never' }]" /></n-form-item>
+              </div>
+            </div>
+            <n-button secondary :loading="testing === 'metatube'" @click="testProvider('metatube')"><template #icon><IconPlugConnected /></template>测试元数据服务</n-button>
+            <n-alert v-if="testMessages.metatube" :type="testMessages.metatube.ok ? 'success' : 'error'">{{ testMessages.metatube.text }}</n-alert>
+          </article>
+
+          <article v-if="providerMap.qbittorrent" class="provider-card">
+            <header>
+              <span class="provider-icon"><IconDownload /></span>
+              <div><strong>qBittorrent</strong><small>Download Provider · 下载与 Tracker</small></div>
+              <n-switch :value="providerMap.qbittorrent.enabled" @update:value="value => toggleProvider(providerMap.qbittorrent, value)" />
+            </header>
+            <n-form-item label="Web UI 地址"><n-input v-model:value="providerMap.qbittorrent.baseUrl" /></n-form-item>
+            <div class="form-grid">
+              <n-form-item label="用户名"><n-input v-model:value="legacy.qbittorrentUsername" /></n-form-item>
+              <n-form-item label="密码"><n-input v-model:value="secrets.qbittorrent" type="password" show-password-on="click" :placeholder="providerMap.qbittorrent.hasSecret ? '已保存，留空保持不变' : 'qBittorrent 密码'" /></n-form-item>
+            </div>
+            <div class="compact-switch-row">
+              <div><strong>自动更新 Tracker</strong><span>按周期向现有任务追加 Tracker，不删除原列表。</span></div>
+              <n-switch v-model:value="legacy.qbittorrentAutoUpdateTrackers" />
+            </div>
+            <div v-if="legacy.qbittorrentAutoUpdateTrackers" class="form-grid">
+              <n-form-item label="Tracker 列表地址"><n-input v-model:value="legacy.qbittorrentTrackerSourceUrl" /></n-form-item>
+              <n-form-item label="间隔（分钟）"><n-input-number v-model:value="legacy.qbittorrentTrackerUpdateInterval" :min="1" style="width: 100%" /></n-form-item>
+            </div>
+            <n-button secondary :loading="testing === 'qbittorrent'" @click="testProvider('qbittorrent')"><template #icon><IconPlugConnected /></template>测试下载服务</n-button>
+            <n-alert v-if="testMessages.qbittorrent" :type="testMessages.qbittorrent.ok ? 'success' : 'error'">{{ testMessages.qbittorrent.text }}</n-alert>
+          </article>
+        </div>
+      </section>
+
+      <section class="settings-group">
+        <header class="settings-group-heading">
+          <div>
+            <span class="eyebrow">AI</span>
+            <h2>AI 接入</h2>
+            <p>接入一个 OpenAI 兼容的 chat/completions 服务，把自然语言编译成自动化规则。支持 OpenAI、DeepSeek、阿里云百炼和本地 Ollama。</p>
+          </div>
+          <div class="section-actions">
+            <n-button type="primary" :loading="savingSection === 'ai'" @click="saveAi">
+              <template #icon><IconDeviceFloppy /></template>
+              保存 AI
+            </n-button>
+          </div>
+        </header>
+        <div class="luma-settings-card panel">
+          <div class="form-grid">
+            <n-form-item label="服务类型">
+              <n-select :value="aiPreset" :options="aiPresets" @update:value="selectAiPreset" />
+            </n-form-item>
+            <n-form-item label="模型名称"><n-input v-model:value="ai.model" placeholder="gpt-4o-mini / deepseek-chat / qwen-plus" /></n-form-item>
+            <n-form-item label="Base URL" class="wide"><n-input v-model:value="ai.baseUrl" placeholder="https://api.openai.com/v1 或 http://localhost:11434/v1" /></n-form-item>
+            <n-form-item label="API Key"><n-input v-model:value="ai.apiKey" type="password" show-password-on="click" :placeholder="ai.hasApiKey ? '已保存，留空保持不变' : 'Ollama 可留空'" /></n-form-item>
+            <n-form-item label="Temperature"><n-input-number v-model:value="ai.temperature" :min="0" :max="2" :step="0.1" style="width:100%" /></n-form-item>
+            <n-form-item label="超时（秒）"><n-input-number v-model:value="ai.timeoutSecs" :min="5" :max="600" style="width:100%" /></n-form-item>
+            <n-form-item label="最大 Token"><n-input-number v-model:value="ai.maxTokens" :min="256" :max="8192" style="width:100%" /></n-form-item>
+            <n-form-item label="启用 AI 助手"><n-switch v-model:value="ai.enabled" /></n-form-item>
+          </div>
+          <div class="provider-card-actions">
+            <n-button secondary :loading="aiTesting" @click="testAi"><template #icon><IconPlugConnected /></template>测试连接</n-button>
+          </div>
+          <n-alert v-if="aiTestMessage" :type="aiTestMessage.ok ? 'success' : 'error'">{{ aiTestMessage.text }}</n-alert>
+        </div>
+      </section>
+
+      <section class="settings-group">
+        <header class="settings-group-heading">
+          <div>
+            <span class="eyebrow">LUMA</span>
+            <h2>入库与路径</h2>
+            <p>这些路径必须与 Docker 挂载保持一致，文件只能在允许的下载根目录和媒体根目录之间处理。</p>
+          </div>
+          <div class="section-actions">
+            <n-button type="primary" :loading="savingSection === 'paths'" @click="savePaths">
+              <template #icon><IconDeviceFloppy /></template>
+              保存路径
+            </n-button>
+          </div>
+        </header>
+        <div class="luma-settings-card panel">
+          <div class="form-grid">
+            <n-form-item label="Luma 下载根目录"><n-input v-model:value="product.downloadRoot" /></n-form-item>
+            <n-form-item label="qB 保存路径"><n-input v-model:value="product.qbittorrentSavePath" /></n-form-item>
+            <n-form-item label="媒体库根目录"><n-input v-model:value="product.mediaRoot" /></n-form-item>
+            <n-form-item label="文件模式"><n-select v-model:value="product.organizerMode" :options="[{ label: '优先硬链接，失败时复制', value: 'hardlink' }, { label: '始终复制', value: 'copy' }]" /></n-form-item>
+            <n-form-item label="电影命名模板"><n-input v-model:value="product.organizerMovieTemplate" /></n-form-item>
+            <n-form-item label="qB 分类与标签"><div class="inline-fields"><n-input v-model:value="product.qbittorrentCategory" placeholder="分类" /><n-input v-model:value="product.qbittorrentTags" placeholder="标签" /></div></n-form-item>
+          </div>
+          <div class="boundary-note"><IconCheck /><span><strong>冲突不会静默覆盖</strong><small>目标文件已存在、路径无法映射或整理失败时，获取会进入“需要关注”。</small></span></div>
+        </div>
+      </section>
+
+      <section class="settings-group">
+        <header><span class="eyebrow">ADVANCED</span><h2>高级诊断</h2><p>目录监听和可信 Python 脚本保留为高级工具。</p></header>
+        <div class="advanced-links">
+          <RouterLink to="/settings/legacy/folders"><IconFolder /><span><strong>媒体目录与监听</strong><small>配置 watch、interval 和手动扫描</small></span></RouterLink>
+          <RouterLink to="/settings/legacy/crawlers"><IconBrandPython /><span><strong>Python 来源脚本</strong><small>上传、定时执行和查看持久化结果</small></span></RouterLink>
+          <RouterLink to="/settings/legacy/tasks"><IconServer /><span><strong>刮削任务记录</strong><small>查看 MetaTube 执行与重试历史</small></span></RouterLink>
+        </div>
+      </section>
+    </div>
+  </n-spin>
+</template>

@@ -1,4 +1,4 @@
-# Luma Media Architecture
+# Luma Architecture
 
 ## Technology Stack
 
@@ -47,6 +47,15 @@ Design principles:
 -   asynchronous task processing
 -   configuration driven
 -   Docker friendly
+
+## Crawler and download pipeline
+
+受信任的 Python 脚本保存在数据卷，由独立的双并发执行器运行。调度器按脚本的
+`next_run_at` 排队，结构化结果和完整执行记录写入 SQLite。qBittorrent 客户端通过 Web API
+登录并接收磁力链接或 torrent URL；Tracker 既可随结果提交，也可从订阅列表定时追加。
+
+`watch` 媒体目录由 `notify` 递归监听操作系统文件事件，3 秒去抖后复用现有扫描与自动刮削
+链路；全局周期扫描继续作为 NAS/网络文件系统可能丢失事件时的兜底。
 
 ## Task model
 
