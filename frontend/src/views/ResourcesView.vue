@@ -159,6 +159,7 @@ onUnmounted(() => eventSource?.close())
             :poster-url="media.posterUrl"
             :subtitle="media.releaseDate ?? '日期待补全'"
             :to="`/media/${media.id}`"
+            :media-id="media.id"
           />
         </div>
         <div v-else class="quiet-empty resolve-empty">
@@ -173,7 +174,7 @@ onUnmounted(() => eventSource?.close())
     <section v-else class="result-section">
       <header class="product-section-head"><div><h2>最近收录</h2><span>后台同步写入本地索引的新内容</span></div></header>
       <div v-if="recent.items.length" class="poster-grid">
-        <PosterCard v-for="media in recent.items" :key="media.id" :title="media.title" :code="media.code" :poster-url="media.posterUrl" :to="`/media/${media.id}`" />
+        <PosterCard v-for="media in recent.items" :key="media.id" :title="media.title" :code="media.code" :poster-url="media.posterUrl" :to="`/media/${media.id}`" :media-id="media.id" />
       </div>
       <div v-else class="quiet-empty">
         <IconSearch :size="28" />

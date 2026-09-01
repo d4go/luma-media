@@ -6,6 +6,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import type { LibraryItem } from '../types'
 import { formatDate } from '../format'
+import MediaCodeLink from '../components/MediaCodeLink.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -87,7 +88,7 @@ onMounted(load)
         <div>
           <span class="media-type-label">本地媒体</span>
           <h1>{{ item.media.title }}</h1>
-          <p>{{ item.media.code.toUpperCase() }}，{{ item.status === 'ready' ? '文件可用' : item.status }}</p>
+          <p><MediaCodeLink :code="item.media.code" :media-id="item.mediaId" />，{{ item.status === 'ready' ? '文件可用' : item.status }}</p>
           <div class="library-export-actions">
             <n-button type="primary" :loading="working === 'nfo'" :disabled="Boolean(working && working !== 'nfo')" @click="regenerateNfo">
               <template #icon><IconRefresh /></template>重新生成 NFO

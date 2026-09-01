@@ -5,6 +5,7 @@ import { IconAlertTriangle, IconArrowRight, IconBolt, IconBooks, IconDownload, I
 import { api } from '../api'
 import type { HomeData } from '../types'
 import PaginationBar from '../components/PaginationBar.vue'
+import MediaCodeLink from '../components/MediaCodeLink.vue'
 
 const data = ref<HomeData | null>(null)
 const loading = ref(true)
@@ -54,7 +55,7 @@ onUnmounted(() => events?.close())
         <section class="home-section home-recent">
           <header class="product-section-head"><div><h2>最近获取</h2><p>下载状态与 qBittorrent 保持同步</p></div><RouterLink to="/downloads">查看全部<IconArrowRight :size="15" /></RouterLink></header>
           <div v-if="data?.recentAcquisitions.items.length" class="home-recent-list">
-            <RouterLink v-for="item in data.recentAcquisitions.items" :key="item.id" :to="`/acquisitions/${item.id}`" class="home-recent-row"><span class="home-recent-poster"><img v-if="item.media.posterUrl" :src="item.media.posterUrl" :alt="item.media.title"><IconMovie v-else :size="20" /></span><span class="home-recent-copy"><strong>{{ item.media.title }}</strong><small>{{ item.media.code || '番号待识别' }}<span>{{ item.stateMessage }}</span></small></span><span class="state-chip" :data-state="item.qbitState === 'missing' ? 'NEEDS_ATTENTION' : item.state">{{ stateLabel(item.state, item.qbitState) }}</span><span class="home-recent-progress">{{ Math.round(item.progress * 100) }}%</span><IconArrowRight class="home-row-arrow" :size="16" /></RouterLink>
+            <RouterLink v-for="item in data.recentAcquisitions.items" :key="item.id" :to="`/acquisitions/${item.id}`" class="home-recent-row"><span class="home-recent-poster"><img v-if="item.media.posterUrl" :src="item.media.posterUrl" :alt="item.media.title"><IconMovie v-else :size="20" /></span><span class="home-recent-copy"><strong>{{ item.media.title }}</strong><small><MediaCodeLink :code="item.media.code" :media-id="item.mediaId" /><span class="home-recent-state">{{ item.stateMessage }}</span></small></span><span class="state-chip" :data-state="item.qbitState === 'missing' ? 'NEEDS_ATTENTION' : item.state">{{ stateLabel(item.state, item.qbitState) }}</span><span class="home-recent-progress">{{ Math.round(item.progress * 100) }}%</span><IconArrowRight class="home-row-arrow" :size="16" /></RouterLink>
           </div>
           <div v-else class="quiet-empty"><IconBolt :size="28" /><strong>还没有获取记录</strong><span>从一次搜索开始，Luma 会在这里保留完整进度。</span><RouterLink to="/resources">发现资源</RouterLink></div>
           <PaginationBar v-if="data && data.recentAcquisitions.total > 0" :page="page" :page-size="pageSize" :total="data.recentAcquisitions.total" :page-sizes="[6, 10, 20]" @update:page="changePage" @update:page-size="changePageSize" />

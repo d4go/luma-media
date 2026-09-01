@@ -1,4 +1,4 @@
-use std::{
+﻿use std::{
     collections::HashMap,
     convert::Infallible,
     path::{Component, Path, PathBuf},
@@ -726,9 +726,26 @@ pub async fn request_acquisition(state: &AppState, input: AcquireInput) -> AppRe
         }
     };
     media_exists(state, media_id).await?;
-    if let Some(id) = sqlx::query_scalar::<_, i64>(&format!("SELECT id FROM acquisition WHERE media_id = ? AND state IN ({ACTIVE_STATES}) ORDER BY id DESC LIMIT 1"))
-        .bind(media_id).fetch_optional(&state.pool).await? {
-        return acquisition_by_id(state, id).await;
+    let active_id = sqlx::query_scalar::<_, i64>(&format!("SELECT id FROM acquisition WHERE media_id = ? AND state IN ({ACTIVE_STATES}) ORDER BY id DESC LIMIT 1"))
+        .bind(media_id).fetch_optional(&state.pool).await?;
+    if let Some(id) = active_id {
+        let existing = acquisition_by_id(state, id).await?;
+        if let Some(resource_id) = input.resource_id {
+            if existing.resource_id != Some(resource_id) && existing.progress <= 0.0 {
+                let belongs: i64 = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM resource WHERE id = ? AND media_id = ? AND available=1)",
+                )
+                .bind(resource_id)
+                .bind(media_id)
+                .fetch_one(&state.pool)
+                .await?;
+                if belongs == 0 {
+                    return Err(AppError::BadRequest("资源不属于该媒体或当前不可用".into()));
+                }
+                return replace_zero_progress_acquisition(state, id, resource_id).await;
+            }
+        }
+        return Ok(existing);
     }
     let resource_id = match input.resource_id {
         Some(id) => Some(id),
@@ -782,6 +799,46 @@ pub async fn request_acquisition(state: &AppState, input: AcquireInput) -> AppRe
         state,
         "acquisition.created",
         json!({"acquisitionId": id, "mediaId": media_id}),
+    );
+    let work_state = state.clone();
+    tokio::spawn(async move {
+        submit_acquisition(&work_state, id).await;
+    });
+    acquisition_by_id(state, id).await
+}
+async fn replace_zero_progress_acquisition(state: &AppState, id: i64, new_resource_id: i64) -> AppResult<Acquisition> {
+    let existing = acquisition_by_id(state, id).await?;
+    if let Some(hash) = existing.qbit_hash.as_deref().filter(|hash| !hash.trim().is_empty()) {
+        let settings = storage::load_settings(&state.pool).await?;
+        let client = QBittorrentClient::new(&settings)?;
+        client.remove(hash).await.map_err(|error| {
+            AppError::BadRequest(format!("无法移除 qBittorrent 中进度为 0 的旧任务：{error}"))
+        })?;
+    }
+
+    let mut tx = state.pool.begin().await?;
+    sqlx::query(
+        "UPDATE acquisition SET resource_id = ?, state = 'REQUESTED', state_message = '已切换为新的磁力资源，等待提交', qbit_hash = NULL, qbit_state = NULL, progress = 0, download_speed = 0, eta_seconds = NULL, download_path = NULL, last_error = NULL, updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(new_resource_id)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    insert_event(
+        &mut tx,
+        id,
+        &format!("reacquire:{new_resource_id}"),
+        Some(existing.state.as_str()),
+        "REQUESTED",
+        "已切换为新的磁力资源",
+        json!({"resourceId": new_resource_id}),
+    )
+    .await?;
+    tx.commit().await?;
+    emit(
+        state,
+        "acquisition.updated",
+        json!({"acquisitionId": id, "mediaId": existing.media_id, "resourceId": new_resource_id}),
     );
     let work_state = state.clone();
     tokio::spawn(async move {
@@ -7141,6 +7198,77 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first.id, second.id);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM acquisition WHERE media_id = ?")
+            .bind(media_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+    #[tokio::test]
+    async fn zero_progress_acquisition_switches_to_new_resource() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let stalled_qbit = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let qbit_url = format!("http://{}", stalled_qbit.local_addr().unwrap());
+        sqlx::query("UPDATE app_setting SET value = ? WHERE key = 'qbittorrent_url'")
+            .bind(qbit_url)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let media_id: i64 = sqlx::query(
+            "INSERT INTO media(normalized_code,title) VALUES ('abc-123','ABC-123') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("id");
+        let old_resource_id: i64 = sqlx::query("INSERT INTO resource(media_id,provider_key,title,download_url,score) VALUES (?,'mock','ABC-123 720p','magnet:?xt=urn:btih:OLD123',80) RETURNING id").bind(media_id).fetch_one(&pool).await.unwrap().get("id");
+        let new_resource_id: i64 = sqlx::query("INSERT INTO resource(media_id,provider_key,title,download_url,score) VALUES (?,'mock','ABC-123 1080p','magnet:?xt=urn:btih:NEW456',90) RETURNING id").bind(media_id).fetch_one(&pool).await.unwrap().get("id");
+        let existing_id: i64 = sqlx::query(
+            "INSERT INTO acquisition(media_id, resource_id, requested_by, state, state_message, progress) VALUES (?, ?, 'manual', 'DOWNLOADING', '下载中', 0) RETURNING id",
+        )
+        .bind(media_id)
+        .bind(old_resource_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("id");
+        let temp = std::env::temp_dir().join(format!("luma-product-test-{}", chrono_like_nonce()));
+        let state = AppState {
+            pool: pool.clone(),
+            scrape_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            crawler_limiter: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            asset_root: temp.join("assets"),
+            script_root: temp.join("scripts"),
+            events: tokio::sync::broadcast::channel(32).0,
+            fetch_manager: std::sync::Arc::new(crate::fetch::FetchManager::default()),
+            provider_registry: std::sync::Arc::new(crate::providers::ProviderRegistry::default()),
+            snapshot_repository: std::sync::Arc::new(crate::ingestion::SnapshotRepository::new(
+                pool.clone(),
+                temp.join("source-cache"),
+            )),
+            ingestion_queue: crate::ingestion::IngestionQueue::new(pool.clone()),
+            task_engine: crate::task::TaskEngine::new(pool.clone()),
+            handler_registry: std::sync::Arc::new(crate::task::handler::HandlerRegistry::new()),
+        };
+        let updated = request_acquisition(
+            &state,
+            AcquireInput {
+                media_id: Some(media_id),
+                resource_id: Some(new_resource_id),
+                requested_by: "manual".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.id, existing_id);
+        let row = sqlx::query("SELECT resource_id FROM acquisition WHERE id = ?")
+            .bind(existing_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("resource_id"), new_resource_id);
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM acquisition WHERE media_id = ?")
             .bind(media_id)
             .fetch_one(&state.pool)
